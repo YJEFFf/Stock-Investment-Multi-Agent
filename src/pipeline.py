@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src import collectors, kis
+from src import collectors, kis, sell
 from src.analysts import chart_analyst, disclosure_analyst, dummy_analyst, news_analyst
 from src.schemas import (
     AnalystOpinion,
@@ -34,6 +34,7 @@ TRADE_WEIGHT = 0.08
 GAP_SKIP_THRESHOLD_PCT = 0.03
 
 DEFAULT_LOG_PATH = Path("logs/pipeline.jsonl")
+DEFAULT_SELL_LOG_PATH = Path("logs/sell.jsonl")
 
 # 정량 사전 필터 절대 문턱값 (docs/PLAN.md §5, 2026-08-08 확정). 관행값으로 시작하고
 # 나중에 필터 통과율 로그를 보고 조정한다 — 과거 수익률에 맞춰 역산하지 않는다.
@@ -528,6 +529,65 @@ async def run_day(
         )
 
     return portfolio, results
+
+
+async def evaluate_holdings(
+    portfolio: PortfolioState,
+    day: datetime,
+    log_path: Path = DEFAULT_SELL_LOG_PATH,
+) -> PortfolioState:
+    """보유 포지션 전체에 결정론적 매도 안전장치(손절/트레일링 익절, src/sell.py)를
+    적용한다.
+
+    매수 쪽엔 정량 필터(quant_prefilter)가 있지만 이쪽엔 없다 — 필요가 없다.
+    리스크 게이트가 종목당 최대 비중을 15%로 막아둬서 보유 종목 수 자체가
+    원천적으로 적다(최대 ~7개). 그래서 매일 보유 종목 전부를 그냥 평가한다.
+
+    LLM 재량 매도는 아직 없다 — 여기선 안전장치만 실행한다. 가격 조회가
+    실패한 종목은 오늘 평가를 건너뛴다(collectors/kis 단에서 이미 재시도를
+    소진한 뒤라 여기서 다시 재시도하지 않는다, 규칙 4).
+    """
+    if not portfolio.positions:
+        return portfolio
+
+    price_results = await asyncio.gather(
+        *(asyncio.to_thread(kis.fetch_current_price, p.ticker) for p in portfolio.positions),
+        return_exceptions=True,
+    )
+
+    price_by_ticker: dict[str, float] = {}
+    for position, price in zip(portfolio.positions, price_results):
+        if isinstance(price, BaseException) or price is None:
+            logger.warning("evaluate_holdings_price_unavailable ticker=%s", position.ticker)
+            continue
+        price_by_ticker[position.ticker] = price
+
+    for ticker, current_price in price_by_ticker.items():
+        position = next(p for p in portfolio.positions if p.ticker == ticker)
+        position = sell.update_peak_price(position, current_price)
+        portfolio = PortfolioState(
+            positions=[position if p.ticker == ticker else p for p in portfolio.positions],
+            cash_weight=portfolio.cash_weight,
+            daily_pnl_pct=portfolio.daily_pnl_pct,
+        )
+
+        action = sell.evaluate_deterministic_sell(position, current_price)
+        if action is None:
+            continue
+
+        portfolio = sell.execute_sell(portfolio, action, current_price)
+        _append_log(
+            log_path,
+            {
+                "day": day.date().isoformat(),
+                "ticker": ticker,
+                "reason": action.reason,
+                "sell_fraction": action.sell_fraction,
+                "price": current_price,
+            },
+        )
+
+    return portfolio
 
 
 def summarize_log(log_path: Path, total_days: int) -> dict:
