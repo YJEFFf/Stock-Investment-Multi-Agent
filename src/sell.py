@@ -15,7 +15,13 @@ pipeline.py(신규 매수 오케스트레이션)와 분리한 이유: 보유 포
 조정이 이유가 된다 — 고치는 이유가 다르다.
 """
 
+import asyncio
+import logging
+
+from src import kis
 from src.schemas import PortfolioState, Position, SellAction
+
+logger = logging.getLogger(__name__)
 
 # 사용자 확정치 (2026-08-09):
 STOP_LOSS_PCT = -0.10  # 진입가 대비 평가손익 -10% 도달 시 전량 매도
@@ -74,11 +80,15 @@ def update_peak_price(position: Position, current_price: float) -> Position:
 
 
 def execute_sell(portfolio: PortfolioState, action: SellAction, current_price: float) -> PortfolioState:
-    """SellAction을 포트폴리오에 반영하는 순수 함수. 실거래 API 호출 없음(규칙 7).
+    """SellAction을 포트폴리오 상태에 반영하는 순수 함수. 실거래 API 호출 없음
+    (규칙 7) — 무비용 시뮬레이션 경로다. 실제 KIS 주문까지 내려면
+    execute_sell_order를 쓴다.
 
     트레일링 익절이 실행되면 다음 구간을 새 고점부터 추적하도록 peak_price를
     현재가로 리셋한다 — 안 그러면 같은 하락 하나로 여러 단계가 연달아 발동해버린다.
     잔여 비중이 사실상 0이면(부동소수 오차 감안) 포지션 자체를 제거한다.
+    quantity가 채워져 있으면(실제 주문으로 연 포지션) 비중과 같은 비율로 줄인다 —
+    실제 매도 없이 상태만 시뮬레이션하는 경로이므로 근사치다.
     """
     position = next((p for p in portfolio.positions if p.ticker == action.ticker), None)
     if position is None:
@@ -96,6 +106,8 @@ def execute_sell(portfolio: PortfolioState, action: SellAction, current_price: f
         )
 
     update = {"weight": remaining_weight}
+    if position.quantity:
+        update["quantity"] = position.quantity - int(position.quantity * action.sell_fraction)
     if action.reason == "take_profit_trail":
         update["take_profit_stage"] = position.take_profit_stage + 1
         update["peak_price"] = current_price
@@ -104,4 +116,56 @@ def execute_sell(portfolio: PortfolioState, action: SellAction, current_price: f
         positions=[*other_positions, position.model_copy(update=update)],
         cash_weight=portfolio.cash_weight + sold_weight,
         daily_pnl_pct=portfolio.daily_pnl_pct,
+    )
+
+
+async def execute_sell_simulated(
+    portfolio: PortfolioState, action: SellAction, current_price: float
+) -> PortfolioState:
+    """execute_sell()을 evaluate_holdings의 SellExecuteFn 인터페이스에 맞춘
+    비동기 래퍼 — 무비용 시뮬레이션 경로."""
+    return execute_sell(portfolio, action, current_price)
+
+
+async def execute_sell_order(portfolio: PortfolioState, action: SellAction, current_price: float) -> PortfolioState:
+    """SellAction을 실제 KIS 모의투자 시장가 매도 주문으로 집행한다.
+
+    execute_sell()과 달리 실제 KIS API를 호출한다(모의투자만, 규칙 7).
+    Position.quantity가 없으면(execute()의 순수 시뮬레이션 경로로 열린 포지션 —
+    실제로 브로커에 주문이 나간 적이 없다) 팔 실주식이 없으므로 상태만
+    execute_sell()로 갱신하고 실제 주문은 생략한다.
+    """
+    position = next((p for p in portfolio.positions if p.ticker == action.ticker), None)
+    if position is None:
+        return portfolio
+
+    if not position.quantity:
+        logger.warning(
+            "execute_sell_order_simulated_only ticker=%s reason=no_real_quantity_tracked", action.ticker
+        )
+        return execute_sell(portfolio, action, current_price)
+
+    shares_to_sell = (
+        position.quantity if action.sell_fraction >= 1.0 else int(position.quantity * action.sell_fraction)
+    )
+    if shares_to_sell <= 0:
+        logger.warning("execute_sell_order_skipped ticker=%s reason=rounds_to_zero_shares", action.ticker)
+        return portfolio
+
+    order_no = await asyncio.to_thread(kis.place_market_sell_order, action.ticker, shares_to_sell)
+    if order_no is None:
+        logger.error("execute_sell_order_failed ticker=%s reason=order_rejected", action.ticker)
+        return portfolio
+
+    updated_portfolio = execute_sell(portfolio, action, current_price)
+    # execute_sell()이 비중 기준 근사치로 줄인 quantity를, 실제로 판 주식수 기준
+    # 정확한 값으로 덮어쓴다.
+    updated_positions = [
+        p.model_copy(update={"quantity": position.quantity - shares_to_sell}) if p.ticker == action.ticker else p
+        for p in updated_portfolio.positions
+    ]
+    return PortfolioState(
+        positions=updated_positions,
+        cash_weight=updated_portfolio.cash_weight,
+        daily_pnl_pct=updated_portfolio.daily_pnl_pct,
     )

@@ -304,6 +304,42 @@ def test_place_market_buy_order_returns_none_when_request_fails(monkeypatch):
     assert kis.place_market_buy_order("005930", 10) is None
 
 
+# --- place_market_sell_order ---
+
+
+def test_place_market_sell_order_returns_order_number(monkeypatch):
+    captured = {}
+
+    def fake_post(path, tr_id, body):
+        captured["body"] = body
+        captured["tr_id"] = tr_id
+        return {"output": {"ODNO": "0000654321"}}
+
+    monkeypatch.setattr(kis, "_kis_post", fake_post)
+
+    order_no = kis.place_market_sell_order("005930", 10)
+
+    assert order_no == "0000654321"
+    assert captured["body"]["PDNO"] == "005930"
+    assert captured["body"]["ORD_QTY"] == "10"
+    assert captured["tr_id"] == kis.ORDER_SELL_TR_ID
+
+
+def test_place_market_sell_order_rejects_non_positive_quantity(monkeypatch):
+    def fail_post(*a, **k):
+        raise AssertionError("수량이 0 이하면 API를 호출하면 안 된다")
+
+    monkeypatch.setattr(kis, "_kis_post", fail_post)
+
+    assert kis.place_market_sell_order("005930", 0) is None
+
+
+def test_place_market_sell_order_returns_none_when_request_fails(monkeypatch):
+    monkeypatch.setattr(kis, "_kis_post", lambda path, tr_id, body: None)
+
+    assert kis.place_market_sell_order("005930", 10) is None
+
+
 # --- fetch_fill_price ---
 
 

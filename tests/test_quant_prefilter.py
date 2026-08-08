@@ -204,6 +204,7 @@ def test_run_daily_composes_universe_filter_and_run_day(monkeypatch, tmp_path):
             RiskGateConfig(),
             fake_analyst_fn,
             pipeline.propose_decision,
+            pipeline.execute_simulated,
             total_expected_analysts=1,
             log_path=tmp_path / "log.jsonl",
         )
@@ -232,6 +233,7 @@ def test_run_daily_returns_empty_when_universe_unavailable(monkeypatch, tmp_path
             RiskGateConfig(),
             should_not_be_called,
             pipeline.propose_decision,
+            pipeline.execute_simulated,
             log_path=tmp_path / "log.jsonl",
         )
     )

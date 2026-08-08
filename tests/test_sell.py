@@ -1,6 +1,6 @@
 import pytest
 
-from src import sell
+from src import kis, sell
 from src.schemas import PortfolioState, Position
 
 
@@ -170,3 +170,130 @@ def test_execute_sell_removes_position_when_remaining_weight_negligible():
     updated = sell.execute_sell(portfolio, action, current_price=139.5)
 
     assert updated.positions == []
+
+
+def test_execute_sell_reduces_quantity_proportionally():
+    from src.schemas import SellAction
+
+    position = _position(weight=0.09, entry_price=100.0, peak_price=150.0, take_profit_stage=1, quantity=30)
+    portfolio = PortfolioState(positions=[position], cash_weight=0.91)
+    action = SellAction(ticker="005930", reason="take_profit_trail", sell_fraction=1 / 3)
+
+    updated = sell.execute_sell(portfolio, action, current_price=139.5)
+
+    assert updated.positions[0].quantity == 20  # 30 - int(30 * 1/3)
+
+
+# --- execute_sell_simulated / execute_sell_order ---
+
+
+def test_execute_sell_simulated_matches_execute_sell():
+    import asyncio
+
+    from src.schemas import SellAction
+
+    portfolio = PortfolioState(positions=[_position(weight=0.10)], cash_weight=0.90)
+    action = SellAction(ticker="005930", reason="stop_loss", sell_fraction=1.0)
+
+    updated = asyncio.run(sell.execute_sell_simulated(portfolio, action, current_price=90.0))
+
+    assert updated.positions == []
+    assert updated.cash_weight == pytest.approx(1.0)
+
+
+def test_execute_sell_order_falls_back_to_simulated_without_tracked_quantity(monkeypatch):
+    import asyncio
+
+    from src.schemas import SellAction
+
+    def fail(*a, **k):
+        raise AssertionError("실제 수량을 모르면 KIS 주문을 내면 안 된다")
+
+    monkeypatch.setattr(kis, "place_market_sell_order", fail)
+
+    portfolio = PortfolioState(positions=[_position(weight=0.10, quantity=None)], cash_weight=0.90)
+    action = SellAction(ticker="005930", reason="stop_loss", sell_fraction=1.0)
+
+    updated = asyncio.run(sell.execute_sell_order(portfolio, action, current_price=90.0))
+
+    assert updated.positions == []  # execute_sell()과 동일한 결과
+
+
+def test_execute_sell_order_places_real_order_and_updates_quantity(monkeypatch):
+    import asyncio
+
+    from src.schemas import SellAction
+
+    captured = {}
+
+    def fake_sell(ticker, quantity):
+        captured["ticker"] = ticker
+        captured["quantity"] = quantity
+        return "ODNO789"
+
+    monkeypatch.setattr(kis, "place_market_sell_order", fake_sell)
+
+    position = _position(weight=0.09, entry_price=100.0, peak_price=150.0, take_profit_stage=1, quantity=30)
+    portfolio = PortfolioState(positions=[position], cash_weight=0.91)
+    action = SellAction(ticker="005930", reason="take_profit_trail", sell_fraction=1 / 3)
+
+    updated = asyncio.run(sell.execute_sell_order(portfolio, action, current_price=139.5))
+
+    assert captured["ticker"] == "005930"
+    assert captured["quantity"] == 10  # int(30 * 1/3)
+    assert updated.positions[0].quantity == 20
+
+
+def test_execute_sell_order_full_exit_sells_all_shares(monkeypatch):
+    import asyncio
+
+    from src.schemas import SellAction
+
+    captured = {}
+    monkeypatch.setattr(
+        kis, "place_market_sell_order", lambda ticker, qty: captured.setdefault("qty", qty) or "ODNO1"
+    )
+
+    position = _position(weight=0.10, entry_price=100.0, quantity=30)
+    portfolio = PortfolioState(positions=[position], cash_weight=0.90)
+    action = SellAction(ticker="005930", reason="stop_loss", sell_fraction=1.0)
+
+    updated = asyncio.run(sell.execute_sell_order(portfolio, action, current_price=90.0))
+
+    assert captured["qty"] == 30
+    assert updated.positions == []
+
+
+def test_execute_sell_order_skips_when_rounds_to_zero_shares(monkeypatch):
+    import asyncio
+
+    from src.schemas import SellAction
+
+    def fail(*a, **k):
+        raise AssertionError("0주로 반올림되면 주문을 내면 안 된다")
+
+    monkeypatch.setattr(kis, "place_market_sell_order", fail)
+
+    position = _position(weight=0.09, entry_price=100.0, peak_price=150.0, take_profit_stage=1, quantity=2)
+    portfolio = PortfolioState(positions=[position], cash_weight=0.91)
+    action = SellAction(ticker="005930", reason="take_profit_trail", sell_fraction=1 / 3)  # int(2/3) = 0
+
+    updated = asyncio.run(sell.execute_sell_order(portfolio, action, current_price=139.5))
+
+    assert updated == portfolio  # 아무 것도 안 바뀜
+
+
+def test_execute_sell_order_returns_unchanged_when_order_rejected(monkeypatch):
+    import asyncio
+
+    from src.schemas import SellAction
+
+    monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: None)
+
+    position = _position(weight=0.10, entry_price=100.0, quantity=30)
+    portfolio = PortfolioState(positions=[position], cash_weight=0.90)
+    action = SellAction(ticker="005930", reason="stop_loss", sell_fraction=1.0)
+
+    updated = asyncio.run(sell.execute_sell_order(portfolio, action, current_price=90.0))
+
+    assert updated == portfolio

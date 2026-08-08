@@ -1,7 +1,13 @@
 import asyncio
 from datetime import datetime, timezone
 
-from src.pipeline import make_combined_analyst_fn, make_dummy_analyst_fn, propose_decision, run_day
+from src.pipeline import (
+    execute_simulated,
+    make_combined_analyst_fn,
+    make_dummy_analyst_fn,
+    propose_decision,
+    run_day,
+)
 from src.schemas import AnalystOpinion, PortfolioState, RiskGateConfig
 
 UNIVERSE = [
@@ -20,12 +26,26 @@ def test_run_day_is_deterministic(tmp_path):
 
     _, results_a = asyncio.run(
         run_day(
-            UNIVERSE, day, PortfolioState(), config, analyst_fn, propose_decision, log_path=tmp_path / "a.jsonl"
+            UNIVERSE,
+            day,
+            PortfolioState(),
+            config,
+            analyst_fn,
+            propose_decision,
+            execute_simulated,
+            log_path=tmp_path / "a.jsonl",
         )
     )
     _, results_b = asyncio.run(
         run_day(
-            UNIVERSE, day, PortfolioState(), config, analyst_fn, propose_decision, log_path=tmp_path / "b.jsonl"
+            UNIVERSE,
+            day,
+            PortfolioState(),
+            config,
+            analyst_fn,
+            propose_decision,
+            execute_simulated,
+            log_path=tmp_path / "b.jsonl",
         )
     )
 
@@ -45,6 +65,7 @@ def test_different_seed_can_change_results(tmp_path):
             config,
             make_dummy_analyst_fn(base_seed=1),
             propose_decision,
+            execute_simulated,
             log_path=tmp_path / "a.jsonl",
         )
     )
@@ -56,6 +77,7 @@ def test_different_seed_can_change_results(tmp_path):
             config,
             make_dummy_analyst_fn(base_seed=2),
             propose_decision,
+            execute_simulated,
             log_path=tmp_path / "b.jsonl",
         )
     )

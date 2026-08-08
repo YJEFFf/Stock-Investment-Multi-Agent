@@ -454,3 +454,50 @@ CLAUDE.md가 "아직 정해지지 않은 것"으로 남겨뒀던 매도 로직�
 보유 종목 평가를 막지 않는다.
 
 LLM 재량 매도는 여전히 미구현 — 결정론적 안전장치만 이 함수로 매일 돈다.
+
+### LLM 재량 매도 + 실주문 배선 완성 (2026-08-09)
+
+남아있던 두 갭(LLM 재량 매도 미구현, 실제 주문 집행이 판단 체인에 안 이어짐)을
+마저 이어붙였다.
+
+**LLM 재량 매도**: 매수 쪽 강세/약세 토론 + 포트폴리오 매니저와 대칭 구조로
+만들었다(`judgment.debate_holding`, `judgment.portfolio_manager_sell`,
+`judgment.judge_sell`). 매수용 프롬프트를 재사용하지 않고
+`prompts/debate_stay.md`/`debate_exit.md`/`portfolio_manager_sell.md`를 새로
+썼다 — "매수할까"와 "계속 들고 있을까"는 다른 질문이라 매수용 프레이밍을
+그대로 쓰면 LLM이 엉뚱한 질문에 답하게 된다. `DebateArgument.stance`는
+bull=존버/bear=이탈로 그대로 재사용(신규 stance 불필요).
+
+규칙 6과 다르게 설계한 지점: 매수용 포트폴리오 매니저는 게이트가 뒤에서
+거부할 수 있다는 전제로 "적당히 관대해도 된다"고 프롬프트에 명시하는데,
+매도용 매니저는 정반대로 "네 SELL은 그대로 실행된다, 그러니 확신 없으면
+HOLD가 기본"이라고 프롬프트에 명시했다 — 게이트가 없는 대신 프롬프트 자체의
+보수성으로 상쇄한다.
+
+`pipeline.evaluate_holdings`에 `analyst_fn`/`judge_sell_fn`을 옵션으로
+추가했다(기본값 `None` — 안 넣으면 이 계층 자체가 꺼진다). 결정론적 매도가
+이미 트리거된 종목은 LLM에게 다시 묻지 않는다(코드가 이미 팔기로 정한 걸
+재확인할 이유가 없다). analyst_fn/judge_sell_fn을 옵션(None 기본)으로 둔 건
+`execute_fn`류(기본값 없음, 항상 명시)와 의도적으로 다른 결정이다 —
+결정론적 안전장치는 항상 켜져 있어야 하지만, LLM 재량은 진짜 선택적 추가
+비용이라 안 켜는 쪽이 안전한 기본값이다.
+
+**실주문 배선**: `run_day`/`run_daily`가 `execute_fn`을 필수 인자로 받도록
+바꿔서 `execute_buy_order`(실제 KIS 주문)를 실제로 꽂을 수 있게 했다 —
+이전엔 이 함수가 있어도 아무도 안 불렀다. 무비용 시뮬레이션 경로는
+`execute_simulated`(`execute()`의 비동기 래퍼)로 남겨 기존 테스트가 그대로
+돌게 했다. 매도도 대칭으로 `SellExecuteFn`(`execute_sell_simulated` vs
+`execute_sell_order`)을 만들어 `evaluate_holdings`에 필수 인자로 추가했다.
+
+**실제 매도 주문을 위해 필요했던 것**: `Position`에 `quantity`(실제 보유
+주수)를 추가했다. `weight`는 비중일 뿐이라 매도 시 몇 주를 팔지 알 수
+없었다 — `execute_buy_order`가 실제로 주문을 넣은 수량을 그대로 저장해두는
+쪽을 택했다(브로커를 다시 조회하는 대신 — 이미 우리가 아는 값이라 조회할
+필요가 없고, 미검증 필드명에 의존하는 리스크도 없다). `quantity`가 없는
+포지션(순수 시뮬레이션 `execute()`로 연 포지션)은 실제로 판 적이 없으니
+`execute_sell_order`가 실주문 없이 상태만 시뮬레이션으로 갱신한다.
+
+`kis.py`에 `place_market_sell_order` 추가 — `place_market_buy_order`와 완전히
+대칭(같은 엔드포인트, tr_id만 다름). 매수와 마찬가지로 라이브로 구조 검증만
+했다("모의투자 영업일이 아닙니다" 응답 — 계좌·파라미터는 정상 처리 확인,
+실제 체결은 장중 재검증 필요).

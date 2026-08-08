@@ -52,6 +52,7 @@ CURRENT_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
 CURRENT_PRICE_TR_ID = "FHKST01010100"
 ORDER_CASH_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
 ORDER_BUY_TR_ID = "VTTC0802U"  # 모의투자 현금 매수 주문
+ORDER_SELL_TR_ID = "VTTC0801U"  # 모의투자 현금 매도 주문
 DAILY_CCLD_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 DAILY_CCLD_TR_ID = "VTTC8001R"  # 모의투자 주식일별주문체결조회
 BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
@@ -318,6 +319,33 @@ def place_market_buy_order(ticker: str, quantity: int) -> str | None:
         "ORD_UNPR": "0",
     }
     data = _kis_post(ORDER_CASH_PATH, ORDER_BUY_TR_ID, body)
+    if data is None:
+        return None
+
+    return (data.get("output") or {}).get("ODNO")
+
+
+def place_market_sell_order(ticker: str, quantity: int) -> str | None:
+    """모의투자 계좌로 시장가 매도 주문을 접수한다. place_market_buy_order와
+    완전히 대칭 — 같은 엔드포인트를 tr_id만 바꿔서 쓴다(KIS의 매수/매도 공통
+    설계). 성공하면 주문번호(ODNO)를 반환한다.
+
+    구조 검증은 매수와 별개로 라이브로 다시 확인했다(2026-08-09) — 같은
+    "모의투자 영업일이 아닙니다" 응답으로 계좌·파라미터가 정상 처리됨을
+    확인했다. 실제 체결은 매수와 마찬가지로 장중 재검증이 필요하다.
+    """
+    if quantity <= 0:
+        return None
+
+    body = {
+        "CANO": os.getenv("KIS_ACCOUNT_NO", ""),
+        "ACNT_PRDT_CD": ACCOUNT_PRODUCT_CODE,
+        "PDNO": ticker,
+        "ORD_DVSN": "01",  # 시장가
+        "ORD_QTY": str(quantity),
+        "ORD_UNPR": "0",
+    }
+    data = _kis_post(ORDER_CASH_PATH, ORDER_SELL_TR_ID, body)
     if data is None:
         return None
 

@@ -89,10 +89,12 @@ SIMA_LIVE_TEST=1 .venv/bin/pytest tests/test_live_smoke.py -v -s  # 실제 API �
 - 하루치 전체 배선 (`pipeline.run_daily`): 완료 — 유니버스 구성 → 정량 필터 → run_day.
   실제 실행은 아직 안 함(비용 발생, 사용자 승인 필요)
 - 마일스톤 3 (IC 측정): 인프라만 구축, 실측 데이터 축적 전
-- 매도 로직 (`src/sell.py` + `pipeline.evaluate_holdings`): 결정론적 안전장치
-  (손절 -10%, 익절 트레일링)가 매일 보유 종목 전체에 실행되도록 배선 완료.
-  LLM 재량 매도는 미구현
-- 매수 주문 집행 (`pipeline.execute_buy_order`): KIS 모의투자 시장가 주문 +
-  갭 체크(±3%) + 체결가로 `Position.entry_price` 설정까지 구현. 계좌·잔고·현재가
-  조회는 라이브 검증 완료, **실제 주문 체결은 장중 재검증 필요**(구현 시점에
-  장이 닫혀 있어 접수 구조만 확인함)
+- 매도 로직: 결정론적 안전장치(손절 -10%, 익절 트레일링, `src/sell.py`) +
+  LLM 재량 매도(`judgment.judge_sell` — 보유 종목 재평가, 매수 쪽 강세/약세
+  토론+매니저와 대칭 구조)까지 전부 구현. `pipeline.evaluate_holdings`가
+  둘 다 매일 실행되도록 배선(LLM 재량은 옵션, 기본은 꺼져 있음)
+- 주문 집행: 매수(`pipeline.execute_buy_order`)·매도(`sell.execute_sell_order`)
+  둘 다 KIS 모의투자 시장가 주문으로 구현하고 `run_day`/`evaluate_holdings`에
+  실제로 연결 완료(`execute_fn`/`sell_execute_fn` 명시적 주입, 기본값 없음).
+  계좌·잔고·현재가 조회는 라이브 검증 완료, **실제 주문 체결은 장중 재검증
+  필요**(구현 시점에 장이 닫혀 있어 매수·매도 둘 다 접수 구조만 확인함)

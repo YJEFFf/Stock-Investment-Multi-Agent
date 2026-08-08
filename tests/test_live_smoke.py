@@ -116,6 +116,7 @@ def test_combined_analysts_end_to_end_live(tmp_path):
             RiskGateConfig(),
             analyst_fn,
             judgment.judge,
+            pipeline.execute_simulated,  # 판단 체인 확인이 목적 — 실주문은 안 낸다
             total_expected_analysts=3,
             log_path=tmp_path / "combined.jsonl",
         )

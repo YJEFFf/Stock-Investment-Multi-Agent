@@ -118,15 +118,20 @@ class Position(BaseModel):
     peak_price: float | None = None  # 진입(또는 마지막 부분 익절) 이후 관측된 최고가 —
     # 트레일링 익절의 기준점.
     take_profit_stage: int = 0  # 부분 익절이 몇 번 실행됐는지
+    quantity: int | None = None  # 실제 보유 주수. pipeline.execute_buy_order가 실제
+    # KIS 주문을 넣을 때만 채운다 — 브로커에 실주문을 낸 적 없는(순수 시뮬레이션
+    # execute()로 연 포지션은 None으로 남는다. 실제 매도 주문 수량 계산에 쓴다
+    # (weight는 비중일 뿐 절대 주수를 모른다).
 
 
 class SellAction(BaseModel):
     """매도는 Decision과 별도 경로다(Decision.action 주석 참고). 결정론적으로 나온
-    매도(손절/트레일링 익절)는 리스크 게이트를 거치지 않는다 — 보유분을 줄이는
-    행위 자체가 위험을 낮추는 방향이라 "한도 초과"라는 개념이 성립하지 않는다."""
+    매도(손절/트레일링 익절)와 LLM 재량 매도(llm_discretionary — 보유 종목 재평가
+    결과) 모두 리스크 게이트를 거치지 않는다 — 보유분을 줄이는 행위 자체가 위험을
+    낮추는 방향이라 "한도 초과"라는 개념이 성립하지 않는다."""
 
     ticker: str
-    reason: Literal["stop_loss", "take_profit_trail"]
+    reason: Literal["stop_loss", "take_profit_trail", "llm_discretionary"]
     sell_fraction: float = Field(gt=0.0, le=1.0)  # 이 포지션의 현재 weight 대비 매도 비율
 
 

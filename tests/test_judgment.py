@@ -7,15 +7,21 @@ from src import judgment
 from src.judgment import (
     BEAR_PROMPT_PATH,
     BULL_PROMPT_PATH,
+    EXIT_PROMPT_PATH,
     MANAGER_PROMPT_PATH,
+    STAY_PROMPT_PATH,
     _DebateResponse,
     _ManagerResponse,
     _prompt_version,
+    _SellManagerResponse,
     debate,
+    debate_holding,
     judge,
+    judge_sell,
     portfolio_manager,
+    portfolio_manager_sell,
 )
-from src.schemas import AnalystOpinion
+from src.schemas import AnalystOpinion, SellAction
 
 
 def _opinion(agent: str, score: float, confidence: float = 0.6) -> AnalystOpinion:
@@ -112,3 +118,75 @@ def test_portfolio_manager_uses_bull_and_bear_arguments(monkeypatch):
 
     assert decision.action == "HOLD"
     assert decision.debate == [bull, bear]
+
+
+def _fake_sell_debate_and_manager(stay_strength=0.6, exit_strength=0.5, action="HOLD"):
+    async def fake_call_structured(*, system, user, response_model, json_schema, **kwargs):
+        normalized = " ".join(user.split())  # 프롬프트 마크다운 줄바꿈 때문에 공백 정규화 후 매칭
+        if '"stay" debater' in normalized:
+            return _DebateResponse(argument="여전히 유효한 상승 논리", strength=stay_strength)
+        if '"exit" debater' in normalized:
+            return _DebateResponse(argument="처음 매수 근거가 무너짐", strength=exit_strength)
+        if "reassessing a position that is already held" in normalized:
+            return _SellManagerResponse(action=action, reasoning="재평가 근거")
+        raise AssertionError(f"unexpected prompt: {user[:80]}")
+
+    return fake_call_structured
+
+
+def test_debate_holding_produces_independent_stay_and_exit(monkeypatch):
+    monkeypatch.setattr(judgment.llm, "call_structured", _fake_sell_debate_and_manager())
+
+    opinions = [_opinion("chart", 0.5), _opinion("news", -0.2)]
+    stay, exit_case = asyncio.run(debate_holding("005930", opinions, unrealized_pct=0.05))
+
+    assert stay.stance == "bull"
+    assert exit_case.stance == "bear"
+
+    expected_stay_version = _prompt_version(STAY_PROMPT_PATH.read_text())
+    expected_exit_version = _prompt_version(EXIT_PROMPT_PATH.read_text())
+    assert stay.evidence == [f"prompt:debate_stay@{expected_stay_version}"]
+    assert exit_case.evidence == [f"prompt:debate_exit@{expected_exit_version}"]
+
+
+def test_judge_sell_returns_none_without_opinions():
+    assert asyncio.run(judge_sell("005930", [], unrealized_pct=0.0)) is None
+
+
+def test_judge_sell_returns_none_on_hold(monkeypatch):
+    monkeypatch.setattr(judgment.llm, "call_structured", _fake_sell_debate_and_manager(action="HOLD"))
+
+    opinions = [_opinion("chart", 0.5)]
+    result = asyncio.run(judge_sell("005930", opinions, unrealized_pct=0.05))
+
+    assert result is None
+
+
+def test_judge_sell_returns_sell_action_on_sell(monkeypatch):
+    monkeypatch.setattr(judgment.llm, "call_structured", _fake_sell_debate_and_manager(action="SELL"))
+
+    opinions = [_opinion("chart", -0.5)]
+    result = asyncio.run(judge_sell("005930", opinions, unrealized_pct=-0.03))
+
+    assert result == SellAction(ticker="005930", reason="llm_discretionary", sell_fraction=1.0)
+
+
+def test_portfolio_manager_sell_propagates_llm_failure(monkeypatch):
+    async def failing(**kwargs):
+        raise RuntimeError("llm exhausted retries")
+
+    monkeypatch.setattr(judgment.llm, "call_structured", failing)
+
+    opinions = [_opinion("chart", 0.5)]
+    with pytest.raises(RuntimeError):
+        asyncio.run(judge_sell("005930", opinions, unrealized_pct=0.0))
+
+
+def test_portfolio_manager_sell_uses_stay_and_exit_arguments(monkeypatch):
+    monkeypatch.setattr(judgment.llm, "call_structured", _fake_sell_debate_and_manager(action="SELL"))
+
+    opinions = [_opinion("chart", -0.4)]
+    stay, exit_case = asyncio.run(debate_holding("005930", opinions, unrealized_pct=-0.05))
+    action = asyncio.run(portfolio_manager_sell("005930", opinions, stay, exit_case, unrealized_pct=-0.05))
+
+    assert action == SellAction(ticker="005930", reason="llm_discretionary", sell_fraction=1.0)

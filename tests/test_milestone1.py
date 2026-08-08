@@ -2,7 +2,7 @@ import asyncio
 import random
 from datetime import datetime, timedelta, timezone
 
-from src.pipeline import make_dummy_analyst_fn, propose_decision, run_day, summarize_log
+from src.pipeline import execute_simulated, make_dummy_analyst_fn, propose_decision, run_day, summarize_log
 from src.schemas import PortfolioState, RiskGateConfig
 
 SECTORS = ["반도체", "IT", "화학", "자동차", "금융"]
@@ -25,7 +25,7 @@ def _simulate(log_path):
             # 당일 손익은 분석 결과와 무관한 시장 요인 — 별도 시드로 시뮬레이션.
             portfolio = portfolio.model_copy(update={"daily_pnl_pct": pnl_rng.uniform(-0.08, 0.03)})
             portfolio, _ = await run_day(
-                UNIVERSE, day, portfolio, config, analyst_fn, propose_decision, log_path=log_path
+                UNIVERSE, day, portfolio, config, analyst_fn, propose_decision, execute_simulated, log_path=log_path
             )
 
     asyncio.run(_run())

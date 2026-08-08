@@ -16,6 +16,7 @@ from src.schemas import (
     PortfolioState,
     Position,
     RiskGateConfig,
+    SellAction,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,21 @@ AnalystFn = Callable[[str, str, datetime], Awaitable[list[AnalystOpinion]]]
 # 종목 하나의 의견 목록을 받아 최종 Decision을 내리는 함수. 비용 없는 propose_decision()
 # (더미/테스트 경로)와 실제 LLM 토론+매니저인 judgment.judge()가 같은 형태를 공유한다.
 JudgeFn = Callable[[list[AnalystOpinion], int], Awaitable[Decision | None]]
+
+# 승인된(또는 거부된) Decision을 포트폴리오에 반영하는 함수. 가격 개념 없는
+# 순수 시뮬레이션(execute_simulated, 무비용)과 실제 KIS 주문까지 내는
+# execute_buy_order가 같은 형태를 공유한다.
+ExecuteFn = Callable[[Decision, GateResult, PortfolioState, str, float], Awaitable[PortfolioState]]
+
+# SellAction을 포트폴리오에 반영하는 함수. 무비용 시뮬레이션(sell.execute_sell_simulated)
+# 과 실제 KIS 매도 주문(sell.execute_sell_order)이 같은 형태를 공유한다.
+SellExecuteFn = Callable[[PortfolioState, SellAction, float], Awaitable[PortfolioState]]
+
+# 보유 종목 재평가(LLM 재량 매도)용 판단 함수. judgment.judge_sell이 이 형태를 따른다.
+# evaluate_holdings에서 기본값 None이면 이 계층 자체를 건너뛴다 — 결정론적
+# 안전장치와 달리 LLM 재량은 진짜로 선택적인 추가 비용이라, 명시적으로 넣지
+# 않으면 안전하게 꺼져 있는 쪽을 기본으로 한다.
+JudgeSellFn = Callable[[str, list[AnalystOpinion], float], Awaitable[SellAction | None]]
 
 
 async def propose_decision(opinions: list[AnalystOpinion], total_expected_analysts: int) -> Decision | None:
@@ -153,6 +169,18 @@ def execute(
     )
 
 
+async def execute_simulated(
+    decision: Decision,
+    gate_result: GateResult,
+    portfolio: PortfolioState,
+    sector: str,
+    trade_weight: float,
+) -> PortfolioState:
+    """execute()를 ExecuteFn 인터페이스에 맞춘 비동기 래퍼 — 무비용 시뮬레이션 경로.
+    run_day가 실제 실행(execute_buy_order)과 동일한 형태로 주입받을 수 있게 한다."""
+    return execute(decision, gate_result, portfolio, sector, trade_weight)
+
+
 async def execute_buy_order(
     decision: Decision,
     gate_result: GateResult,
@@ -221,6 +249,7 @@ async def execute_buy_order(
         existing.entry_price = (old_basis + new_basis) / new_weight
         existing.weight = new_weight
         existing.peak_price = max(existing.peak_price or entry_price, entry_price)
+        existing.quantity = (existing.quantity or 0) + quantity
     else:
         positions.append(
             Position(
@@ -229,6 +258,7 @@ async def execute_buy_order(
                 weight=trade_weight,
                 entry_price=entry_price,
                 peak_price=entry_price,
+                quantity=quantity,
             )
         )
 
@@ -425,16 +455,18 @@ async def run_daily(
     config: RiskGateConfig,
     analyst_fn: AnalystFn,
     judge_fn: JudgeFn,
+    execute_fn: ExecuteFn,
     total_expected_analysts: int = 1,
     log_path: Path = DEFAULT_LOG_PATH,
 ) -> tuple[PortfolioState, list[tuple[Decision, GateResult]]]:
     """하루치 전체 파이프라인 진입점: 코스피200 유니버스 구성 -> 정량 필터 ->
-    run_day(analyst_fn, judge_fn). 유니버스 조회 자체가 실패하면(네이버 접근 불가
-    등) 그날은 빈 결과로 관망한다 — 매수 없음이 기본 상태다(규칙 1).
+    run_day(analyst_fn, judge_fn, execute_fn). 유니버스 조회 자체가 실패하면(네이버
+    접근 불가 등) 그날은 빈 결과로 관망한다 — 매수 없음이 기본 상태다(규칙 1).
 
-    analyst_fn/judge_fn은 run_day와 마찬가지로 기본값이 없다 — 실제 LLM 경로
-    (judgment.judge, 비용 발생)를 쓸지 무비용 경로(propose_decision)를 쓸지 호출부가
-    항상 명시해야 실수로 비용이 나가지 않는다.
+    analyst_fn/judge_fn/execute_fn은 run_day와 마찬가지로 기본값이 없다 — 실제 LLM
+    경로(judgment.judge, 비용 발생)·실제 주문 집행(execute_buy_order, 실거래 발생)을
+    쓸지 무비용 경로(propose_decision/execute_simulated)를 쓸지 호출부가 항상
+    명시해야 실수로 비용이나 실주문이 나가지 않는다.
     """
     universe = await build_universe_with_sectors()
     if universe is None:
@@ -450,7 +482,7 @@ async def run_daily(
     )
 
     return await run_day(
-        filtered, day, portfolio, config, analyst_fn, judge_fn, total_expected_analysts, log_path
+        filtered, day, portfolio, config, analyst_fn, judge_fn, execute_fn, total_expected_analysts, log_path
     )
 
 
@@ -461,15 +493,17 @@ async def run_day(
     config: RiskGateConfig,
     analyst_fn: AnalystFn,
     judge_fn: JudgeFn,
+    execute_fn: ExecuteFn,
     total_expected_analysts: int = 1,
     log_path: Path = DEFAULT_LOG_PATH,
 ) -> tuple[PortfolioState, list[tuple[Decision, GateResult]]]:
     """유니버스(종목, 섹터)를 순회하며 분석→판단→게이트→집행을 실행하고 로그를 남긴다.
 
     분석가 호출과 판단(judge_fn) 호출 모두 asyncio.gather(..., return_exceptions=True)로
-    병렬 실행한다 — 한 종목의 호출이 실패해도 다른 종목은 영향받지 않는다. judge_fn은
-    기본값이 없다 — 비용 없는 propose_decision인지 실제 LLM 토론+매니저(judgment.judge)
-    인지 호출부가 항상 명시적으로 골라야 한다.
+    병렬 실행한다 — 한 종목의 호출이 실패해도 다른 종목은 영향받지 않는다. judge_fn과
+    execute_fn 둘 다 기본값이 없다 — 비용 없는 propose_decision/execute_simulated인지
+    실제 LLM 토론+매니저(judgment.judge)·실제 KIS 주문(execute_buy_order)인지 호출부가
+    항상 명시적으로 골라야 한다.
     """
     raw_results = await asyncio.gather(
         *(analyst_fn(ticker, sector, day) for ticker, sector in universe), return_exceptions=True
@@ -507,7 +541,7 @@ async def run_day(
         else:
             gate_result = GateResult(approved=False, rejected_by=None)
 
-        portfolio = execute(decision, gate_result, portfolio, sector, TRADE_WEIGHT)
+        portfolio = await execute_fn(decision, gate_result, portfolio, sector, TRADE_WEIGHT)
         results.append((decision, gate_result))
 
         # avg_score/avg_confidence는 마일스톤 3 IC 계산의 원재료 — decision.inputs에서
@@ -534,18 +568,29 @@ async def run_day(
 async def evaluate_holdings(
     portfolio: PortfolioState,
     day: datetime,
+    sell_execute_fn: SellExecuteFn,
+    analyst_fn: AnalystFn | None = None,
+    judge_sell_fn: JudgeSellFn | None = None,
     log_path: Path = DEFAULT_SELL_LOG_PATH,
 ) -> PortfolioState:
-    """보유 포지션 전체에 결정론적 매도 안전장치(손절/트레일링 익절, src/sell.py)를
-    적용한다.
+    """보유 포지션 전체를 매일 재평가한다 — 결정론적 안전장치(손절/트레일링
+    익절, src/sell.py)는 항상 돌고, LLM 재량 매도(judgment.judge_sell)는
+    analyst_fn/judge_sell_fn을 넣었을 때만 추가로 돈다.
 
     매수 쪽엔 정량 필터(quant_prefilter)가 있지만 이쪽엔 없다 — 필요가 없다.
     리스크 게이트가 종목당 최대 비중을 15%로 막아둬서 보유 종목 수 자체가
     원천적으로 적다(최대 ~7개). 그래서 매일 보유 종목 전부를 그냥 평가한다.
 
-    LLM 재량 매도는 아직 없다 — 여기선 안전장치만 실행한다. 가격 조회가
-    실패한 종목은 오늘 평가를 건너뛴다(collectors/kis 단에서 이미 재시도를
-    소진한 뒤라 여기서 다시 재시도하지 않는다, 규칙 4).
+    sell_execute_fn은 기본값이 없다 — 무비용 시뮬레이션(execute_sell_simulated)인지
+    실제 KIS 매도 주문(execute_sell_order)인지 호출부가 항상 명시해야 한다.
+    analyst_fn/judge_sell_fn은 반대로 기본값이 None이다 — 결정론적 안전장치와
+    달리 LLM 재량은 진짜 선택적인 추가 비용이라 명시적으로 켜지 않으면 꺼져
+    있는 쪽이 안전한 기본값이다.
+
+    한 종목에 대해 결정론적 매도가 이미 트리거되면 그날은 그걸로 끝이다 —
+    같은 포지션에 대해 코드가 이미 팔기로 결정했는데 LLM에게 다시 물어볼
+    이유가 없다. 가격 조회가 실패한 종목은 오늘 평가를 건너뛴다(collectors/kis
+    단에서 이미 재시도를 소진한 뒤라 여기서 다시 재시도하지 않는다, 규칙 4).
     """
     if not portfolio.positions:
         return portfolio
@@ -572,10 +617,25 @@ async def evaluate_holdings(
         )
 
         action = sell.evaluate_deterministic_sell(position, current_price)
+
+        if action is None and analyst_fn is not None and judge_sell_fn is not None:
+            try:
+                opinions = await analyst_fn(ticker, position.sector, day)
+            except Exception as exc:  # noqa: BLE001 - 재평가 실패는 그냥 오늘 평가 스킵
+                logger.warning("evaluate_holdings_reanalysis_failed ticker=%s error=%s", ticker, exc)
+                opinions = []
+
+            unrealized_pct = (
+                (current_price - position.entry_price) / position.entry_price
+                if position.entry_price
+                else 0.0
+            )
+            action = await judge_sell_fn(ticker, opinions, unrealized_pct)
+
         if action is None:
             continue
 
-        portfolio = sell.execute_sell(portfolio, action, current_price)
+        portfolio = await sell_execute_fn(portfolio, action, current_price)
         _append_log(
             log_path,
             {

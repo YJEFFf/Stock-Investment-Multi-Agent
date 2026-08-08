@@ -96,6 +96,7 @@ def test_chart_analyst_signal_rate_over_real_history(tmp_path):
                 config,
                 make_analyst_fn(eval_date),
                 pipeline.propose_decision,
+                pipeline.execute_simulated,
                 log_path=log_path,
             )
             buys = [d.ticker for d, g in results if d.action == "BUY" and g.approved]
