@@ -194,3 +194,138 @@ def test_fetch_daily_ohlcv_trims_to_lookback_days(monkeypatch):
 
     assert len(bars) == 1
     assert bars[0].date == date(2026, 1, 2)  # 최신 것만 남는다
+
+
+# --- _kis_post / _kis_request (POST 경로) ---
+
+
+def test_kis_post_sends_body_and_returns_data_on_success(monkeypatch):
+    monkeypatch.setattr(kis, "get_access_token", lambda: "tok")
+    captured = {}
+
+    class FakeResponse:
+        def json(self):
+            return {"rt_cd": "0", "msg_cd": "0", "msg1": "ok", "output": {"ODNO": "123"}}
+
+    def fake_post(url, headers=None, data=None, timeout=None):
+        captured["headers"] = headers
+        captured["data"] = data
+        return FakeResponse()
+
+    monkeypatch.setattr(kis.requests, "post", fake_post)
+
+    result = kis._kis_post("/some/path", "TRID", {"A": "1"})
+
+    assert result["output"]["ODNO"] == "123"
+    assert captured["headers"]["custtype"] == "P"
+    assert json.loads(captured["data"]) == {"A": "1"}
+
+
+def test_kis_post_returns_none_on_api_error(monkeypatch):
+    monkeypatch.setattr(kis, "get_access_token", lambda: "tok")
+
+    class FakeResponse:
+        def json(self):
+            return {"rt_cd": "1", "msg_cd": "SOME_ERROR", "msg1": "실패"}
+
+    monkeypatch.setattr(kis.requests, "post", lambda *a, **k: FakeResponse())
+
+    assert kis._kis_post("/some/path", "TRID", {}) is None
+
+
+# --- fetch_current_price ---
+
+
+def test_fetch_current_price_success(monkeypatch):
+    monkeypatch.setattr(
+        kis, "_kis_get", lambda path, tr_id, params: {"rt_cd": "0", "output": {"stck_prpr": "231000"}}
+    )
+
+    assert kis.fetch_current_price("005930") == 231000.0
+
+
+def test_fetch_current_price_returns_none_when_request_fails(monkeypatch):
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params: None)
+
+    assert kis.fetch_current_price("005930") is None
+
+
+# --- fetch_account_balance ---
+
+
+def test_fetch_account_balance_success(monkeypatch):
+    monkeypatch.setattr(
+        kis, "_kis_get", lambda path, tr_id, params: {"output2": [{"tot_evlu_amt": "100000000"}]}
+    )
+
+    assert kis.fetch_account_balance() == 100000000.0
+
+
+def test_fetch_account_balance_returns_none_when_output_empty(monkeypatch):
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params: {"output2": []})
+
+    assert kis.fetch_account_balance() is None
+
+
+# --- place_market_buy_order ---
+
+
+def test_place_market_buy_order_returns_order_number(monkeypatch):
+    captured = {}
+
+    def fake_post(path, tr_id, body):
+        captured["body"] = body
+        captured["tr_id"] = tr_id
+        return {"output": {"ODNO": "0000123456"}}
+
+    monkeypatch.setattr(kis, "_kis_post", fake_post)
+
+    order_no = kis.place_market_buy_order("005930", 10)
+
+    assert order_no == "0000123456"
+    assert captured["body"]["PDNO"] == "005930"
+    assert captured["body"]["ORD_QTY"] == "10"
+    assert captured["body"]["ORD_DVSN"] == "01"  # 시장가
+    assert captured["tr_id"] == kis.ORDER_BUY_TR_ID
+
+
+def test_place_market_buy_order_rejects_non_positive_quantity(monkeypatch):
+    def fail_post(*a, **k):
+        raise AssertionError("수량이 0 이하면 API를 호출하면 안 된다")
+
+    monkeypatch.setattr(kis, "_kis_post", fail_post)
+
+    assert kis.place_market_buy_order("005930", 0) is None
+
+
+def test_place_market_buy_order_returns_none_when_request_fails(monkeypatch):
+    monkeypatch.setattr(kis, "_kis_post", lambda path, tr_id, body: None)
+
+    assert kis.place_market_buy_order("005930", 10) is None
+
+
+# --- fetch_fill_price ---
+
+
+def test_fetch_fill_price_success(monkeypatch):
+    monkeypatch.setattr(
+        kis, "_kis_get", lambda path, tr_id, params: {"output2": {"pchs_avg_pric": "231500.0000"}}
+    )
+
+    price = kis.fetch_fill_price("005930", date(2026, 8, 9))
+
+    assert price == pytest.approx(231500.0)
+
+
+def test_fetch_fill_price_returns_none_when_no_fills(monkeypatch):
+    monkeypatch.setattr(
+        kis, "_kis_get", lambda path, tr_id, params: {"output2": {"pchs_avg_pric": "0"}}
+    )
+
+    assert kis.fetch_fill_price("005930", date(2026, 8, 9)) is None
+
+
+def test_fetch_fill_price_returns_none_when_request_fails(monkeypatch):
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params: None)
+
+    assert kis.fetch_fill_price("005930", date(2026, 8, 9)) is None

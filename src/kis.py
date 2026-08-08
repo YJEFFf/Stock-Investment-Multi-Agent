@@ -1,4 +1,4 @@
-"""한국투자증권(KIS) Open API 클라이언트 — 시세 데이터 수집 전용, 모의투자만.
+"""한국투자증권(KIS) Open API 클라이언트 — 시세 조회 + 모의투자 주문 집행.
 
 collectors.py(Naver 스크래핑)와 분리한 이유: 인증 토큰 수명 관리·초당 거래건수
 제한 대응은 HTML 파싱과 완전히 다른 종류의 문제라 고치는 이유가 다르다
@@ -13,6 +13,18 @@ CLAUDE.md 규칙 7: 모의투자 도메인(openapivts)만 호출한다. 실전�
   msg_cd="EGW00201"로 응답한다 (msg1 텍스트가 아니라 msg_cd로 판별하는 게 안전).
 - inquire-daily-itemchartprice는 조회 기간을 얼마나 넓게 잡아도 최근 100
   거래일로 캡핑된다.
+
+실측으로 확인한 것 (2026-08-09, 주문 관련):
+- 계좌번호(CANO)는 .env의 KIS_ACCOUNT_NO(8자리), 상품코드(ACNT_PRDT_CD)는 "01"
+  — 실제 주문·잔고조회 API로 검증됨(정상 응답, "01"이 아니면 계좌 인증 자체가
+  거부됐을 것).
+- 잔고조회(inquire-balance)는 라이브로 완전히 검증됨 — 총평가금액
+  tot_evlu_amt가 사용자가 설정한 초기자금 1억(100000000)과 정확히 일치.
+- **주문 접수(order-cash)는 구조만 검증됐다** — 계좌·파라미터는 정상 처리됐지만
+  응답이 "모의투자 영업일이 아닙니다"(장이 닫혀 있음)라 실제 체결까지는 못
+  봤다. 체결가 조회(inquire-daily-ccld)의 output1(주문별 체결 내역) 필드명은
+  실제 체결 건이 없어 확인 못 했고, 대신 output2(집계, pchs_avg_pric 등 필드명
+  확인됨)로 우회한다. 장중에 실제 매수가 한 번 나가면 이 부분을 재검증할 것.
 """
 
 import json
@@ -20,7 +32,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -36,6 +48,15 @@ BASE_URL = "https://openapivts.koreainvestment.com:29443"  # 모의투자 전용
 TOKEN_PATH = "/oauth2/tokenP"
 DAILY_CHART_PATH = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
 DAILY_CHART_TR_ID = "FHKST03010100"
+CURRENT_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
+CURRENT_PRICE_TR_ID = "FHKST01010100"
+ORDER_CASH_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
+ORDER_BUY_TR_ID = "VTTC0802U"  # 모의투자 현금 매수 주문
+DAILY_CCLD_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+DAILY_CCLD_TR_ID = "VTTC8001R"  # 모의투자 주식일별주문체결조회
+BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
+BALANCE_TR_ID = "VTTC8434R"  # 모의투자 주식잔고조회
+ACCOUNT_PRODUCT_CODE = "01"  # 실측으로 확인됨 — 계좌번호 뒤 2자리
 
 TOKEN_CACHE_PATH = Path(__file__).resolve().parent.parent / ".kis_token_cache.json"
 
@@ -116,8 +137,10 @@ def _throttle() -> None:
         _last_request_at = time.monotonic()
 
 
-def _kis_get(path: str, tr_id: str, params: dict) -> dict | None:
-    """공통 KIS GET 요청. 초당 거래건수 제한(EGW00201)만 재시도 대상이다.
+def _kis_request(
+    method: str, path: str, tr_id: str, *, params: dict | None = None, body: dict | None = None
+) -> dict | None:
+    """공통 KIS 요청(GET/POST). 초당 거래건수 제한(EGW00201)만 재시도 대상이다.
 
     네트워크 예외도 재시도 대상(규칙 4)이지만, 그 외 API 비즈니스 오류
     (rt_cd != "0", 예: 잘못된 종목코드)는 재시도해도 같은 응답이 나오므로
@@ -135,14 +158,21 @@ def _kis_get(path: str, tr_id: str, params: dict) -> dict | None:
         "appsecret": os.getenv("KIS_APP_SECRET", ""),
         "tr_id": tr_id,
     }
+    if body is not None:
+        headers["custtype"] = "P"
 
     last_error: Exception | str | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         _throttle()
         try:
-            response = requests.get(
-                f"{BASE_URL}{path}", headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS
-            )
+            if method == "GET":
+                response = requests.get(
+                    f"{BASE_URL}{path}", headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS
+                )
+            else:
+                response = requests.post(
+                    f"{BASE_URL}{path}", headers=headers, data=json.dumps(body), timeout=REQUEST_TIMEOUT_SECONDS
+                )
             data = response.json()
         except (requests.RequestException, ValueError) as exc:
             last_error = exc
@@ -166,6 +196,14 @@ def _kis_get(path: str, tr_id: str, params: dict) -> dict | None:
 
     logger.error("kis_fetch_exhausted path=%s error=%s", path, last_error)
     return None
+
+
+def _kis_get(path: str, tr_id: str, params: dict) -> dict | None:
+    return _kis_request("GET", path, tr_id, params=params)
+
+
+def _kis_post(path: str, tr_id: str, body: dict) -> dict | None:
+    return _kis_request("POST", path, tr_id, body=body)
 
 
 def _parse_daily_chart(data: dict) -> list[OHLCVBar]:
@@ -214,3 +252,109 @@ def fetch_daily_ohlcv(ticker: str, lookback_days: int = 60) -> list[OHLCVBar] | 
     if not bars:
         return None
     return bars[-lookback_days:]
+
+
+def fetch_current_price(ticker: str) -> float | None:
+    """실시간 현재가. 갭 체크(장 시작가 vs 전일 종가)와 주문 수량 계산에 쓴다."""
+    params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}
+    data = _kis_get(CURRENT_PRICE_PATH, CURRENT_PRICE_TR_ID, params)
+    if data is None:
+        return None
+
+    price_str = (data.get("output") or {}).get("stck_prpr")
+    if not price_str:
+        return None
+    return float(price_str)
+
+
+def fetch_account_balance() -> float | None:
+    """계좌 총평가금액(tot_evlu_amt). 비중(weight) 기반 주문 수량을 절대
+    원화·주수로 환산하려면 이 값이 필요하다 — PortfolioState는 비중만 들고
+    있고 절대 금액은 추적하지 않으므로, 매번 브로커(KIS)를 실제 잔고의
+    출처로 삼는다(자체 상태와 동기화 문제를 피하기 위해)."""
+    params = {
+        "CANO": os.getenv("KIS_ACCOUNT_NO", ""),
+        "ACNT_PRDT_CD": ACCOUNT_PRODUCT_CODE,
+        "AFHR_FLPR_YN": "N",
+        "OFL_YN": "",
+        "INQR_DVSN": "02",
+        "UNPR_DVSN": "01",
+        "FUND_STTL_ICLD_YN": "N",
+        "FNCG_AMT_AUTO_RDPT_YN": "N",
+        "PRCS_DVSN": "01",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+    data = _kis_get(BALANCE_PATH, BALANCE_TR_ID, params)
+    if data is None:
+        return None
+
+    rows = data.get("output2") or []
+    if not rows:
+        return None
+    amount_str = rows[0].get("tot_evlu_amt")
+    if not amount_str:
+        return None
+    return float(amount_str)
+
+
+def place_market_buy_order(ticker: str, quantity: int) -> str | None:
+    """모의투자 계좌로 시장가 매수 주문을 접수한다. 성공하면 주문번호(ODNO)를
+    반환한다 — 주문 접수와 체결은 별개 이벤트라 체결가는 fetch_fill_price로
+    따로 조회해야 한다.
+
+    실거래시간 종단 검증은 아직 못 했다(2026-08-09, 장이 닫혀 있어 "모의투자
+    영업일이 아닙니다" 응답만 확인) — 계좌·파라미터 형태는 정상 처리됐다.
+    """
+    if quantity <= 0:
+        return None
+
+    body = {
+        "CANO": os.getenv("KIS_ACCOUNT_NO", ""),
+        "ACNT_PRDT_CD": ACCOUNT_PRODUCT_CODE,
+        "PDNO": ticker,
+        "ORD_DVSN": "01",  # 시장가
+        "ORD_QTY": str(quantity),
+        "ORD_UNPR": "0",
+    }
+    data = _kis_post(ORDER_CASH_PATH, ORDER_BUY_TR_ID, body)
+    if data is None:
+        return None
+
+    return (data.get("output") or {}).get("ODNO")
+
+
+def fetch_fill_price(ticker: str, order_date: date) -> float | None:
+    """그날 그 종목의 매수 평균 체결가. inquire-daily-ccld의 output2(집계)에서
+    구매평균가격(pchs_avg_pric)을 쓴다 — 종목·날짜를 좁혀서 조회하므로 이 주문
+    하나의 평균 체결가와 사실상 같다(같은 날 같은 종목을 두 번 매수하지 않는 한).
+
+    output1(주문별 체결 내역)의 필드명은 아직 실측으로 확인 못 했다(2026-08-09,
+    실제 체결 건이 없어서) — 그래서 필드명이 이미 확인된 output2 집계 쪽을 쓴다.
+    """
+    date_str = order_date.strftime("%Y%m%d")
+    params = {
+        "CANO": os.getenv("KIS_ACCOUNT_NO", ""),
+        "ACNT_PRDT_CD": ACCOUNT_PRODUCT_CODE,
+        "INQR_STRT_DT": date_str,
+        "INQR_END_DT": date_str,
+        "SLL_BUY_DVSN_CD": "00",
+        "INQR_DVSN": "00",
+        "PDNO": ticker,
+        "CCLD_DVSN": "00",
+        "ORD_GNO_BRNO": "",
+        "ODNO": "",
+        "INQR_DVSN_3": "00",
+        "INQR_DVSN_1": "",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+    data = _kis_get(DAILY_CCLD_PATH, DAILY_CCLD_TR_ID, params)
+    if data is None:
+        return None
+
+    price_str = (data.get("output2") or {}).get("pchs_avg_pric")
+    if not price_str:
+        return None
+    price = float(price_str)
+    return price if price > 0 else None

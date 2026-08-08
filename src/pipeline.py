@@ -2,10 +2,10 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-from src import collectors
+from src import collectors, kis
 from src.analysts import chart_analyst, disclosure_analyst, dummy_analyst, news_analyst
 from src.schemas import (
     AnalystOpinion,
@@ -27,6 +27,11 @@ MIN_CONFIDENCE = 0.7
 
 # 포지션 사이징 로직이 아직 없어서 쓰는 고정값 — 실제 사이징 알고리즘이 들어오면 교체.
 TRADE_WEIGHT = 0.08
+
+# 판단 시점(전일 데이터 기준)과 실제 집행 시점(장 시작) 사이에 가격이 이 이상
+# 벌어지면 매수를 스킵한다 — 사용자 확정치(2026-08-09). 판단 근거가 낡았다고
+# 보고 억지로 체결시키지 않는다(규칙 2·3과 같은 정신: 조건이 안 맞으면 안 산다).
+GAP_SKIP_THRESHOLD_PCT = 0.03
 
 DEFAULT_LOG_PATH = Path("logs/pipeline.jsonl")
 
@@ -125,7 +130,11 @@ def execute(
     sector: str,
     trade_weight: float,
 ) -> PortfolioState:
-    """승인된 BUY만 포트폴리오에 반영하는 순수 함수. 실거래 API 호출 없음 (규칙 7)."""
+    """승인된 BUY만 포트폴리오에 반영하는 순수 함수. 실거래 API 호출 없음(규칙 7) —
+    가격 개념이 아예 없는 시뮬레이션 전용 경로다(entry_price를 채우지 않는다).
+    무비용 테스트·측정용으로 계속 남겨둔다. 실제 KIS 모의투자 주문까지 내는
+    경로는 execute_buy_order를 쓴다.
+    """
     if not (decision.action == "BUY" and gate_result.approved):
         return portfolio
 
@@ -135,6 +144,92 @@ def execute(
         existing.weight += trade_weight
     else:
         positions.append(Position(ticker=decision.ticker, sector=sector, weight=trade_weight))
+
+    return PortfolioState(
+        positions=positions,
+        cash_weight=portfolio.cash_weight - trade_weight,
+        daily_pnl_pct=portfolio.daily_pnl_pct,
+    )
+
+
+async def execute_buy_order(
+    decision: Decision,
+    gate_result: GateResult,
+    portfolio: PortfolioState,
+    sector: str,
+    trade_weight: float,
+) -> PortfolioState:
+    """게이트를 통과한 BUY를 실제 KIS 모의투자 시장가 주문으로 집행한다.
+
+    execute()와 달리 실제 KIS API를 호출한다(모의투자만, 규칙 7). 판단 시점(전일
+    데이터 기준)과 집행 시점(장 시작) 사이 가격이 GAP_SKIP_THRESHOLD_PCT 이상
+    벌어지면 판단 근거가 낡았다고 보고 스킵한다. 가격·잔고 조회 중 하나라도
+    실패하거나 주문이 거부되면 매수 없이 그대로 반환한다 — 매수를 강행할 이유가
+    없다(규칙 1, 기본 상태는 현금).
+
+    포지션이 이미 있으면 진입가를 비중 가중평균으로 갱신한다(근사치 — weight는
+    "그 시점 총자산 대비 비중"이라 매수 시점마다 총자산이 달라지면 완전히
+    정확하진 않다. 포지션을 추가매수하는 경우는 드물어 이 근사로 충분하다고
+    본다).
+    """
+    if not (decision.action == "BUY" and gate_result.approved):
+        return portfolio
+
+    ticker = decision.ticker
+
+    prev_bars, current_price = await asyncio.gather(
+        asyncio.to_thread(kis.fetch_daily_ohlcv, ticker, 2),
+        asyncio.to_thread(kis.fetch_current_price, ticker),
+    )
+    if not prev_bars or current_price is None:
+        logger.warning("execute_buy_order_skipped ticker=%s reason=price_data_unavailable", ticker)
+        return portfolio
+
+    prev_close = prev_bars[-1].close
+    gap_pct = abs(current_price - prev_close) / prev_close
+    if gap_pct > GAP_SKIP_THRESHOLD_PCT:
+        logger.warning("execute_buy_order_skipped ticker=%s reason=gap_too_large gap_pct=%.4f", ticker, gap_pct)
+        return portfolio
+
+    total_value = await asyncio.to_thread(kis.fetch_account_balance)
+    if total_value is None:
+        logger.warning("execute_buy_order_skipped ticker=%s reason=balance_unavailable", ticker)
+        return portfolio
+
+    quantity = int((total_value * trade_weight) // current_price)
+    if quantity <= 0:
+        logger.warning("execute_buy_order_skipped ticker=%s reason=quantity_zero", ticker)
+        return portfolio
+
+    order_no = await asyncio.to_thread(kis.place_market_buy_order, ticker, quantity)
+    if order_no is None:
+        logger.error("execute_buy_order_failed ticker=%s reason=order_rejected", ticker)
+        return portfolio
+
+    fill_price = await asyncio.to_thread(kis.fetch_fill_price, ticker, datetime.now(timezone.utc).date())
+    # 체결가 조회가 실패해도 주문 자체는 이미 나갔다 — None보다 현재가 근사치가
+    # 낫다(포지션이 리스크 관리 대상에서 아예 빠지는 걸 막는다).
+    entry_price = fill_price if fill_price is not None else current_price
+
+    positions = [p.model_copy() for p in portfolio.positions]
+    existing = next((p for p in positions if p.ticker == ticker), None)
+    if existing is not None:
+        old_basis = (existing.entry_price or entry_price) * existing.weight
+        new_basis = entry_price * trade_weight
+        new_weight = existing.weight + trade_weight
+        existing.entry_price = (old_basis + new_basis) / new_weight
+        existing.weight = new_weight
+        existing.peak_price = max(existing.peak_price or entry_price, entry_price)
+    else:
+        positions.append(
+            Position(
+                ticker=ticker,
+                sector=sector,
+                weight=trade_weight,
+                entry_price=entry_price,
+                peak_price=entry_price,
+            )
+        )
 
     return PortfolioState(
         positions=positions,

@@ -90,5 +90,8 @@ SIMA_LIVE_TEST=1 .venv/bin/pytest tests/test_live_smoke.py -v -s  # 실제 API �
   실제 실행은 아직 안 함(비용 발생, 사용자 승인 필요)
 - 마일스톤 3 (IC 측정): 인프라만 구축, 실측 데이터 축적 전
 - 매도 로직 (`src/sell.py`): 결정론적 안전장치(손절 -10%, 익절 트레일링) 구현
-  완료. 매수 실행 경로가 아직 진입가를 안 채워서(`Position.entry_price`) 실제
-  작동엔 추가 배선 필요 — 알려진 갭. LLM 재량 매도는 미구현
+  완료. LLM 재량 매도는 미구현
+- 매수 주문 집행 (`pipeline.execute_buy_order`): KIS 모의투자 시장가 주문 +
+  갭 체크(±3%) + 체결가로 `Position.entry_price` 설정까지 구현. 계좌·잔고·현재가
+  조회는 라이브 검증 완료, **실제 주문 체결은 장중 재검증 필요**(구현 시점에
+  장이 닫혀 있어 접수 구조만 확인함)
