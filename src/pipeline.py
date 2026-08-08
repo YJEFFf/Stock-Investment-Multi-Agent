@@ -298,6 +298,66 @@ async def quant_prefilter(
     return passed
 
 
+async def build_universe_with_sectors() -> list[tuple[str, str]] | None:
+    """코스피200 유니버스(네이버)에 업종(네이버, 캐시됨)을 붙여 run_day가 기대하는
+    (종목코드, 업종) 형태로 만든다.
+
+    유니버스 조회 자체가 실패하면 None — 유니버스가 틀리면 그날 전체 판단이
+    왜곡되므로 조용히 진행하지 않는다. 업종 맵은 이보다 관대하게 다룬다: 캐시조차
+    없어 전부 실패해도(사실상 없음) 빈 문자열로 대체하고 계속 진행한다 — 업종을
+    쓰는 건 뉴스 분석가의 업종 배경 뉴스뿐이라, 이거 하나 때문에 하루 전체를 막을
+    이유가 없다(차트·공시 분석가는 sector를 아예 안 씀).
+    """
+    universe, sector_map = await asyncio.gather(
+        asyncio.to_thread(collectors.fetch_kospi200_universe),
+        asyncio.to_thread(collectors.fetch_kospi200_sector_map),
+    )
+    if universe is None:
+        logger.error("build_universe_with_sectors_failed reason=universe_fetch_failed")
+        return None
+
+    if sector_map is None:
+        logger.warning("build_universe_with_sectors_degraded reason=sector_map_unavailable")
+        sector_map = {}
+
+    return [(code, sector_map.get(code, "")) for code, _name in universe]
+
+
+async def run_daily(
+    day: datetime,
+    portfolio: PortfolioState,
+    config: RiskGateConfig,
+    analyst_fn: AnalystFn,
+    judge_fn: JudgeFn,
+    total_expected_analysts: int = 1,
+    log_path: Path = DEFAULT_LOG_PATH,
+) -> tuple[PortfolioState, list[tuple[Decision, GateResult]]]:
+    """하루치 전체 파이프라인 진입점: 코스피200 유니버스 구성 -> 정량 필터 ->
+    run_day(analyst_fn, judge_fn). 유니버스 조회 자체가 실패하면(네이버 접근 불가
+    등) 그날은 빈 결과로 관망한다 — 매수 없음이 기본 상태다(규칙 1).
+
+    analyst_fn/judge_fn은 run_day와 마찬가지로 기본값이 없다 — 실제 LLM 경로
+    (judgment.judge, 비용 발생)를 쓸지 무비용 경로(propose_decision)를 쓸지 호출부가
+    항상 명시해야 실수로 비용이 나가지 않는다.
+    """
+    universe = await build_universe_with_sectors()
+    if universe is None:
+        logger.error("run_daily_aborted day=%s reason=universe_fetch_failed", day.date().isoformat())
+        return portfolio, []
+
+    filtered = await quant_prefilter(universe)
+    logger.info(
+        "run_daily_filtered day=%s universe=%d filtered=%d",
+        day.date().isoformat(),
+        len(universe),
+        len(filtered),
+    )
+
+    return await run_day(
+        filtered, day, portfolio, config, analyst_fn, judge_fn, total_expected_analysts, log_path
+    )
+
+
 async def run_day(
     universe: list[tuple[str, str]],
     day: datetime,

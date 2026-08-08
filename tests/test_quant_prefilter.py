@@ -2,7 +2,7 @@ import asyncio
 from datetime import date, datetime, timezone
 
 from src import collectors, pipeline
-from src.schemas import MarketContext, OHLCVBar
+from src.schemas import MarketContext, OHLCVBar, PortfolioState, RiskGateConfig
 
 
 def _bars(closes: list[float]) -> list[OHLCVBar]:
@@ -143,3 +143,98 @@ def test_quant_prefilter_uses_real_index_bars_for_excess_return(monkeypatch):
     result = asyncio.run(pipeline.quant_prefilter([("005930", "반도체")]))
 
     assert result == [("005930", "반도체")]
+
+
+# --- build_universe_with_sectors / run_daily (전체 배선) ---
+
+
+def test_build_universe_with_sectors_merges_universe_and_sector_map(monkeypatch):
+    monkeypatch.setattr(
+        collectors, "fetch_kospi200_universe", lambda: [("005930", "삼성전자"), ("000660", "SK하이닉스")]
+    )
+    monkeypatch.setattr(collectors, "fetch_kospi200_sector_map", lambda: {"005930": "반도체와반도체장비"})
+
+    universe = asyncio.run(pipeline.build_universe_with_sectors())
+
+    # 매핑에 없는 종목(000660)은 빈 문자열로 대체된다.
+    assert universe == [("005930", "반도체와반도체장비"), ("000660", "")]
+
+
+def test_build_universe_with_sectors_returns_none_when_universe_fetch_fails(monkeypatch):
+    monkeypatch.setattr(collectors, "fetch_kospi200_universe", lambda: None)
+    monkeypatch.setattr(collectors, "fetch_kospi200_sector_map", lambda: {})
+
+    assert asyncio.run(pipeline.build_universe_with_sectors()) is None
+
+
+def test_build_universe_with_sectors_degrades_when_sector_map_unavailable(monkeypatch):
+    """업종 맵이 완전히 실패해도(캐시조차 없음) 유니버스 자체는 살려서 진행한다 —
+    업종을 쓰는 건 뉴스 분석가의 배경 뉴스뿐이라 이거 하나로 하루 전체를 막지 않는다."""
+    monkeypatch.setattr(collectors, "fetch_kospi200_universe", lambda: [("005930", "삼성전자")])
+    monkeypatch.setattr(collectors, "fetch_kospi200_sector_map", lambda: None)
+
+    universe = asyncio.run(pipeline.build_universe_with_sectors())
+
+    assert universe == [("005930", "")]
+
+
+def test_run_daily_composes_universe_filter_and_run_day(monkeypatch, tmp_path):
+    async def fake_build_universe():
+        return [("005930", "반도체"), ("000660", "반도체")]
+
+    async def fake_quant_prefilter(universe, lookback_days=60):
+        return [t for t in universe if t[0] == "005930"]  # 하나만 통과시킴
+
+    called_with = {}
+
+    async def fake_analyst_fn(ticker, sector, day):
+        called_with["ticker"] = ticker
+        from src.schemas import AnalystOpinion
+
+        return [AnalystOpinion(agent="chart", ticker=ticker, score=0.9, confidence=0.9, evidence=["e"], as_of=day)]
+
+    monkeypatch.setattr(pipeline, "build_universe_with_sectors", fake_build_universe)
+    monkeypatch.setattr(pipeline, "quant_prefilter", fake_quant_prefilter)
+
+    day = datetime(2026, 1, 5, tzinfo=timezone.utc)
+    _, results = asyncio.run(
+        pipeline.run_daily(
+            day,
+            PortfolioState(),
+            RiskGateConfig(),
+            fake_analyst_fn,
+            pipeline.propose_decision,
+            total_expected_analysts=1,
+            log_path=tmp_path / "log.jsonl",
+        )
+    )
+
+    assert called_with["ticker"] == "005930"  # 필터를 통과 못 한 000660엔 analyst_fn이 안 불림
+    assert len(results) == 1
+    assert results[0][0].ticker == "005930"
+
+
+def test_run_daily_returns_empty_when_universe_unavailable(monkeypatch, tmp_path):
+    async def fake_build_universe():
+        return None
+
+    async def should_not_be_called(*a, **k):
+        raise AssertionError("유니버스가 없으면 analyst_fn이 호출되면 안 된다")
+
+    monkeypatch.setattr(pipeline, "build_universe_with_sectors", fake_build_universe)
+
+    day = datetime(2026, 1, 5, tzinfo=timezone.utc)
+    portfolio_in = PortfolioState()
+    portfolio_out, results = asyncio.run(
+        pipeline.run_daily(
+            day,
+            portfolio_in,
+            RiskGateConfig(),
+            should_not_be_called,
+            pipeline.propose_decision,
+            log_path=tmp_path / "log.jsonl",
+        )
+    )
+
+    assert results == []
+    assert portfolio_out == portfolio_in
