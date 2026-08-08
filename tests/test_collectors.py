@@ -50,6 +50,24 @@ def test_compute_indicators_sma_and_returns():
     assert indicators["volume_vs_20d_avg_ratio"] == pytest.approx(1.0)
 
 
+def test_compute_indicators_daily_return_stdev_requires_21_bars():
+    bars = _bars(20)  # 19개 수익률만 나옴 -> 20일 표준편차엔 21개 종가 필요
+    indicators = collectors.compute_indicators(bars)
+
+    assert "daily_return_stdev_20d" not in indicators
+
+
+def test_compute_indicators_daily_return_stdev_zero_for_flat_prices():
+    bars = _bars(21)  # 매일 close가 1씩 오르는 고정 패턴이라 표준편차는 0이 아님
+    flat_bars = [
+        OHLCVBar(date=b.date, open=100, high=100, low=100, close=100, volume=1000) for b in bars
+    ]
+
+    indicators = collectors.compute_indicators(flat_bars)
+
+    assert indicators["daily_return_stdev_20d"] == pytest.approx(0.0)
+
+
 def test_compute_indicators_skips_halted_days_for_support_resistance():
     """거래정지일은 네이버가 O/H/L/V를 전부 0으로 내려준다 — 실제 코스피200 199종목
     전수 조회 중 한화(000880)에서 발견된 케이스. 지지/저항 계산에 들어가면 0으로

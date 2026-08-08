@@ -34,9 +34,20 @@ DEFAULT_LOG_PATH = Path("logs/pipeline.jsonl")
 # 나중에 필터 통과율 로그를 보고 조정한다 — 과거 수익률에 맞춰 역산하지 않는다.
 # top-N이 아니라 절대 문턱이라 통과 개수는 매일 다르고 0일 수도 있다 (규칙 2·3).
 QUANT_VOLUME_SURGE_RATIO = 2.0  # 거래량이 20일 평균 대비 이 배수 이상
-QUANT_EXCESS_RETURN_PCT = 5.0  # 코스피200 지수 대비 5일 초과수익률 절대값(%) 이상
 QUANT_RSI_OVERBOUGHT = 70.0
 QUANT_RSI_OVERSOLD = 30.0
+
+# 초과수익률(지수 대비) 문턱은 고정 %p가 아니라 종목 자신의 변동성 단위로 잰다.
+# 2026-08-08 실측: 코스피200 지수가 5일간 -6.9% 빠진 주에 고정 5%p 문턱을 썼더니
+# 199종목 중 188종목(94.5%)이 통과했다 — 지수가 크게 움직인 주엔 종목 간 분산
+# 자체가 커져서 고정폭 문턱이 무의미해진다는 게 드러났다. daily_return_stdev_20d
+# (그 종목 자신의 최근 20일 일별 수익률 표준편차)를 5일치로 스케일(√5)해 "이번
+# 5일 초과수익률이 이 종목 자신의 정상적인 변동폭 대비 몇 배인가"로 정규화한다 —
+# 시장이 흔들리는 주엔 종목 자신의 변동성도 같이 커지므로 문턱이 자동으로 따라
+# 올라간다. 횡단면(그날 200종목 분포) z-score와 다르다 — 그건 매일 일정 비율이
+# 통과하도록 구조적으로 보장되어 규칙 2·3을 우회하는 통로가 될 위험이 있어 반려한
+# 방식이고, 이건 종목 자신의 시계열 대비라 그런 문제가 없다.
+QUANT_EXCESS_RETURN_Z_THRESHOLD = 2.0
 
 # 종목 하나에 대해 (현재 구성된 모든) 분석가를 호출하고 얻은 의견 목록을 반환하는 함수.
 # 더미 경로(마일스톤 1)와 실데이터 경로(마일스톤 2)가 같은 run_day를 공유하도록 주입한다.
@@ -228,8 +239,8 @@ def passes_quant_filter(indicators: dict[str, float], index_return_5d_pct: float
     """비용 게이트일 뿐 품질 판단이 아니다 — "이 종목이 좋다"가 아니라 "오늘 이
     종목에 평소보다 뭔가 있다"만 본다. 방향 판단은 전적으로 LLM 분석가 몫이다.
 
-    세 조건을 OR로 묶는다: 거래량 급증 / 지수 대비 초과 모멘텀 / RSI 극단.
-    절대 문턱이라 통과 여부에 종목 개수 목표가 없다 — 규칙 2·3.
+    세 조건을 OR로 묶는다: 거래량 급증 / 자기 변동성 대비 정규화한 지수 초과 모멘텀
+    / RSI 극단. 절대 문턱이라 통과 여부에 종목 개수 목표가 없다 — 규칙 2·3.
     """
     volume_ratio = indicators.get("volume_vs_20d_avg_ratio")
     if volume_ratio is not None and volume_ratio >= QUANT_VOLUME_SURGE_RATIO:
@@ -240,9 +251,11 @@ def passes_quant_filter(indicators: dict[str, float], index_return_5d_pct: float
         return True
 
     stock_return = indicators.get("return_5d_pct")
-    if stock_return is not None and index_return_5d_pct is not None:
+    daily_vol = indicators.get("daily_return_stdev_20d")
+    if stock_return is not None and index_return_5d_pct is not None and daily_vol:
         excess_return = stock_return - index_return_5d_pct
-        if abs(excess_return) >= QUANT_EXCESS_RETURN_PCT:
+        expected_5d_vol = daily_vol * (5**0.5)
+        if expected_5d_vol > 0 and abs(excess_return) / expected_5d_vol >= QUANT_EXCESS_RETURN_Z_THRESHOLD:
             return True
 
     return False

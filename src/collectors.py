@@ -127,6 +127,15 @@ def _rsi(closes: list[float], period: int = 14) -> float:
     return 100 - (100 / (1 + rs))
 
 
+def _stdev(values: list[float]) -> float:
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+    return variance**0.5
+
+
 def compute_indicators(bars: list[OHLCVBar]) -> dict[str, float]:
     """추세·모멘텀·거래량·지지저항 지표. 텍스트로 차트를 본 것과 동등한 효과를
     노린다 (docs/PLAN.md §5). bars는 오래된 순으로 정렬돼 있어야 한다."""
@@ -166,6 +175,14 @@ def compute_indicators(bars: list[OHLCVBar]) -> dict[str, float]:
     if len(volumes) >= 20:
         avg_volume_20 = sum(volumes[-20:]) / 20
         indicators["volume_vs_20d_avg_ratio"] = volumes[-1] / avg_volume_20 if avg_volume_20 else 0.0
+
+    if len(closes) >= 21:
+        window_closes = closes[-21:]
+        daily_returns = [
+            (window_closes[i] - window_closes[i - 1]) / window_closes[i - 1] * 100
+            for i in range(1, len(window_closes))
+        ]
+        indicators["daily_return_stdev_20d"] = _stdev(daily_returns)
 
     return indicators
 

@@ -35,21 +35,28 @@ def test_fails_when_rsi_neutral():
     assert not pipeline.passes_quant_filter({"rsi14": 50.0}, index_return_5d_pct=None)
 
 
-def test_passes_when_excess_return_over_threshold():
-    # 종목 +8%, 지수 +1% -> 초과수익률 7% >= 5%
-    indicators = {"return_5d_pct": 8.0}
+def test_passes_when_excess_return_z_over_threshold():
+    # 종목 +8%, 지수 +1% -> 초과 7%. 자기 일별 변동성 1% -> 5일 기대변동폭 ~2.24%.
+    # z = 7 / 2.24 ≈ 3.13 >= 2.0
+    indicators = {"return_5d_pct": 8.0, "daily_return_stdev_20d": 1.0}
     assert pipeline.passes_quant_filter(indicators, index_return_5d_pct=1.0)
 
 
-def test_fails_when_move_matches_market_wide_move():
-    """시장 전체가 같이 움직인 날엔 개별 종목만의 신호가 아니다 — 초과수익률이
-    작으면 걸리지 않아야 한다 (레짐 강건성 설계 의도)."""
-    indicators = {"return_5d_pct": 7.0}
-    assert not pipeline.passes_quant_filter(indicators, index_return_5d_pct=6.0)  # 초과 1%뿐
+def test_fails_when_same_excess_return_is_normal_for_a_volatile_stock():
+    """2026-08-08 실측: 지수가 크게 움직인 주엔 고정 %p 문턱이 거의 다 걸렸다
+    (199종목 중 188종목 통과). 자기 변동성으로 정규화하면 원래 변동성이 큰
+    종목에게는 같은 초과수익률이 평범한 움직임으로 취급돼 걸리지 않아야 한다."""
+    indicators = {"return_5d_pct": 8.0, "daily_return_stdev_20d": 5.0}  # 초과 7%는 동일
+    assert not pipeline.passes_quant_filter(indicators, index_return_5d_pct=1.0)
+
+
+def test_excess_return_condition_skipped_when_daily_vol_missing():
+    indicators = {"return_5d_pct": 20.0}  # daily_return_stdev_20d 없음
+    assert not pipeline.passes_quant_filter(indicators, index_return_5d_pct=1.0)
 
 
 def test_excess_return_condition_skipped_when_index_return_missing():
-    indicators = {"return_5d_pct": 20.0}
+    indicators = {"return_5d_pct": 20.0, "daily_return_stdev_20d": 1.0}
     assert not pipeline.passes_quant_filter(indicators, index_return_5d_pct=None)
 
 
@@ -128,7 +135,9 @@ def test_quant_prefilter_uses_real_index_bars_for_excess_return(monkeypatch):
     index_bars = _bars([100.0] * 20 + [101.0])  # 지수는 거의 안 움직임 (+1%)
     monkeypatch.setattr(collectors, "fetch_kospi200_index_bars", lambda lookback_days: index_bars)
 
-    stock_context = _context("005930", {"return_5d_pct": 9.0})  # 초과수익률 ~8%
+    stock_context = _context(
+        "005930", {"return_5d_pct": 9.0, "daily_return_stdev_20d": 1.0}
+    )  # 초과수익률 ~8%, z ≈ 3.6
     monkeypatch.setattr(collectors, "fetch_market_context", lambda ticker, lookback_days: stock_context)
 
     result = asyncio.run(pipeline.quant_prefilter([("005930", "반도체")]))
