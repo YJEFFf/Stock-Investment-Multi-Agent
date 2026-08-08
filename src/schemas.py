@@ -111,6 +111,23 @@ class Position(BaseModel):
     ticker: str
     sector: str
     weight: float  # 포트폴리오 대비 비중
+    entry_price: float | None = None  # 진입 시 가중평균 단가. 매도 로직(src/sell.py)의
+    # 손절/익절 판단 전제조건 — 매수 실행 경로가 아직 진입가를 채우지 않는 포지션은
+    # None으로 남는다(알려진 갭, docs/PLAN.md §5). None인 포지션은 결정론적 매도
+    # 평가가 "판단 불가"로 건너뛴다(AnalystOpinion=None과 같은 패턴).
+    peak_price: float | None = None  # 진입(또는 마지막 부분 익절) 이후 관측된 최고가 —
+    # 트레일링 익절의 기준점.
+    take_profit_stage: int = 0  # 부분 익절이 몇 번 실행됐는지
+
+
+class SellAction(BaseModel):
+    """매도는 Decision과 별도 경로다(Decision.action 주석 참고). 결정론적으로 나온
+    매도(손절/트레일링 익절)는 리스크 게이트를 거치지 않는다 — 보유분을 줄이는
+    행위 자체가 위험을 낮추는 방향이라 "한도 초과"라는 개념이 성립하지 않는다."""
+
+    ticker: str
+    reason: Literal["stop_loss", "take_profit_trail"]
+    sell_fraction: float = Field(gt=0.0, le=1.0)  # 이 포지션의 현재 weight 대비 매도 비율
 
 
 class PortfolioState(BaseModel):

@@ -89,4 +89,6 @@ SIMA_LIVE_TEST=1 .venv/bin/pytest tests/test_live_smoke.py -v -s  # 실제 API �
 - 하루치 전체 배선 (`pipeline.run_daily`): 완료 — 유니버스 구성 → 정량 필터 → run_day.
   실제 실행은 아직 안 함(비용 발생, 사용자 승인 필요)
 - 마일스톤 3 (IC 측정): 인프라만 구축, 실측 데이터 축적 전
-- 매도 로직: 미구현
+- 매도 로직 (`src/sell.py`): 결정론적 안전장치(손절 -10%, 익절 트레일링) 구현
+  완료. 매수 실행 경로가 아직 진입가를 안 채워서(`Position.entry_price`) 실제
+  작동엔 추가 배선 필요 — 알려진 갭. LLM 재량 매도는 미구현
