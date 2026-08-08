@@ -30,6 +30,14 @@ TRADE_WEIGHT = 0.08
 
 DEFAULT_LOG_PATH = Path("logs/pipeline.jsonl")
 
+# 정량 사전 필터 절대 문턱값 (docs/PLAN.md §5, 2026-08-08 확정). 관행값으로 시작하고
+# 나중에 필터 통과율 로그를 보고 조정한다 — 과거 수익률에 맞춰 역산하지 않는다.
+# top-N이 아니라 절대 문턱이라 통과 개수는 매일 다르고 0일 수도 있다 (규칙 2·3).
+QUANT_VOLUME_SURGE_RATIO = 2.0  # 거래량이 20일 평균 대비 이 배수 이상
+QUANT_EXCESS_RETURN_PCT = 5.0  # 코스피200 지수 대비 5일 초과수익률 절대값(%) 이상
+QUANT_RSI_OVERBOUGHT = 70.0
+QUANT_RSI_OVERSOLD = 30.0
+
 # 종목 하나에 대해 (현재 구성된 모든) 분석가를 호출하고 얻은 의견 목록을 반환하는 함수.
 # 더미 경로(마일스톤 1)와 실데이터 경로(마일스톤 2)가 같은 run_day를 공유하도록 주입한다.
 # sector는 뉴스 분석가처럼 종목이 속한 업종 정보가 필요한 분석가를 위한 것 — 필요 없는
@@ -214,6 +222,67 @@ def make_combined_analyst_fn(component_fns: list[AnalystFn]) -> AnalystFn:
         return opinions
 
     return _fn
+
+
+def passes_quant_filter(indicators: dict[str, float], index_return_5d_pct: float | None) -> bool:
+    """비용 게이트일 뿐 품질 판단이 아니다 — "이 종목이 좋다"가 아니라 "오늘 이
+    종목에 평소보다 뭔가 있다"만 본다. 방향 판단은 전적으로 LLM 분석가 몫이다.
+
+    세 조건을 OR로 묶는다: 거래량 급증 / 지수 대비 초과 모멘텀 / RSI 극단.
+    절대 문턱이라 통과 여부에 종목 개수 목표가 없다 — 규칙 2·3.
+    """
+    volume_ratio = indicators.get("volume_vs_20d_avg_ratio")
+    if volume_ratio is not None and volume_ratio >= QUANT_VOLUME_SURGE_RATIO:
+        return True
+
+    rsi = indicators.get("rsi14")
+    if rsi is not None and (rsi >= QUANT_RSI_OVERBOUGHT or rsi <= QUANT_RSI_OVERSOLD):
+        return True
+
+    stock_return = indicators.get("return_5d_pct")
+    if stock_return is not None and index_return_5d_pct is not None:
+        excess_return = stock_return - index_return_5d_pct
+        if abs(excess_return) >= QUANT_EXCESS_RETURN_PCT:
+            return True
+
+    return False
+
+
+async def quant_prefilter(
+    universe: list[tuple[str, str]], lookback_days: int = 60
+) -> list[tuple[str, str]]:
+    """코스피200 전체를 개별 종목 시세 조회 없이 LLM 분석가에 넘기면 하루 800회
+    호출이 된다 (docs/PLAN.md §2). 이 함수는 그 앞단에서 KIS 시세 데이터만으로
+    "오늘 볼 가치가 있는가"를 절대 문턱으로 걸러 비용을 줄인다.
+
+    시세 조회 자체가 실패한 종목(KIS 데이터 수집 실패)은 그냥 이번 라운드에서
+    빠진다 — 이미 collectors 단에서 재시도를 다 소진한 뒤의 결과라 여기서 다시
+    재시도하지 않는다(규칙 4는 데이터 수집 계층에서 지킨다).
+    """
+    index_bars = await asyncio.to_thread(collectors.fetch_kospi200_index_bars, lookback_days)
+    index_indicators = collectors.compute_indicators(index_bars) if index_bars else {}
+    index_return_5d_pct = index_indicators.get("return_5d_pct")
+
+    async def _check(ticker: str, sector: str) -> tuple[str, str] | None:
+        context = await asyncio.to_thread(collectors.fetch_market_context, ticker, lookback_days)
+        if context is None:
+            return None
+        if passes_quant_filter(context.indicators, index_return_5d_pct):
+            return (ticker, sector)
+        return None
+
+    raw_results = await asyncio.gather(*(_check(t, s) for t, s in universe), return_exceptions=True)
+
+    passed: list[tuple[str, str]] = []
+    for (ticker, _), result in zip(universe, raw_results):
+        if isinstance(result, BaseException):
+            logger.warning("quant_prefilter_failed ticker=%s error=%s", ticker, result)
+            continue
+        if result is not None:
+            passed.append(result)
+
+    logger.info("quant_prefilter_done universe=%d passed=%d", len(universe), len(passed))
+    return passed
 
 
 async def run_day(

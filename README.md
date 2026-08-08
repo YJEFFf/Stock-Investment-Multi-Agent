@@ -84,6 +84,7 @@ SIMA_LIVE_TEST=1 .venv/bin/pytest tests/test_live_smoke.py -v -s  # 실제 API �
 - 마일스톤 1 (아무것도 사지 않는 시스템): 완료
 - 마일스톤 2 (분석가 투입 — 차트·뉴스·공시): 완료
 - 판단 계층 (강세/약세 토론 + 포트폴리오 매니저): 완료
-- 시세 데이터 소스: KOSPI200 종목 리스트는 Naver 스크래핑, 개별 종목 시세는 KIS API
+- 시세 데이터 소스: KOSPI200 종목 리스트·업종 매핑은 Naver 스크래핑, 개별 종목 시세는 KIS API
+- 정량 사전 필터 (`pipeline.quant_prefilter`): 완료 — LLM 호출 전 비용 게이트
 - 마일스톤 3 (IC 측정): 인프라만 구축, 실측 데이터 축적 전
-- 정량 사전 필터, 매도 로직: 미구현
+- 매도 로직: 미구현
