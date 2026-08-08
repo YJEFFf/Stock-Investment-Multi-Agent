@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TypeVar
 
 import requests
@@ -26,11 +27,16 @@ NAVER_CHART_URL = "https://fchart.stock.naver.com/sise.nhn"
 NAVER_STOCK_NEWS_URL = "https://finance.naver.com/item/news_news.naver"
 NAVER_NEWS_HUB_URL = "https://finance.naver.com/news/"
 NAVER_KOSPI200_CONSTITUENTS_URL = "https://finance.naver.com/sise/entryJongmok.naver"
+NAVER_SECTOR_GROUP_LIST_URL = "https://finance.naver.com/sise/sise_group.naver"
+NAVER_SECTOR_GROUP_DETAIL_URL = "https://finance.naver.com/sise/sise_group_detail.naver"
 DART_CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 
 KOSPI200_INDEX_SYMBOL = "KPI200"
 KOSPI200_CONSTITUENT_PAGES = 20  # 페이지당 10종목 x 20페이지 = 200종목
+
+SECTOR_CACHE_PATH = Path(__file__).resolve().parent.parent / ".kospi200_sector_cache.json"
+SECTOR_CACHE_TTL_DAYS = 30  # 업종 분류는 실질적으로 거의 안 바뀌는 데이터 (docs/PLAN.md §5)
 
 REQUEST_TIMEOUT_SECONDS = 5.0
 MAX_RETRIES = 3
@@ -215,8 +221,8 @@ def _parse_kospi200_constituent_page(html_text: str) -> list[tuple[str, str]]:
 def fetch_kospi200_universe() -> list[tuple[str, str]] | None:
     """네이버 금융에서 코스피200 편입종목 전체를 스크래핑한다.
 
-    반환값은 (종목코드, 종목명)이다 — 업종(섹터)이 아니다. 이 페이지엔 업종 정보가
-    없어 뉴스 분석가가 쓰는 sector는 별도로 채워야 한다 (아직 미구현, 알려진 갭).
+    반환값은 (종목코드, 종목명)이다 — 업종(섹터)이 아니다. 뉴스 분석가가 쓰는
+    sector는 fetch_kospi200_sector_map()으로 별도로 채운다.
 
     페이지 하나라도 수집 실패하면 전체를 None으로 실패 처리한다. 유니버스가
     일부만 채워진 채로 조용히 넘어가면 이후 전체 판단이 왜곡되므로, 개별 종목
@@ -241,6 +247,92 @@ def fetch_kospi200_universe() -> list[tuple[str, str]] | None:
                 constituents.append((code, name))
 
     return constituents
+
+
+_SECTOR_GROUP_PATTERN = re.compile(
+    r'/sise/sise_group_detail\.naver\?type=upjong&no=(\d+)"[^>]*>([^<]*)</a>'
+)
+_SECTOR_MEMBER_PATTERN = re.compile(r'<a href="/item/main\.naver\?code=(\d{6})"')
+
+
+def _parse_sector_groups(html_text: str) -> list[tuple[str, str]]:
+    return [(no, html.unescape(name.strip())) for no, name in _SECTOR_GROUP_PATTERN.findall(html_text)]
+
+
+def _parse_sector_members(html_text: str) -> list[str]:
+    return _SECTOR_MEMBER_PATTERN.findall(html_text)
+
+
+def _read_sector_cache() -> tuple[dict[str, str], datetime] | None:
+    try:
+        payload = json.loads(SECTOR_CACHE_PATH.read_text())
+        return payload["sector_map"], datetime.fromisoformat(payload["fetched_at"])
+    except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError, ValueError):
+        return None
+
+
+def _write_sector_cache(sector_map: dict[str, str]) -> None:
+    try:
+        SECTOR_CACHE_PATH.write_text(
+            json.dumps(
+                {"fetched_at": datetime.now(timezone.utc).isoformat(), "sector_map": sector_map},
+                ensure_ascii=False,
+            )
+        )
+    except OSError as exc:
+        logger.warning("sector_cache_write_failed error=%s", exc)
+
+
+def _fetch_sector_map_live() -> dict[str, str] | None:
+    """네이버 업종별 시세(79개 그룹)를 전부 훑어 종목코드 -> 업종명 맵을 만든다.
+
+    그룹 하나라도 수집 실패하면 전체를 None으로 실패 처리한다 — fetch_kospi200_universe와
+    같은 이유(부분적으로 채워진 맵으로 조용히 넘어가는 게 더 위험하다).
+    """
+    groups = _fetch_with_retries(NAVER_SECTOR_GROUP_LIST_URL, _parse_sector_groups, params={"type": "upjong"})
+    if groups is None:
+        return None
+
+    sector_map: dict[str, str] = {}
+    for no, name in groups:
+        members = _fetch_with_retries(
+            NAVER_SECTOR_GROUP_DETAIL_URL, _parse_sector_members, params={"type": "upjong", "no": no}
+        )
+        if members is None:
+            logger.error("sector_group_fetch_failed no=%s name=%s", no, name)
+            return None
+        for code in members:
+            sector_map.setdefault(code, name)
+
+    return sector_map
+
+
+def fetch_kospi200_sector_map() -> dict[str, str] | None:
+    """종목코드 -> 업종명 매핑. 코스피200 유니버스와 달리 실질적으로 거의 안 바뀌는
+    데이터라 파일에 캐시하고 SECTOR_CACHE_TTL_DAYS(기본 30일)가 지나야만 다시
+    네이버를 긁는다 — 매일 79개 그룹을 새로 조회할 이유가 없다.
+
+    캐시가 있는데 갱신 시도가 실패하면(네트워크 등) 조용히 기존(다소 오래된) 캐시로
+    폴백한다 — 하루 늦게 반영되는 것보다 그날 파이프라인 전체가 막히는 게 더 나쁘다.
+    캐시가 아예 없는 최초 상태에서 실패하면 None으로 명확히 실패 처리한다.
+    """
+    cached = _read_sector_cache()
+
+    if cached is not None:
+        sector_map, fetched_at = cached
+        if datetime.now(timezone.utc) - fetched_at <= timedelta(days=SECTOR_CACHE_TTL_DAYS):
+            return sector_map
+
+    fresh = _fetch_sector_map_live()
+    if fresh is not None:
+        _write_sector_cache(fresh)
+        return fresh
+
+    if cached is not None:
+        logger.warning("sector_map_refresh_failed_using_stale_cache")
+        return cached[0]
+
+    return None
 
 
 _COMPANY_NEWS_ROW_PATTERN = re.compile(

@@ -6,3 +6,4 @@ logs/
 .DS_Store
 .env
 .kis_token_cache.json
+.kospi200_sector_cache.json

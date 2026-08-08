@@ -197,6 +197,143 @@ def test_fetch_kospi200_universe_returns_none_if_any_page_fails(monkeypatch):
     assert universe is None  # 페이지 하나라도 실패하면 전체 실패
 
 
+FAKE_SECTOR_GROUP_LIST_HTML = """
+<a href="/sise/sise_group_detail.naver?type=upjong&no=307">전자제품</a>
+<a href="/sise/sise_group_detail.naver?type=upjong&no=272">화학</a>
+"""
+
+FAKE_SECTOR_MEMBERS_307_HTML = """
+<a href="/item/main.naver?code=066570">LG전자</a>
+<a href="/item/main.naver?code=009150">삼성전기</a>
+"""
+
+FAKE_SECTOR_MEMBERS_272_HTML = """
+<a href="/item/main.naver?code=051910">LG화학</a>
+"""
+
+
+@pytest.fixture(autouse=True)
+def _isolate_sector_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(collectors, "SECTOR_CACHE_PATH", tmp_path / "sector_cache.json")
+
+
+def test_parse_sector_groups_extracts_no_and_name():
+    groups = collectors._parse_sector_groups(FAKE_SECTOR_GROUP_LIST_HTML)
+
+    assert groups == [("307", "전자제품"), ("272", "화학")]
+
+
+def test_parse_sector_members_extracts_codes():
+    codes = collectors._parse_sector_members(FAKE_SECTOR_MEMBERS_307_HTML)
+
+    assert codes == ["066570", "009150"]
+
+
+def test_fetch_kospi200_sector_map_builds_map_from_all_groups(monkeypatch):
+    class FakeResponse:
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            pass
+
+    responses = {
+        ("sise_group.naver", None): FakeResponse(FAKE_SECTOR_GROUP_LIST_HTML),
+        ("sise_group_detail.naver", "307"): FakeResponse(FAKE_SECTOR_MEMBERS_307_HTML),
+        ("sise_group_detail.naver", "272"): FakeResponse(FAKE_SECTOR_MEMBERS_272_HTML),
+    }
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        key = (url.rsplit("/", 1)[-1], (params or {}).get("no"))
+        return responses[key]
+
+    monkeypatch.setattr(collectors.requests, "get", fake_get)
+
+    sector_map = collectors.fetch_kospi200_sector_map()
+
+    assert sector_map == {"066570": "전자제품", "009150": "전자제품", "051910": "화학"}
+
+
+def test_fetch_kospi200_sector_map_uses_fresh_cache_without_network_call(monkeypatch):
+    from datetime import datetime, timezone
+
+    collectors.SECTOR_CACHE_PATH.write_text(
+        json.dumps({"fetched_at": datetime.now(timezone.utc).isoformat(), "sector_map": {"005930": "반도체"}})
+    )
+
+    def fail_get(*a, **k):
+        raise AssertionError("신선한 캐시가 있으면 네트워크 요청을 하면 안 된다")
+
+    monkeypatch.setattr(collectors.requests, "get", fail_get)
+
+    sector_map = collectors.fetch_kospi200_sector_map()
+
+    assert sector_map == {"005930": "반도체"}
+
+
+def test_fetch_kospi200_sector_map_refetches_when_cache_stale(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    stale_time = datetime.now(timezone.utc) - timedelta(days=collectors.SECTOR_CACHE_TTL_DAYS + 1)
+    collectors.SECTOR_CACHE_PATH.write_text(
+        json.dumps({"fetched_at": stale_time.isoformat(), "sector_map": {"005930": "옛날업종"}})
+    )
+
+    class FakeResponse:
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            pass
+
+    responses = {
+        ("sise_group.naver", None): FakeResponse(FAKE_SECTOR_GROUP_LIST_HTML),
+        ("sise_group_detail.naver", "307"): FakeResponse(FAKE_SECTOR_MEMBERS_307_HTML),
+        ("sise_group_detail.naver", "272"): FakeResponse(FAKE_SECTOR_MEMBERS_272_HTML),
+    }
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        key = (url.rsplit("/", 1)[-1], (params or {}).get("no"))
+        return responses[key]
+
+    monkeypatch.setattr(collectors.requests, "get", fake_get)
+
+    sector_map = collectors.fetch_kospi200_sector_map()
+
+    assert sector_map == {"066570": "전자제품", "009150": "전자제품", "051910": "화학"}
+
+
+def test_fetch_kospi200_sector_map_falls_back_to_stale_cache_on_refresh_failure(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr(collectors.time, "sleep", lambda *_: None)
+    stale_time = datetime.now(timezone.utc) - timedelta(days=collectors.SECTOR_CACHE_TTL_DAYS + 1)
+    collectors.SECTOR_CACHE_PATH.write_text(
+        json.dumps({"fetched_at": stale_time.isoformat(), "sector_map": {"005930": "반도체"}})
+    )
+
+    monkeypatch.setattr(
+        collectors.requests,
+        "get",
+        lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError("down")),
+    )
+
+    sector_map = collectors.fetch_kospi200_sector_map()
+
+    assert sector_map == {"005930": "반도체"}  # 갱신 실패 -> 오래된 캐시라도 사용
+
+
+def test_fetch_kospi200_sector_map_returns_none_when_no_cache_and_fetch_fails(monkeypatch):
+    monkeypatch.setattr(collectors.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(
+        collectors.requests,
+        "get",
+        lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError("down")),
+    )
+
+    assert collectors.fetch_kospi200_sector_map() is None
+
+
 FAKE_COMPANY_NEWS_HTML = """
 <table class="type5">
 <tbody>
