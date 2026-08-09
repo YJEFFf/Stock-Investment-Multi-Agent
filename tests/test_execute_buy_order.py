@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import date
 
 import pytest
@@ -117,7 +118,7 @@ def test_skips_when_order_rejected(monkeypatch):
     assert result == portfolio
 
 
-def test_opens_new_position_with_fill_price(monkeypatch):
+def test_opens_new_position_with_fill_price(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(230000.0))
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 231000.0)  # 갭 ~0.4%, 문턱 이내
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
@@ -132,8 +133,11 @@ def test_opens_new_position_with_fill_price(monkeypatch):
     monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, order_date: 231200.0)
 
     portfolio = PortfolioState(cash_weight=1.0)
+    log_path = tmp_path / "trade_journal.jsonl"
     result = asyncio.run(
-        pipeline.execute_buy_order(_decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08)
+        pipeline.execute_buy_order(
+            _decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08, log_path=log_path
+        )
     )
 
     assert len(result.positions) == 1
@@ -142,12 +146,21 @@ def test_opens_new_position_with_fill_price(monkeypatch):
     assert pos.entry_price == 231200.0
     assert pos.peak_price == 231200.0
     assert pos.weight == 0.08
+    assert pos.entry_day == date.today()
     assert result.cash_weight == pytest.approx(0.92)
     # 수량 = floor(100_000_000 * 0.08 / 231000) = floor(34.6...) = 34
     assert captured_qty["qty"] == int((100_000_000 * 0.08) // 231000.0)
 
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert len(entries) == 1
+    assert entries[0]["event"] == "buy"
+    assert entries[0]["ticker"] == TICKER
+    assert entries[0]["entry_price"] == 231200.0
+    assert entries[0]["order_no"] == "ODNO123"
+    assert entries[0]["decision"]["reason"] == "test"
 
-def test_falls_back_to_current_price_when_fill_price_unavailable(monkeypatch):
+
+def test_falls_back_to_current_price_when_fill_price_unavailable(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
@@ -156,24 +169,40 @@ def test_falls_back_to_current_price_when_fill_price_unavailable(monkeypatch):
 
     portfolio = PortfolioState(cash_weight=1.0)
     result = asyncio.run(
-        pipeline.execute_buy_order(_decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08)
+        pipeline.execute_buy_order(
+            _decision(),
+            GateResult(approved=True, rejected_by=None),
+            portfolio,
+            "반도체",
+            0.08,
+            log_path=tmp_path / "trade_journal.jsonl",
+        )
     )
 
     assert result.positions[0].entry_price == 101.0  # current_price로 근사
 
 
-def test_adds_to_existing_position_with_weighted_average_entry_price(monkeypatch):
+def test_adds_to_existing_position_with_weighted_average_entry_price(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(200.0))
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 200.0)
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
     monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: "ODNO456")
     monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, order_date: 200.0)
 
-    existing = Position(ticker=TICKER, sector="반도체", weight=0.08, entry_price=100.0, peak_price=120.0)
+    existing = Position(
+        ticker=TICKER, sector="반도체", weight=0.08, entry_day=date(2026, 1, 5), entry_price=100.0, peak_price=120.0
+    )
     portfolio = PortfolioState(positions=[existing], cash_weight=0.92)
 
     result = asyncio.run(
-        pipeline.execute_buy_order(_decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08)
+        pipeline.execute_buy_order(
+            _decision(),
+            GateResult(approved=True, rejected_by=None),
+            portfolio,
+            "반도체",
+            0.08,
+            log_path=tmp_path / "trade_journal.jsonl",
+        )
     )
 
     assert len(result.positions) == 1
@@ -182,3 +211,4 @@ def test_adds_to_existing_position_with_weighted_average_entry_price(monkeypatch
     # 가중평균: (100*0.08 + 200*0.08) / 0.16 = 150
     assert pos.entry_price == pytest.approx(150.0)
     assert pos.peak_price == 200.0  # 새 체결가가 기존 고점보다 높음
+    assert pos.entry_day == date(2026, 1, 5)  # 추가매수해도 최초 진입일 유지

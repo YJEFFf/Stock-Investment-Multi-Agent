@@ -64,12 +64,19 @@ def test_no_sell_when_price_within_normal_range(monkeypatch, tmp_path):
 def test_stop_loss_removes_position_and_logs(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 89.0)  # -11%
 
-    position = _position(entry_price=100.0, peak_price=100.0, weight=0.10)
+    position = _position(entry_price=100.0, peak_price=100.0, weight=0.10, entry_day=DAY.date())
     portfolio = PortfolioState(positions=[position], cash_weight=0.90)
     log_path = tmp_path / "sell.jsonl"
+    trade_journal_log_path = tmp_path / "trade_journal.jsonl"
 
     result = asyncio.run(
-        pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated, log_path=log_path)
+        pipeline.evaluate_holdings(
+            portfolio,
+            DAY,
+            sell.execute_sell_simulated,
+            log_path=log_path,
+            trade_journal_log_path=trade_journal_log_path,
+        )
     )
 
     assert result.positions == []
@@ -80,6 +87,15 @@ def test_stop_loss_removes_position_and_logs(monkeypatch, tmp_path):
     assert entries[0]["reason"] == "stop_loss"
     assert entries[0]["ticker"] == "005930"
 
+    journal_entries = [json.loads(line) for line in trade_journal_log_path.read_text().splitlines()]
+    assert len(journal_entries) == 1
+    assert journal_entries[0]["event"] == "sell"
+    assert journal_entries[0]["reason"] == "stop_loss"
+    assert journal_entries[0]["reasoning"] is None
+    assert journal_entries[0]["exit_price"] == 89.0
+    assert journal_entries[0]["realized_pnl_pct"] == pytest.approx(-0.11)
+    assert journal_entries[0]["holding_days"] == 0
+
 
 def test_take_profit_partial_sell_and_logs(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 120.0)  # +20%
@@ -89,7 +105,13 @@ def test_take_profit_partial_sell_and_logs(monkeypatch, tmp_path):
     log_path = tmp_path / "sell.jsonl"
 
     result = asyncio.run(
-        pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated, log_path=log_path)
+        pipeline.evaluate_holdings(
+            portfolio,
+            DAY,
+            sell.execute_sell_simulated,
+            log_path=log_path,
+            trade_journal_log_path=tmp_path / "trade_journal.jsonl",
+        )
     )
 
     assert len(result.positions) == 1
@@ -114,7 +136,13 @@ def test_handles_multiple_positions_independently(monkeypatch, tmp_path):
     log_path = tmp_path / "sell.jsonl"
 
     result = asyncio.run(
-        pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated, log_path=log_path)
+        pipeline.evaluate_holdings(
+            portfolio,
+            DAY,
+            sell.execute_sell_simulated,
+            log_path=log_path,
+            trade_journal_log_path=tmp_path / "trade_journal.jsonl",
+        )
     )
 
     remaining_tickers = {p.ticker for p in result.positions}
@@ -184,6 +212,7 @@ def test_llm_layer_not_consulted_when_deterministic_already_triggered(monkeypatc
             analyst_fn=fail_analyst,
             judge_sell_fn=fail_judge,
             log_path=log_path,
+            trade_journal_log_path=tmp_path / "trade_journal.jsonl",
         )
     )
 
@@ -201,11 +230,12 @@ def test_llm_layer_consulted_when_no_deterministic_trigger(monkeypatch, tmp_path
 
     async def fake_judge(ticker, opinions, unrealized_pct):
         captured["judge_called_with"] = (ticker, len(opinions), round(unrealized_pct, 4))
-        return SellAction(ticker=ticker, reason="llm_discretionary", sell_fraction=1.0)
+        return SellAction(ticker=ticker, reason="llm_discretionary", sell_fraction=1.0, reasoning="근거 없어짐")
 
-    position = _position(entry_price=100.0, peak_price=100.0, weight=0.10)
+    position = _position(entry_price=100.0, peak_price=100.0, weight=0.10, entry_day=DAY.date())
     portfolio = PortfolioState(positions=[position], cash_weight=0.90)
     log_path = tmp_path / "sell.jsonl"
+    trade_journal_log_path = tmp_path / "trade_journal.jsonl"
 
     result = asyncio.run(
         pipeline.evaluate_holdings(
@@ -215,6 +245,7 @@ def test_llm_layer_consulted_when_no_deterministic_trigger(monkeypatch, tmp_path
             analyst_fn=fake_analyst,
             judge_sell_fn=fake_judge,
             log_path=log_path,
+            trade_journal_log_path=trade_journal_log_path,
         )
     )
 
@@ -224,6 +255,11 @@ def test_llm_layer_consulted_when_no_deterministic_trigger(monkeypatch, tmp_path
 
     entries = [json.loads(line) for line in log_path.read_text().splitlines()]
     assert entries[0]["reason"] == "llm_discretionary"
+
+    journal_entries = [json.loads(line) for line in trade_journal_log_path.read_text().splitlines()]
+    assert journal_entries[0]["reason"] == "llm_discretionary"
+    assert journal_entries[0]["reasoning"] == "근거 없어짐"
+    assert journal_entries[0]["holding_days"] == 0
 
 
 def test_llm_layer_holds_when_judge_sell_returns_none(monkeypatch, tmp_path):

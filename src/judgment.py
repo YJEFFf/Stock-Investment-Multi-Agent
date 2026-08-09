@@ -229,7 +229,7 @@ async def portfolio_manager_sell(
 
     if result.action == "HOLD":
         return None
-    return SellAction(ticker=ticker, reason="llm_discretionary", sell_fraction=1.0)
+    return SellAction(ticker=ticker, reason="llm_discretionary", sell_fraction=1.0, reasoning=result.reasoning)
 
 
 async def judge_sell(ticker: str, opinions: list[AnalystOpinion], unrealized_pct: float) -> SellAction | None:

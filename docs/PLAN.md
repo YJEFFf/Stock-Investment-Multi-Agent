@@ -614,3 +614,43 @@ n_days개만 추려서 그 위에서 집계하는 래퍼를 새로 추가했다(
 라인 — `logs/cron.log`로 그대로 흘러간다). **의도적으로 읽기 전용이다**: 이 집계
 결과를 판단 로직 어디에도 입력으로 되먹이지 않는다 — 방금 위 항목에서 짚은 "과거
 데이터가 판단에 개입하면 위험하다"는 원칙을 모니터링 자체에도 그대로 적용한 것.
+
+### 매매일지용 체결 기록 — `logs/trade_journal.jsonl` (2026-08-09)
+
+사용자가 "로그를 최대한 많이 남기고 싶다"고 요청하면서, 나중에 노션과 연결해
+매매일지(포트폴리오 서사)를 쓸 때 필요한 데이터가 지금 안 남고 있는지 점검했다.
+사람이 나중에 수동으로 채울 여지(메모·태그 등)는 없고 **전부 자동 기록만** —
+사용자가 명시적으로 확인.
+
+점검 결과 실제로 큰 구멍이 있었다: `pipeline.jsonl`/`sell.jsonl`은 "판단이
+게이트를 통과했는지"까지만 기록하고, **실제 체결 사실(체결가·수량·주문번호)과
+그 판단을 만든 근거(분석가 의견·토론 논거·매니저 사유)는 어디에도 구조화된
+형태로 안 남고 있었다.** 갭 초과/잔고 조회 실패로 매수가 스킵돼도
+`pipeline.jsonl`엔 `approved: true`로만 남아 실제로는 안 산 걸 산 것처럼 보이는
+상태였다. 실현손익(realized P&L)을 계산하는 코드도 전혀 없었다.
+
+**대응**: 판단 로그(`pipeline.jsonl`/`sell.jsonl`, "게이트가 뭘 걸렀나" 관점)는
+그대로 두고, 별도로 `logs/trade_journal.jsonl`을 추가해서 **실제 체결이 일어나는
+지점**(`execute_buy_order`/`evaluate_holdings`)에서 한 이벤트당 한 줄씩 남긴다.
+
+- **매수 이벤트**: 체결가·수량·KIS 주문번호·갭 비율 + `decision.model_dump()`
+  전체(분석가별 점수·evidence, 강세/약세 토론 논거, 매니저 최종 사유) — 개별
+  필드를 손으로 골라서 남기지 않고 `Decision` 객체를 통째로 직렬화했다. 나중에
+  `Decision`에 필드가 늘어도 로그가 자동으로 따라가고, 지금 당장 어떤 필드가
+  "매매일지에 중요한지" 미리 고르지 않아도 된다.
+- **매도 이벤트**: 매도 사유(`stop_loss`/`take_profit_trail`/`llm_discretionary`),
+  LLM 재량 매도일 때의 실제 판단 사유 텍스트(`SellAction.reasoning` — 이전엔
+  `portfolio_manager_sell`이 생성만 하고 버렸다), 체결가, 진입가 대비
+  실현손익률, 보유일수.
+
+**스키마 변경 (최소, 기존 계약 안 건드림)**: `Position.entry_day: date | None`
+(최초 진입일 — 추가매수해도 갱신 안 함, 보유기간 계산용), `SellAction.reasoning:
+str | None`(결정론적 매도는 룰이 근거 그 자체라 None으로 남는다). 둘 다 optional
+필드 추가라 `Decision.debate`/`Decision.evidence`를 추가했을 때와 같은 패턴.
+
+**보유기간·실현손익 계산 위치**: `evaluate_holdings`가 실제 매도를 실행하기
+직전의 `position`(entry_price/entry_day 보존된 상태)과 `current_price`를 그대로
+갖고 있어 여기서 계산한다 — `sell.execute_sell_order`는 체결가를 별도로 다시
+조회하지 않고(매수 쪽 `fetch_fill_price`와 비대칭 — 아직 안 맞춤, 장중 재검증
+과제 중 하나) `current_price`를 그대로 체결가로 쓰기 때문에 이 지점의 값이
+정확하다.

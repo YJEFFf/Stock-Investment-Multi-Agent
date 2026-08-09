@@ -111,6 +111,7 @@ class Position(BaseModel):
     ticker: str
     sector: str
     weight: float  # 포트폴리오 대비 비중
+    entry_day: date | None = None  # 최초 진입일(추가매수해도 갱신 안 함) — 매매일지 보유기간 계산용
     entry_price: float | None = None  # 진입 시 가중평균 단가. 매도 로직(src/sell.py)의
     # 손절/익절 판단 전제조건 — 매수 실행 경로가 아직 진입가를 채우지 않는 포지션은
     # None으로 남는다(알려진 갭, docs/PLAN.md §5). None인 포지션은 결정론적 매도
@@ -133,6 +134,8 @@ class SellAction(BaseModel):
     ticker: str
     reason: Literal["stop_loss", "take_profit_trail", "llm_discretionary"]
     sell_fraction: float = Field(gt=0.0, le=1.0)  # 이 포지션의 현재 weight 대비 매도 비율
+    reasoning: str | None = None  # llm_discretionary일 때만 채워지는 LLM 판단 사유. 결정론적
+    # 매도(stop_loss/take_profit_trail)는 룰이 근거 그 자체라 별도 서술이 필요 없다.
 
 
 class PortfolioState(BaseModel):

@@ -168,7 +168,9 @@ def test_judge_sell_returns_sell_action_on_sell(monkeypatch):
     opinions = [_opinion("chart", -0.5)]
     result = asyncio.run(judge_sell("005930", opinions, unrealized_pct=-0.03))
 
-    assert result == SellAction(ticker="005930", reason="llm_discretionary", sell_fraction=1.0)
+    assert result == SellAction(
+        ticker="005930", reason="llm_discretionary", sell_fraction=1.0, reasoning="재평가 근거"
+    )
 
 
 def test_portfolio_manager_sell_propagates_llm_failure(monkeypatch):
@@ -189,4 +191,6 @@ def test_portfolio_manager_sell_uses_stay_and_exit_arguments(monkeypatch):
     stay, exit_case = asyncio.run(debate_holding("005930", opinions, unrealized_pct=-0.05))
     action = asyncio.run(portfolio_manager_sell("005930", opinions, stay, exit_case, unrealized_pct=-0.05))
 
-    assert action == SellAction(ticker="005930", reason="llm_discretionary", sell_fraction=1.0)
+    assert action == SellAction(
+        ticker="005930", reason="llm_discretionary", sell_fraction=1.0, reasoning="재평가 근거"
+    )

@@ -36,6 +36,10 @@ GAP_SKIP_THRESHOLD_PCT = 0.03
 
 DEFAULT_LOG_PATH = Path("logs/pipeline.jsonl")
 DEFAULT_SELL_LOG_PATH = Path("logs/sell.jsonl")
+# 매수/매도 "판단"(위 두 파일)과는 별개로, 실제 체결 시점의 원본 사실 + 그 결정을 만든
+# 근거 전체(분석가 의견·토론·매니저 사유)를 사람이 읽을 수 있는 형태로 남긴다. 나중에
+# 노션 매매일지 동기화가 이 파일 하나만 읽으면 되도록 하는 게 목적(2026-08-09).
+DEFAULT_TRADE_JOURNAL_LOG_PATH = Path("logs/trade_journal.jsonl")
 
 # 정량 사전 필터 절대 문턱값 (docs/PLAN.md §5, 2026-08-08 확정). 관행값으로 시작하고
 # 나중에 필터 통과율 로그를 보고 조정한다 — 과거 수익률에 맞춰 역산하지 않는다.
@@ -187,6 +191,7 @@ async def execute_buy_order(
     portfolio: PortfolioState,
     sector: str,
     trade_weight: float,
+    log_path: Path = DEFAULT_TRADE_JOURNAL_LOG_PATH,
 ) -> PortfolioState:
     """게이트를 통과한 BUY를 실제 KIS 모의투자 시장가 주문으로 집행한다.
 
@@ -239,6 +244,7 @@ async def execute_buy_order(
     # 체결가 조회가 실패해도 주문 자체는 이미 나갔다 — None보다 현재가 근사치가
     # 낫다(포지션이 리스크 관리 대상에서 아예 빠지는 걸 막는다).
     entry_price = fill_price if fill_price is not None else current_price
+    today = datetime.now(timezone.utc).date()
 
     positions = [p.model_copy() for p in portfolio.positions]
     existing = next((p for p in positions if p.ticker == ticker), None)
@@ -250,17 +256,34 @@ async def execute_buy_order(
         existing.weight = new_weight
         existing.peak_price = max(existing.peak_price or entry_price, entry_price)
         existing.quantity = (existing.quantity or 0) + quantity
+        # entry_day는 최초 진입일 그대로 둔다 — 추가매수로 갱신하면 보유기간이 매번 리셋된다.
     else:
         positions.append(
             Position(
                 ticker=ticker,
                 sector=sector,
                 weight=trade_weight,
+                entry_day=today,
                 entry_price=entry_price,
                 peak_price=entry_price,
                 quantity=quantity,
             )
         )
+
+    _append_log(
+        log_path,
+        {
+            "event": "buy",
+            "day": today.isoformat(),
+            "ticker": ticker,
+            "sector": sector,
+            "quantity": quantity,
+            "entry_price": entry_price,
+            "order_no": order_no,
+            "gap_pct": round(gap_pct, 4),
+            "decision": decision.model_dump(mode="json"),
+        },
+    )
 
     return PortfolioState(
         positions=positions,
@@ -572,6 +595,7 @@ async def evaluate_holdings(
     analyst_fn: AnalystFn | None = None,
     judge_sell_fn: JudgeSellFn | None = None,
     log_path: Path = DEFAULT_SELL_LOG_PATH,
+    trade_journal_log_path: Path = DEFAULT_TRADE_JOURNAL_LOG_PATH,
 ) -> PortfolioState:
     """보유 포지션 전체를 매일 재평가한다 — 결정론적 안전장치(손절/트레일링
     익절, src/sell.py)는 항상 돌고, LLM 재량 매도(judgment.judge_sell)는
@@ -644,6 +668,26 @@ async def evaluate_holdings(
                 "reason": action.reason,
                 "sell_fraction": action.sell_fraction,
                 "price": current_price,
+            },
+        )
+
+        realized_pnl_pct = (
+            (current_price - position.entry_price) / position.entry_price if position.entry_price else None
+        )
+        holding_days = (day.date() - position.entry_day).days if position.entry_day else None
+        _append_log(
+            trade_journal_log_path,
+            {
+                "event": "sell",
+                "day": day.date().isoformat(),
+                "ticker": ticker,
+                "reason": action.reason,
+                "reasoning": action.reasoning,
+                "sell_fraction": action.sell_fraction,
+                "exit_price": current_price,
+                "entry_price": position.entry_price,
+                "realized_pnl_pct": realized_pnl_pct,
+                "holding_days": holding_days,
             },
         )
 
