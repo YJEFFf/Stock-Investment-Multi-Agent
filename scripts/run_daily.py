@@ -12,14 +12,17 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from src import judgment, pipeline, sell
+from src import judgment, notify, pipeline, sell
+from src.market_calendar import is_krx_trading_day
 from src.schemas import PortfolioState, RiskGateConfig
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("run_daily")
 
 PORTFOLIO_STATE_PATH = Path("logs/portfolio_state.json")
+KST = ZoneInfo("Asia/Seoul")
 
 
 def _load_portfolio() -> PortfolioState:
@@ -34,6 +37,11 @@ def _save_portfolio(portfolio: PortfolioState) -> None:
 
 
 async def main() -> None:
+    today_kst = datetime.now(KST).date()
+    if not is_krx_trading_day(today_kst):
+        logger.info("not_a_trading_day day=%s — skip (주말/공휴일, LLM 호출 없음)", today_kst.isoformat())
+        return
+
     day = datetime.now(timezone.utc)
     config = RiskGateConfig()
     portfolio = _load_portfolio()
@@ -65,8 +73,9 @@ async def main() -> None:
         )
         _save_portfolio(portfolio)
         logger.info("evaluate_holdings_done positions=%d", len(portfolio.positions))
-    except Exception:
+    except Exception as exc:
         logger.exception("evaluate_holdings_failed — 매수 판단은 계속 진행한다")
+        notify.send_telegram_alert(f"[SIMA] evaluate_holdings 실패 (매수 판단은 계속 진행): {exc!r}")
 
     # 2. 신규 매수 판단 (유니버스 구성 -> 정량 필터 -> 분석가 -> 토론+매니저 -> 게이트 -> 실주문)
     portfolio, results = await pipeline.run_daily(
@@ -91,4 +100,9 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as exc:
+        logger.exception("run_daily_failed")
+        notify.send_telegram_alert(f"[SIMA] run_daily 전체 실패, 그날 매수/매도 판단이 안 돌았다: {exc!r}")
+        raise
