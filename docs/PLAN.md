@@ -813,3 +813,50 @@ EC2 cron의 실제 실행 방식(`uv run python3 scripts/run_daily.py`)이 정�
 네트워크 호출을 의심할 것.** 두 테스트 파일에 `notify.send_telegram_alert`와
 `pipeline._display_name`을 자동으로 목킹하는 `autouse` 픽스처를 추가해서
 재발을 막았다. 사용자에게 즉시 알렸다.
+
+### 전체 워크플로우 점검 (2026-08-09, 실전 검증 전날)
+
+사용자가 "맨 처음부터 알림/일지 작성까지 전체 워크플로우를 테스트로
+점검하자"고 요청. 점검해보니 두 가지가 비어 있었다.
+
+1. **`notify.format_error_alert`를 만들어놓고 실제로는 안 쓰고 있었다.**
+   `run_daily.py`의 오류 발신 3곳(evaluate_holdings 실패, 노션 동기화 실패,
+   run_daily 전체 실패)이 여전히 직접 f-string을 조립하고 있었다 — "통일된
+   양식" 요청의 취지에 안 맞았다. 세 곳 다 `format_error_alert()`를 쓰도록
+   고쳤다.
+
+2. **`scripts/run_daily.py`의 오케스트레이션(`main()`) 자체를 검증하는 테스트가
+   하나도 없었다.** 개별 단계(`evaluate_holdings`, `run_daily`, `notify`,
+   `notion_sync`)는 각자 테스트가 있지만, 그것들이 cron 진입점 안에서 올바른
+   순서·인자로 이어지는지는 아무도 확인하지 않고 있었다. `tests/test_run_daily.py`
+   를 새로 추가 — 휴장일 스킵, 정상 흐름의 단계 순서(`evaluate_holdings` →
+   `run_daily` → 모니터링 → 노션), `evaluate_holdings` 실패 시에도 `run_daily`가
+   이전 포트폴리오를 이어받아 계속 진행하는지, `_sync_notion`의 설정/미설정
+   분기, 포트폴리오 저장/로드 라운드트립을 검증한다. `main()`이 내부에서
+   `_sync_notion`/`_log_monitoring_summary`를 호출하므로, 그 함수들 자체의
+   동작을 검증하는 테스트는 모듈 임포트 직후(어떤 몽키패치도 걸리기 전)의
+   실제 함수 참조를 미리 붙잡아뒀다가 그걸 직접 호출하는 방식을 썼다 —
+   안 그러면 오케스트레이션 테스트용 autouse 픽스처가 덮어쓴 no-op을 대신
+   테스트하게 된다.
+
+3. **`tests/test_end_to_end_workflow.py`**: 위 둘로도 "단계별로는 맞는데 실제로
+   이어 붙였을 때도 맞는가"는 완전히 검증되지 않는다 — 그래서 `scripts.run_daily.main()`
+   을 네트워크 경계(`kis.py`/`collectors.py`의 개별 fetch 함수, `llm.call_structured`,
+   `notify.send_telegram_alert`)만 목킹하고 통째로 한 번 실행하는 테스트를
+   추가했다. 시나리오: 보유 종목 하나가 손절선(-11%)을 넘어 매도되고, 동시에
+   신규 후보 하나가 정량 필터(거래량 서지)를 통과해 분석(차트만 실제 의견 —
+   뉴스·공시는 데이터 없음으로 자연 스킵, `degraded=True`) → 토론 → 매니저
+   BUY 승인 → 게이트 통과 → 실주문까지 간다. `monkeypatch.chdir(tmp_path)`로
+   모든 상대경로 로그(`logs/pipeline.jsonl`, `logs/trade_journal.jsonl`,
+   `logs/portfolio_state.json`)를 격리했다 — 이 파일들의 기본 경로는 함수
+   시그니처의 기본 인자값(정의 시점에 한 번 바인딩)이지만 **값 자체가 상대
+   `Path` 객체**라 실제 파일 접근은 호출 시점의 cwd를 기준으로 풀리므로,
+   `chdir`만으로 충분히 격리된다(경로 상수를 몽키패치할 필요가 없다 — 그건
+   함수 기본값에 이미 구워져 있어 안 먹힌다). `llm.call_structured`는
+   `response_model.__name__`으로 어떤 호출인지 구분해 응답하는 단일 가짜로
+   대체했다 — `analysts.py`/`judgment.py`의 프롬프트 조립·재시도·스키마
+   검증 로직은 전부 실제로 실행된다. 결과: 매매일지에 매도 1건+매수 1건,
+   판단 로그에 정상 기록, 텔레그램 알림 2건이 통일된 양식 그대로 발송됨을
+   확인 — 전부 정상.
+
+세 파일 다 통과, 전체 스위트 241개 통과, 실제 로그 오염 없음 확인.

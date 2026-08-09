@@ -87,7 +87,9 @@ async def main() -> None:
         logger.info("evaluate_holdings_done positions=%d", len(portfolio.positions))
     except Exception as exc:
         logger.exception("evaluate_holdings_failed — 매수 판단은 계속 진행한다")
-        notify.send_telegram_alert(f"[SIMA] evaluate_holdings 실패 (매수 판단은 계속 진행): {exc!r}")
+        notify.send_telegram_alert(
+            notify.format_error_alert("evaluate_holdings 실패 (매수 판단은 계속 진행)", repr(exc))
+        )
 
     # 2. 신규 매수 판단 (유니버스 구성 -> 정량 필터 -> 분석가 -> 토론+매니저 -> 게이트 -> 실주문)
     portfolio, results = await pipeline.run_daily(
@@ -134,7 +136,7 @@ def _sync_notion(today_kst, portfolio: PortfolioState) -> None:
             logger.info("notion_daily_report_synced=%s", created)
     except Exception as exc:
         logger.exception("notion_sync_failed")
-        notify.send_telegram_alert(f"[SIMA] 노션 동기화 실패 (매매 자체엔 영향 없음): {exc!r}")
+        notify.send_telegram_alert(notify.format_error_alert("노션 동기화 실패 (매매 자체엔 영향 없음)", repr(exc)))
 
 
 def _log_monitoring_summary() -> None:
@@ -169,5 +171,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as exc:
         logger.exception("run_daily_failed")
-        notify.send_telegram_alert(f"[SIMA] run_daily 전체 실패, 그날 매수/매도 판단이 안 돌았다: {exc!r}")
+        notify.send_telegram_alert(
+            notify.format_error_alert("run_daily 전체 실패, 그날 매수/매도 판단이 안 돌았다", repr(exc))
+        )
         raise
