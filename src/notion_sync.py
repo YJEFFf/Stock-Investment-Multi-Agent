@@ -47,6 +47,11 @@ REASON_LABELS = {
     "stop_loss": "손절",
     "take_profit_trail": "익절",
     "llm_discretionary": "LLM재량매도",
+    "price_data_unavailable": "시세조회실패",
+    "gap_too_large": "갭초과",
+    "balance_unavailable": "잔고조회실패",
+    "quantity_zero": "수량0",
+    "order_rejected": "주문거부",
 }
 
 
@@ -395,6 +400,26 @@ def _sell_row_children(entry: dict) -> list[dict]:
     return [_heading("판단 사유", level=3), _paragraph(_truncate(entry["reasoning"]))]
 
 
+def _buy_skipped_row_properties(entry: dict) -> dict:
+    return {
+        "이름": {"title": _rich_text(f"{entry['ticker']} 매수 스킵")},
+        "날짜": {"date": {"start": entry["day"]}},
+        "티커": {"rich_text": _rich_text(entry["ticker"])},
+        "구분": {"select": {"name": "매수스킵"}},
+        "사유": {"select": {"name": REASON_LABELS.get(entry["reason"], entry["reason"])}},
+    }
+
+
+def _buy_skipped_row_children(entry: dict) -> list[dict]:
+    detail = f" (갭 {entry['gap_pct']:.1%})" if entry.get("gap_pct") is not None else ""
+    return [
+        _paragraph(
+            "리스크 게이트는 승인했지만 체결 직전 단계에서 실제 매수까지는 가지 못했다 — "
+            f"사유: {REASON_LABELS.get(entry['reason'], entry['reason'])}{detail}."
+        )
+    ]
+
+
 def _entry_key(entry: dict) -> str:
     return f"{entry['event']}:{entry['ticker']}:{entry['day']}"
 
@@ -441,6 +466,9 @@ def sync_trade_journal(
         if entry["event"] == "buy":
             properties = _buy_row_properties(entry)
             children = _buy_row_children(entry)
+        elif entry["event"] == "buy_skipped":
+            properties = _buy_skipped_row_properties(entry)
+            children = _buy_skipped_row_children(entry)
         else:
             properties = _sell_row_properties(entry)
             children = _sell_row_children(entry)
@@ -497,7 +525,12 @@ def _decision_label(entry: dict) -> str:
 
 
 def _daily_report_children(
-    day: str, decisions_today: list[dict], buys: list[dict], sells: list[dict], portfolio: PortfolioState
+    day: str,
+    decisions_today: list[dict],
+    buys: list[dict],
+    sells: list[dict],
+    skips: list[dict],
+    portfolio: PortfolioState,
 ) -> list[dict]:
     blocks = [_heading("오늘의 판단 요약", level=2)]
     if decisions_today:
@@ -512,7 +545,9 @@ def _daily_report_children(
         for d in decisions_today:
             avg_score = d.get("avg_score")
             score_text = f"{avg_score:.2f}" if avg_score is not None else "-"
-            blocks.append(_bulleted(f"{d['ticker']}: {_decision_label(d)} (avg_score={score_text})"))
+            reason = _truncate(d.get("reason"), 300)
+            suffix = f" — {reason}" if reason else ""
+            blocks.append(_bulleted(f"{d['ticker']}: {_decision_label(d)} (avg_score={score_text}){suffix}"))
     else:
         blocks.append(_paragraph("오늘은 판단 로그가 없다 — 휴장일이었거나 유니버스 수집에 실패했을 수 있다."))
 
@@ -531,6 +566,13 @@ def _daily_report_children(
             blocks.append(_bulleted(f"{s['ticker']}: {reason_label}{pnl}"))
     else:
         blocks.append(_paragraph("오늘 매도 없음."))
+
+    if skips:
+        blocks.append(_heading(f"특별한 일 — 게이트는 통과했지만 체결 못 함 ({len(skips)}건)", level=2))
+        for sk in skips:
+            reason_label = REASON_LABELS.get(sk["reason"], sk["reason"])
+            detail = f" (갭 {sk['gap_pct']:.1%})" if sk.get("gap_pct") is not None else ""
+            blocks.append(_bulleted(f"{sk['ticker']}: {reason_label}{detail}"))
 
     blocks.append(_heading(f"장마감 기준 보유 종목 ({len(portfolio.positions)}개)", level=2))
     if portfolio.positions:
@@ -594,11 +636,12 @@ def sync_daily_report(
     trades_today = _read_jsonl_for_day(trade_journal_log_path, day)
     buys = [e for e in trades_today if e["event"] == "buy"]
     sells = [e for e in trades_today if e["event"] == "sell"]
+    skips = [e for e in trades_today if e["event"] == "buy_skipped"]
 
     body = {
         "parent": {"database_id": database_id},
         "properties": _daily_report_properties(day, buys, sells, portfolio),
-        "children": _daily_report_children(day, decisions_today, buys, sells, portfolio),
+        "children": _daily_report_children(day, decisions_today, buys, sells, skips, portfolio),
     }
     result = _notion_request("POST", "/pages", body)
     if result is None:

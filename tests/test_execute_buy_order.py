@@ -62,7 +62,7 @@ def test_skips_when_gate_not_approved(monkeypatch):
     assert result == portfolio
 
 
-def test_skips_when_gap_too_large(monkeypatch):
+def test_skips_when_gap_too_large(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 110.0)  # +10%, 문턱(3%) 초과
 
@@ -72,50 +72,72 @@ def test_skips_when_gap_too_large(monkeypatch):
     monkeypatch.setattr(kis, "fetch_account_balance", fail)
 
     portfolio = PortfolioState()
+    log_path = tmp_path / "trade_journal.jsonl"
     result = asyncio.run(
-        pipeline.execute_buy_order(_decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08)
+        pipeline.execute_buy_order(
+            _decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08, log_path=log_path
+        )
     )
 
     assert result == portfolio
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert entries[0]["event"] == "buy_skipped"
+    assert entries[0]["reason"] == "gap_too_large"
+    assert entries[0]["gap_pct"] == pytest.approx(0.1)
 
 
-def test_skips_when_price_data_unavailable(monkeypatch):
+def test_skips_when_price_data_unavailable(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: None)
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 100.0)
 
     portfolio = PortfolioState()
+    log_path = tmp_path / "trade_journal.jsonl"
     result = asyncio.run(
-        pipeline.execute_buy_order(_decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08)
+        pipeline.execute_buy_order(
+            _decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08, log_path=log_path
+        )
     )
 
     assert result == portfolio
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert entries[0]["reason"] == "price_data_unavailable"
 
 
-def test_skips_when_balance_unavailable(monkeypatch):
+def test_skips_when_balance_unavailable(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: None)
 
     portfolio = PortfolioState()
+    log_path = tmp_path / "trade_journal.jsonl"
     result = asyncio.run(
-        pipeline.execute_buy_order(_decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08)
+        pipeline.execute_buy_order(
+            _decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08, log_path=log_path
+        )
     )
 
     assert result == portfolio
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert entries[0]["reason"] == "balance_unavailable"
 
 
-def test_skips_when_order_rejected(monkeypatch):
+def test_skips_when_order_rejected(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
     monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: None)
 
     portfolio = PortfolioState()
+    log_path = tmp_path / "trade_journal.jsonl"
     result = asyncio.run(
-        pipeline.execute_buy_order(_decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08)
+        pipeline.execute_buy_order(
+            _decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08, log_path=log_path
+        )
     )
 
     assert result == portfolio
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert entries[0]["reason"] == "order_rejected"
 
 
 def test_opens_new_position_with_fill_price(monkeypatch, tmp_path):

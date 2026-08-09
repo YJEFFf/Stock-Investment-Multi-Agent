@@ -111,6 +111,10 @@ def _sell_entry(ticker="005930", day="2026-08-11", reason="stop_loss", reasoning
     }
 
 
+def _buy_skipped_entry(ticker="005930", day="2026-08-10", reason="gap_too_large", gap_pct=0.042):
+    return {"event": "buy_skipped", "day": day, "ticker": ticker, "reason": reason, "gap_pct": gap_pct}
+
+
 def _write_jsonl(path, entries):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
@@ -143,6 +147,28 @@ def test_sync_trade_journal_creates_rows_for_new_entries(monkeypatch, tmp_path):
     assert json.loads(state_path.read_text())["synced_keys"] == sorted(
         ["buy:005930:2026-08-10", "sell:005930:2026-08-11"]
     )
+
+
+def test_sync_trade_journal_handles_buy_skipped_events(monkeypatch, tmp_path):
+    log_path = tmp_path / "trade_journal.jsonl"
+    _write_jsonl(log_path, [_buy_skipped_entry()])
+
+    captured_bodies = []
+
+    def fake_request(method, path, body=None):
+        captured_bodies.append(body)
+        return {"id": "row-x"}
+
+    monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
+
+    summary = notion_sync.sync_trade_journal(log_path, "db-123", state_path=tmp_path / "state.json")
+
+    assert summary == {"synced": 1, "failed": 0, "skipped": 0}
+    props = captured_bodies[0]["properties"]
+    assert props["구분"] == {"select": {"name": "매수스킵"}}
+    assert props["사유"] == {"select": {"name": "갭초과"}}
+    body_text = json.dumps(captured_bodies[0]["children"], ensure_ascii=False)
+    assert "4.2%" in body_text
 
 
 def test_sync_trade_journal_skips_already_synced_entries(monkeypatch, tmp_path):
@@ -281,6 +307,7 @@ def test_sync_daily_report_creates_one_page_summarizing_the_day(monkeypatch, tmp
                 "rejected_by": "position_limit",
                 "avg_score": 0.87,
                 "avg_confidence": 0.75,
+                "reason": "이미 종목당 한도를 채워 신규 편입은 보류한다",
             },
             {
                 "day": "2026-08-09",
@@ -294,7 +321,10 @@ def test_sync_daily_report_creates_one_page_summarizing_the_day(monkeypatch, tmp
         ],
     )
     trade_journal_log = tmp_path / "trade_journal.jsonl"
-    _write_jsonl(trade_journal_log, [_buy_entry(day="2026-08-10")])
+    _write_jsonl(
+        trade_journal_log,
+        [_buy_entry(day="2026-08-10"), _buy_skipped_entry(ticker="035420", day="2026-08-10")],
+    )
 
     portfolio = PortfolioState(
         positions=[Position(ticker="005930", sector="반도체", weight=0.08, entry_price=231200.0, quantity=10)],
@@ -330,6 +360,9 @@ def test_sync_daily_report_creates_one_page_summarizing_the_day(monkeypatch, tmp
     assert "999999" not in all_text
     assert "005930" in all_text
     assert "000660" in all_text  # 거부된 판단도 요약에는 포함
+    assert "이미 종목당 한도를 채워" in all_text  # HOLD/거부 종목도 실제 판단 문장이 노출됨
+    assert "035420" in all_text  # 게이트 승인됐지만 체결 스킵된 "특별한 일"도 노출됨
+    assert "특별한 일" in all_text
 
     assert json.loads(state_path.read_text())["synced_days"] == ["2026-08-10"]
 

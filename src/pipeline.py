@@ -210,6 +210,7 @@ async def execute_buy_order(
         return portfolio
 
     ticker = decision.ticker
+    today = datetime.now(timezone.utc).date()
 
     prev_bars, current_price = await asyncio.gather(
         asyncio.to_thread(kis.fetch_daily_ohlcv, ticker, 2),
@@ -217,34 +218,38 @@ async def execute_buy_order(
     )
     if not prev_bars or current_price is None:
         logger.warning("execute_buy_order_skipped ticker=%s reason=price_data_unavailable", ticker)
+        _log_buy_skip(log_path, today, ticker, "price_data_unavailable")
         return portfolio
 
     prev_close = prev_bars[-1].close
     gap_pct = abs(current_price - prev_close) / prev_close
     if gap_pct > GAP_SKIP_THRESHOLD_PCT:
         logger.warning("execute_buy_order_skipped ticker=%s reason=gap_too_large gap_pct=%.4f", ticker, gap_pct)
+        _log_buy_skip(log_path, today, ticker, "gap_too_large", gap_pct=round(gap_pct, 4))
         return portfolio
 
     total_value = await asyncio.to_thread(kis.fetch_account_balance)
     if total_value is None:
         logger.warning("execute_buy_order_skipped ticker=%s reason=balance_unavailable", ticker)
+        _log_buy_skip(log_path, today, ticker, "balance_unavailable")
         return portfolio
 
     quantity = int((total_value * trade_weight) // current_price)
     if quantity <= 0:
         logger.warning("execute_buy_order_skipped ticker=%s reason=quantity_zero", ticker)
+        _log_buy_skip(log_path, today, ticker, "quantity_zero")
         return portfolio
 
     order_no = await asyncio.to_thread(kis.place_market_buy_order, ticker, quantity)
     if order_no is None:
         logger.error("execute_buy_order_failed ticker=%s reason=order_rejected", ticker)
+        _log_buy_skip(log_path, today, ticker, "order_rejected")
         return portfolio
 
     fill_price = await asyncio.to_thread(kis.fetch_fill_price, ticker, datetime.now(timezone.utc).date())
     # 체결가 조회가 실패해도 주문 자체는 이미 나갔다 — None보다 현재가 근사치가
     # 낫다(포지션이 리스크 관리 대상에서 아예 빠지는 걸 막는다).
     entry_price = fill_price if fill_price is not None else current_price
-    today = datetime.now(timezone.utc).date()
 
     positions = [p.model_copy() for p in portfolio.positions]
     existing = next((p for p in positions if p.ticker == ticker), None)
@@ -296,6 +301,15 @@ def _append_log(log_path: Path, entry: dict) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a") as f:
         f.write(json.dumps(entry, default=str) + "\n")
+
+
+def _log_buy_skip(log_path: Path, day, ticker: str, reason: str, **extra) -> None:
+    """게이트는 승인했는데 execute_buy_order 단계(가격 갭·잔고·주문거부 등)에서
+    실제 체결까지는 못 간 경우를 남긴다. 이걸 안 남기면 pipeline.jsonl엔
+    approved=true로만 남아 실제로는 안 산 걸 산 것처럼 보인다 — trade_journal.jsonl
+    쪽에서 "매수"가 아니라 "buy_skipped"로 구분해서, 매매일지·일일 리포트에
+    "특별한 일"로 드러나게 한다."""
+    _append_log(log_path, {"event": "buy_skipped", "day": day.isoformat(), "ticker": ticker, "reason": reason, **extra})
 
 
 def make_dummy_analyst_fn(base_seed: int) -> AnalystFn:
@@ -582,6 +596,7 @@ async def run_day(
                 "rejected_by": gate_result.rejected_by,
                 "avg_score": avg_score,
                 "avg_confidence": avg_confidence,
+                "reason": decision.reason,
             },
         )
 
