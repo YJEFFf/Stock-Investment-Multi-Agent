@@ -111,21 +111,27 @@ async def main() -> None:
     )
 
     _log_monitoring_summary()
-    _sync_notion()
+    _sync_notion(today_kst, portfolio)
 
 
-def _sync_notion() -> None:
-    """logs/trade_journal.jsonl의 새 이벤트를 노션 매매일지로 올린다. 워크스페이스가
-    아직 설정 안 됐으면(scripts/setup_notion_workspace.py 미실행) 조용히 건너뛴다 —
+def _sync_notion(today_kst, portfolio: PortfolioState) -> None:
+    """logs/trade_journal.jsonl의 새 이벤트를 노션 매매일지로 올리고, 오늘 하루를
+    요약한 일일 리포트도 남긴다. 워크스페이스가 아직 설정 안 됐으면
+    (scripts/setup_notion_workspace.py 미실행) 해당 부분만 조용히 건너뛴다 —
     노션 연동은 부가 기능이라 이것 때문에 run_daily 자체가 실패하면 안 된다."""
-    database_id = os.environ.get("NOTION_TRADE_JOURNAL_DB_ID")
-    if not database_id:
+    trade_journal_db_id = os.environ.get("NOTION_TRADE_JOURNAL_DB_ID")
+    daily_report_db_id = os.environ.get("NOTION_DAILY_REPORT_DB_ID")
+    if not trade_journal_db_id and not daily_report_db_id:
         logger.info("notion_sync_skipped reason=not_configured")
         return
 
     try:
-        summary = notion_sync.sync_trade_journal(pipeline.DEFAULT_TRADE_JOURNAL_LOG_PATH, database_id)
-        logger.info("notion_sync summary=%s", summary)
+        if trade_journal_db_id:
+            summary = notion_sync.sync_trade_journal(pipeline.DEFAULT_TRADE_JOURNAL_LOG_PATH, trade_journal_db_id)
+            logger.info("notion_sync summary=%s", summary)
+        if daily_report_db_id:
+            created = notion_sync.sync_daily_report(today_kst.isoformat(), portfolio, daily_report_db_id)
+            logger.info("notion_daily_report_synced=%s", created)
     except Exception as exc:
         logger.exception("notion_sync_failed")
         notify.send_telegram_alert(f"[SIMA] 노션 동기화 실패 (매매 자체엔 영향 없음): {exc!r}")

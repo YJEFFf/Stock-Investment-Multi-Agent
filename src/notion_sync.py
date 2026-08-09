@@ -17,6 +17,8 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from src.schemas import PortfolioState
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,14 @@ MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2.0
 
 GITHUB_URL = "https://github.com/YJEFFf/Stock-Investment-Multi-Agent"
+
+# pipeline.py의 DEFAULT_LOG_PATH/DEFAULT_TRADE_JOURNAL_LOG_PATH와 같은 경로 문자열을
+# 여기서 다시 상수로 든다 — pipeline.py를 임포트하지 않기 위해서다(순환 임포트는
+# 없지만, notion_sync는 "노션에 뭘 쓰나"가 고치는 이유고 pipeline은 "판단 로직"이
+# 고치는 이유라 굳이 묶지 않는다. llm.py의 DEFAULT_LLM_CALL_LOG_PATH와 같은 패턴).
+DEFAULT_PIPELINE_LOG_PATH = Path("logs/pipeline.jsonl")
+DEFAULT_TRADE_JOURNAL_LOG_PATH = Path("logs/trade_journal.jsonl")
+DEFAULT_DAILY_REPORT_STATE_PATH = Path("logs/notion_daily_report_state.json")
 
 # CLAUDE.md/PLAN.md와 다른 파일로 관리하는 이유: 코드가 아니라 노션 표시용
 # 텍스트라 손보는 이유가 다르다(문서 내용이 아니라 노션 블록 포맷을 고치게 됨).
@@ -451,3 +461,151 @@ def sync_trade_journal(
     _save_synced_keys(state_path, synced_keys)
     logger.info("notion_sync_done synced=%d failed=%d skipped=%d", synced, failed, skipped)
     return {"synced": synced, "failed": failed, "skipped": skipped}
+
+
+# --- 일일 리포트 (장마감 후 그날 하루 요약) ---
+
+
+def create_daily_report_database(parent_page_id: str) -> str | None:
+    body = {
+        "parent": {"type": "page_id", "page_id": parent_page_id},
+        "title": [{"type": "text", "text": {"content": "일일 리포트"}}],
+        "properties": {
+            "이름": {"title": {}},
+            "날짜": {"date": {}},
+            "매수": {"number": {"format": "number"}},
+            "매도": {"number": {"format": "number"}},
+            "보유종목수": {"number": {"format": "number"}},
+            "현금비중": {"number": {"format": "percent"}},
+        },
+    }
+    result = _notion_request("POST", "/databases", body)
+    return result["id"] if result else None
+
+
+def _read_jsonl_for_day(log_path: Path, day: str) -> list[dict]:
+    if not log_path.exists():
+        return []
+    entries = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    return [e for e in entries if e.get("day") == day]
+
+
+def _decision_label(entry: dict) -> str:
+    if entry["action"] == "BUY":
+        return "BUY(승인)" if entry["approved"] else f"BUY(거부:{entry['rejected_by']})"
+    return "HOLD"
+
+
+def _daily_report_children(
+    day: str, decisions_today: list[dict], buys: list[dict], sells: list[dict], portfolio: PortfolioState
+) -> list[dict]:
+    blocks = [_heading("오늘의 판단 요약", level=2)]
+    if decisions_today:
+        approved_buys = sum(1 for d in decisions_today if d["action"] == "BUY" and d["approved"])
+        rejected = sum(1 for d in decisions_today if not d["approved"])
+        blocks.append(
+            _paragraph(
+                f"총 {len(decisions_today)}개 종목 판단 · BUY 승인 {approved_buys}개 · "
+                f"게이트 거부 {rejected}개 · 나머지는 HOLD"
+            )
+        )
+        for d in decisions_today:
+            avg_score = d.get("avg_score")
+            score_text = f"{avg_score:.2f}" if avg_score is not None else "-"
+            blocks.append(_bulleted(f"{d['ticker']}: {_decision_label(d)} (avg_score={score_text})"))
+    else:
+        blocks.append(_paragraph("오늘은 판단 로그가 없다 — 휴장일이었거나 유니버스 수집에 실패했을 수 있다."))
+
+    blocks.append(_heading(f"매수 ({len(buys)}건)", level=2))
+    if buys:
+        for b in buys:
+            blocks.append(_bulleted(f"{b['ticker']}: {b['quantity']}주 @ {b['entry_price']:,.0f}"))
+    else:
+        blocks.append(_paragraph("오늘 매수 없음."))
+
+    blocks.append(_heading(f"매도 ({len(sells)}건)", level=2))
+    if sells:
+        for s in sells:
+            reason_label = REASON_LABELS.get(s["reason"], s["reason"])
+            pnl = f", 실현손익 {s['realized_pnl_pct']:+.1%}" if s.get("realized_pnl_pct") is not None else ""
+            blocks.append(_bulleted(f"{s['ticker']}: {reason_label}{pnl}"))
+    else:
+        blocks.append(_paragraph("오늘 매도 없음."))
+
+    blocks.append(_heading(f"장마감 기준 보유 종목 ({len(portfolio.positions)}개)", level=2))
+    if portfolio.positions:
+        for p in portfolio.positions:
+            entry_price = f"{p.entry_price:,.0f}" if p.entry_price is not None else "-"
+            quantity = p.quantity if p.quantity is not None else "-"
+            blocks.append(_bulleted(f"{p.ticker}: 비중 {p.weight:.1%}, 진입가 {entry_price}, 수량 {quantity}"))
+    else:
+        blocks.append(_paragraph("보유 종목 없음 — 전액 현금."))
+    blocks.append(_paragraph(f"현금 비중: {portfolio.cash_weight:.1%}"))
+
+    return blocks
+
+
+def _daily_report_properties(day: str, buys: list[dict], sells: list[dict], portfolio: PortfolioState) -> dict:
+    return {
+        "이름": {"title": _rich_text(f"{day} 리포트")},
+        "날짜": {"date": {"start": day}},
+        "매수": {"number": len(buys)},
+        "매도": {"number": len(sells)},
+        "보유종목수": {"number": len(portfolio.positions)},
+        "현금비중": {"number": portfolio.cash_weight},
+    }
+
+
+def _load_synced_days(state_path: Path) -> set[str]:
+    if not state_path.exists():
+        return set()
+    return set(json.loads(state_path.read_text()).get("synced_days", []))
+
+
+def _save_synced_days(state_path: Path, days: set[str]) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({"synced_days": sorted(days)}, ensure_ascii=False, indent=2))
+
+
+def sync_daily_report(
+    day: str,
+    portfolio: PortfolioState,
+    database_id: str,
+    pipeline_log_path: Path = DEFAULT_PIPELINE_LOG_PATH,
+    trade_journal_log_path: Path = DEFAULT_TRADE_JOURNAL_LOG_PATH,
+    state_path: Path = DEFAULT_DAILY_REPORT_STATE_PATH,
+) -> bool:
+    """하루에 한 번, 장 마감 뒤 그날의 판단·매수·매도·최종 보유 종목을 요약해
+    노션에 한 페이지로 남긴다. logs/pipeline.jsonl(그날의 모든 판단)과
+    logs/trade_journal.jsonl(그날 실제 체결)을 day로 필터링해서 합치고,
+    최종 보유 종목은 그 시점의 PortfolioState 그대로를 스냅샷으로 적는다 —
+    매매일지(sync_trade_journal)는 이벤트 이력이고 이건 "그날 하루" 단위
+    요약이라 서로 다른 걸 보여준다.
+
+    같은 날짜로 이미 만든 적 있으면(로컬 state 파일 기준) 다시 안 만든다 —
+    run_daily.py가 같은 날 재실행돼도 중복 리포트가 안 생기게.
+    """
+    synced_days = _load_synced_days(state_path)
+    if day in synced_days:
+        logger.info("notion_daily_report_skipped day=%s reason=already_synced", day)
+        return False
+
+    decisions_today = _read_jsonl_for_day(pipeline_log_path, day)
+    trades_today = _read_jsonl_for_day(trade_journal_log_path, day)
+    buys = [e for e in trades_today if e["event"] == "buy"]
+    sells = [e for e in trades_today if e["event"] == "sell"]
+
+    body = {
+        "parent": {"database_id": database_id},
+        "properties": _daily_report_properties(day, buys, sells, portfolio),
+        "children": _daily_report_children(day, decisions_today, buys, sells, portfolio),
+    }
+    result = _notion_request("POST", "/pages", body)
+    if result is None:
+        logger.warning("notion_daily_report_failed day=%s", day)
+        return False
+
+    synced_days.add(day)
+    _save_synced_days(state_path, synced_days)
+    logger.info("notion_daily_report_synced day=%s", day)
+    return True

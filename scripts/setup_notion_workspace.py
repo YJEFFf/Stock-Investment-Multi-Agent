@@ -1,7 +1,8 @@
 """노션 워크스페이스 뼈대를 한 번 만드는 스크립트 — 랜딩 페이지에 소개+GitHub
-링크 블록 추가, "프로젝트 소개·설계 철학" 페이지 생성, "매매일지" 데이터베이스
-생성. 이미 만들어져 있으면(.env에 NOTION_TRADE_JOURNAL_DB_ID가 있으면) 아무것도
-안 하고 종료한다 — 재실행해도 중복 페이지가 안 생기게.
+링크 블록 추가, "프로젝트 소개·설계 철학" 페이지 생성, "매매일지"·"일일 리포트"
+데이터베이스 생성. 각 산출물은 .env에 대응하는 ID가 이미 있으면 건너뛴다 —
+재실행해도 중복 페이지가 안 생기고, 나중에 새 산출물이 추가돼도(이번에 일일
+리포트가 그랬다) 이미 설정된 나머지를 건드리지 않고 빠진 것만 채운다.
 
 사전 준비: .env에 NOTION_API_KEY, NOTION_PARENT_PAGE_ID가 채워져 있어야 한다
 (노션에서 페이지를 만들고 integration과 연결한 뒤 그 페이지 ID).
@@ -32,37 +33,48 @@ def _append_env_var(key: str, value: str) -> None:
 
 
 def main() -> None:
-    if os.environ.get("NOTION_TRADE_JOURNAL_DB_ID"):
-        print("이미 설정되어 있습니다. NOTION_TRADE_JOURNAL_DB_ID:", os.environ["NOTION_TRADE_JOURNAL_DB_ID"])
-        return
-
     parent_page_id = os.environ.get("NOTION_PARENT_PAGE_ID")
     if not parent_page_id or not os.environ.get("NOTION_API_KEY"):
         print(".env에 NOTION_API_KEY / NOTION_PARENT_PAGE_ID를 먼저 채워주세요.")
         return
 
-    print("랜딩 페이지에 소개 + GitHub 링크 추가 중...")
-    if not notion_sync.add_landing_page_content(parent_page_id):
-        print("실패 — NOTION_API_KEY가 올바른지, 페이지가 integration과 연결됐는지 확인하세요.")
-        return
-    print("완료.")
+    if os.environ.get("NOTION_TRADE_JOURNAL_DB_ID"):
+        print("랜딩/소개/매매일지는 이미 설정됨 — 건너뜀.")
+    else:
+        print("랜딩 페이지에 소개 + GitHub 링크 추가 중...")
+        if not notion_sync.add_landing_page_content(parent_page_id):
+            print("실패 — NOTION_API_KEY가 올바른지, 페이지가 integration과 연결됐는지 확인하세요.")
+            return
+        print("완료.")
 
-    print("프로젝트 소개 페이지 생성 중...")
-    intro_page_id = notion_sync.create_intro_page(parent_page_id)
-    if intro_page_id is None:
-        print("실패.")
-        return
-    print("완료. intro_page_id =", intro_page_id)
+        print("프로젝트 소개 페이지 생성 중...")
+        intro_page_id = notion_sync.create_intro_page(parent_page_id)
+        if intro_page_id is None:
+            print("실패.")
+            return
+        print("완료. intro_page_id =", intro_page_id)
+        _append_env_var("NOTION_INTRO_PAGE_ID", intro_page_id)
 
-    print("매매일지 데이터베이스 생성 중...")
-    database_id = notion_sync.create_trade_journal_database(parent_page_id)
-    if database_id is None:
-        print("실패.")
-        return
-    print("완료. database_id =", database_id)
+        print("매매일지 데이터베이스 생성 중...")
+        database_id = notion_sync.create_trade_journal_database(parent_page_id)
+        if database_id is None:
+            print("실패.")
+            return
+        print("완료. database_id =", database_id)
+        _append_env_var("NOTION_TRADE_JOURNAL_DB_ID", database_id)
 
-    _append_env_var("NOTION_TRADE_JOURNAL_DB_ID", database_id)
-    print(".env에 NOTION_TRADE_JOURNAL_DB_ID 저장 완료. 노션 페이지를 열어 확인해보세요.")
+    if os.environ.get("NOTION_DAILY_REPORT_DB_ID"):
+        print("일일 리포트 데이터베이스는 이미 설정됨 — 건너뜀.")
+    else:
+        print("일일 리포트 데이터베이스 생성 중...")
+        report_db_id = notion_sync.create_daily_report_database(parent_page_id)
+        if report_db_id is None:
+            print("실패.")
+            return
+        print("완료. database_id =", report_db_id)
+        _append_env_var("NOTION_DAILY_REPORT_DB_ID", report_db_id)
+
+    print("설정 완료. 노션 페이지를 열어 확인해보세요.")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import pytest
 import requests
 
 from src import notion_sync
+from src.schemas import PortfolioState, Position
 
 
 class _FakeResponse:
@@ -249,3 +250,116 @@ def test_refresh_intro_page_handles_no_existing_blocks(monkeypatch):
     monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
 
     assert notion_sync.refresh_intro_page("intro-page-1") is True
+
+
+def _write_pipeline_jsonl(path, entries):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+
+def test_sync_daily_report_creates_one_page_summarizing_the_day(monkeypatch, tmp_path):
+    pipeline_log = tmp_path / "pipeline.jsonl"
+    _write_pipeline_jsonl(
+        pipeline_log,
+        [
+            {
+                "day": "2026-08-10",
+                "ticker": "005930",
+                "action": "BUY",
+                "approved": True,
+                "rejected_by": None,
+                "avg_score": 0.9,
+                "avg_confidence": 0.8,
+            },
+            {
+                "day": "2026-08-10",
+                "ticker": "000660",
+                "action": "BUY",
+                "approved": False,
+                "rejected_by": "position_limit",
+                "avg_score": 0.87,
+                "avg_confidence": 0.75,
+            },
+            {
+                "day": "2026-08-09",
+                "ticker": "999999",
+                "action": "HOLD",
+                "approved": True,
+                "rejected_by": None,
+                "avg_score": 0.1,
+                "avg_confidence": 0.5,
+            },
+        ],
+    )
+    trade_journal_log = tmp_path / "trade_journal.jsonl"
+    _write_jsonl(trade_journal_log, [_buy_entry(day="2026-08-10")])
+
+    portfolio = PortfolioState(
+        positions=[Position(ticker="005930", sector="반도체", weight=0.08, entry_price=231200.0, quantity=10)],
+        cash_weight=0.92,
+    )
+
+    captured = {}
+
+    def fake_request(method, path, body=None):
+        captured["body"] = body
+        return {"id": "report-page-1"}
+
+    monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
+
+    state_path = tmp_path / "notion_daily_report_state.json"
+    created = notion_sync.sync_daily_report(
+        "2026-08-10",
+        portfolio,
+        "report-db-1",
+        pipeline_log_path=pipeline_log,
+        trade_journal_log_path=trade_journal_log,
+        state_path=state_path,
+    )
+
+    assert created is True
+    body = captured["body"]
+    assert body["parent"] == {"database_id": "report-db-1"}
+    assert body["properties"]["매수"] == {"number": 1}
+    assert body["properties"]["매도"] == {"number": 0}
+    assert body["properties"]["보유종목수"] == {"number": 1}
+    # 다른 날짜(2026-08-09) 판단은 포함되면 안 된다.
+    all_text = json.dumps(body["children"], ensure_ascii=False)
+    assert "999999" not in all_text
+    assert "005930" in all_text
+    assert "000660" in all_text  # 거부된 판단도 요약에는 포함
+
+    assert json.loads(state_path.read_text())["synced_days"] == ["2026-08-10"]
+
+
+def test_sync_daily_report_skips_if_already_synced_for_day(monkeypatch, tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"synced_days": ["2026-08-10"]}))
+
+    def fail_request(*a, **k):
+        raise AssertionError("이미 만든 날짜는 다시 요청하면 안 된다")
+
+    monkeypatch.setattr(notion_sync, "_notion_request", fail_request)
+
+    created = notion_sync.sync_daily_report(
+        "2026-08-10", PortfolioState(), "report-db-1", state_path=state_path
+    )
+
+    assert created is False
+
+
+def test_sync_daily_report_handles_no_decisions_that_day(tmp_path, monkeypatch):
+    monkeypatch.setattr(notion_sync, "_notion_request", lambda *a, **k: {"id": "x"})
+
+    created = notion_sync.sync_daily_report(
+        "2026-08-09",
+        PortfolioState(),
+        "report-db-1",
+        pipeline_log_path=tmp_path / "does_not_exist.jsonl",
+        trade_journal_log_path=tmp_path / "also_missing.jsonl",
+        state_path=tmp_path / "state.json",
+    )
+
+    assert created is True
