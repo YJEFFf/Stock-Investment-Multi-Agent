@@ -352,6 +352,73 @@ def test_fetch_kospi200_sector_map_returns_none_when_no_cache_and_fetch_fails(mo
     assert collectors.fetch_kospi200_sector_map() is None
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ticker_name_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(collectors, "TICKER_NAME_CACHE_PATH", tmp_path / "ticker_name_cache.json")
+
+
+def test_fetch_kospi200_ticker_names_builds_map_from_universe(monkeypatch):
+    monkeypatch.setattr(collectors, "KOSPI200_CONSTITUENT_PAGES", 1)
+
+    class FakeResponse:
+        text = FAKE_KOSPI200_PAGE_HTML
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(collectors.requests, "get", lambda *a, **k: FakeResponse())
+
+    ticker_names = collectors.fetch_kospi200_ticker_names()
+
+    assert ticker_names == {"005930": "삼성전자", "000660": "SK하이닉스"}
+
+
+def test_fetch_kospi200_ticker_names_uses_fresh_cache_without_network_call(monkeypatch):
+    from datetime import datetime, timezone
+
+    collectors.TICKER_NAME_CACHE_PATH.write_text(
+        json.dumps(
+            {"fetched_at": datetime.now(timezone.utc).isoformat(), "ticker_names": {"005930": "삼성전자"}}
+        )
+    )
+
+    def fail_get(*a, **k):
+        raise AssertionError("신선한 캐시가 있으면 네트워크 요청을 하면 안 된다")
+
+    monkeypatch.setattr(collectors.requests, "get", fail_get)
+
+    assert collectors.fetch_kospi200_ticker_names() == {"005930": "삼성전자"}
+
+
+def test_fetch_kospi200_ticker_names_falls_back_to_stale_cache_on_refresh_failure(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr(collectors.time, "sleep", lambda *_: None)
+    stale_time = datetime.now(timezone.utc) - timedelta(days=collectors.TICKER_NAME_CACHE_TTL_DAYS + 1)
+    collectors.TICKER_NAME_CACHE_PATH.write_text(
+        json.dumps({"fetched_at": stale_time.isoformat(), "ticker_names": {"005930": "삼성전자"}})
+    )
+
+    monkeypatch.setattr(
+        collectors.requests,
+        "get",
+        lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError("down")),
+    )
+
+    assert collectors.fetch_kospi200_ticker_names() == {"005930": "삼성전자"}
+
+
+def test_fetch_kospi200_ticker_names_returns_none_when_no_cache_and_fetch_fails(monkeypatch):
+    monkeypatch.setattr(collectors.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(
+        collectors.requests,
+        "get",
+        lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError("down")),
+    )
+
+    assert collectors.fetch_kospi200_ticker_names() is None
+
+
 FAKE_COMPANY_NEWS_HTML = """
 <table class="type5">
 <tbody>

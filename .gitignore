@@ -7,3 +7,4 @@ logs/
 .env
 .kis_token_cache.json
 .kospi200_sector_cache.json
+.kospi200_ticker_name_cache.json

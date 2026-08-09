@@ -38,6 +38,9 @@ KOSPI200_CONSTITUENT_PAGES = 20  # 페이지당 10종목 x 20페이지 = 200종�
 SECTOR_CACHE_PATH = Path(__file__).resolve().parent.parent / ".kospi200_sector_cache.json"
 SECTOR_CACHE_TTL_DAYS = 30  # 업종 분류는 실질적으로 거의 안 바뀌는 데이터 (docs/PLAN.md §5)
 
+TICKER_NAME_CACHE_PATH = Path(__file__).resolve().parent.parent / ".kospi200_ticker_name_cache.json"
+TICKER_NAME_CACHE_TTL_DAYS = 30  # 종목명도 업종만큼 거의 안 바뀌는 데이터 — 같은 캐시 전략
+
 REQUEST_TIMEOUT_SECONDS = 5.0
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 1.0
@@ -347,6 +350,52 @@ def fetch_kospi200_sector_map() -> dict[str, str] | None:
 
     if cached is not None:
         logger.warning("sector_map_refresh_failed_using_stale_cache")
+        return cached[0]
+
+    return None
+
+
+def _read_ticker_name_cache() -> tuple[dict[str, str], datetime] | None:
+    try:
+        payload = json.loads(TICKER_NAME_CACHE_PATH.read_text())
+        return payload["ticker_names"], datetime.fromisoformat(payload["fetched_at"])
+    except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError, ValueError):
+        return None
+
+
+def _write_ticker_name_cache(ticker_names: dict[str, str]) -> None:
+    try:
+        TICKER_NAME_CACHE_PATH.write_text(
+            json.dumps(
+                {"fetched_at": datetime.now(timezone.utc).isoformat(), "ticker_names": ticker_names},
+                ensure_ascii=False,
+            )
+        )
+    except OSError as exc:
+        logger.warning("ticker_name_cache_write_failed error=%s", exc)
+
+
+def fetch_kospi200_ticker_names() -> dict[str, str] | None:
+    """종목코드 -> 종목명 매핑. fetch_kospi200_universe()가 이미 갖고 있는 정보를
+    재사용하는 캐시 레이어일 뿐이다 — 텔레그램 알림에서 코드 대신 이름을 보여주려고
+    추가했다(사용자 요청, 2026-08-09). 업종 맵과 같은 이유로 파일 캐시를 쓴다
+    (거의 안 바뀌는 데이터라 매번 200종목 스크래핑할 필요 없음). 갱신 실패 시
+    기존 캐시로 폴백하는 것도 sector_map과 동일한 정책."""
+    cached = _read_ticker_name_cache()
+
+    if cached is not None:
+        ticker_names, fetched_at = cached
+        if datetime.now(timezone.utc) - fetched_at <= timedelta(days=TICKER_NAME_CACHE_TTL_DAYS):
+            return ticker_names
+
+    universe = fetch_kospi200_universe()
+    if universe is not None:
+        ticker_names = dict(universe)
+        _write_ticker_name_cache(ticker_names)
+        return ticker_names
+
+    if cached is not None:
+        logger.warning("ticker_name_refresh_failed_using_stale_cache")
         return cached[0]
 
     return None

@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src import collectors, kis, sell
+from src import collectors, kis, notify, sell
 from src.analysts import chart_analyst, disclosure_analyst, dummy_analyst, news_analyst
 from src.schemas import (
     AnalystOpinion,
@@ -289,6 +289,7 @@ async def execute_buy_order(
             "decision": decision.model_dump(mode="json"),
         },
     )
+    notify.send_telegram_alert(notify.format_buy_alert(_display_name(ticker), entry_price, quantity, decision.reason))
 
     return PortfolioState(
         positions=positions,
@@ -303,6 +304,14 @@ def _append_log(log_path: Path, entry: dict) -> None:
         f.write(json.dumps(entry, default=str) + "\n")
 
 
+def _display_name(ticker: str) -> str:
+    """텔레그램 알림에 종목코드 대신 종목명을 보여주려고 쓴다(사용자 요청,
+    2026-08-09). collectors.fetch_kospi200_ticker_names()가 30일 캐시라 대부분
+    파일 읽기 한 번으로 끝난다. 실패해도 코드로 폴백할 뿐 알림 자체를 막지 않는다."""
+    names = collectors.fetch_kospi200_ticker_names()
+    return (names or {}).get(ticker, ticker)
+
+
 def _log_buy_skip(log_path: Path, day, ticker: str, reason: str, **extra) -> None:
     """게이트는 승인했는데 execute_buy_order 단계(가격 갭·잔고·주문거부 등)에서
     실제 체결까지는 못 간 경우를 남긴다. 이걸 안 남기면 pipeline.jsonl엔
@@ -310,6 +319,9 @@ def _log_buy_skip(log_path: Path, day, ticker: str, reason: str, **extra) -> Non
     쪽에서 "매수"가 아니라 "buy_skipped"로 구분해서, 매매일지·일일 리포트에
     "특별한 일"로 드러나게 한다."""
     _append_log(log_path, {"event": "buy_skipped", "day": day.isoformat(), "ticker": ticker, "reason": reason, **extra})
+    reason_label = notify.REASON_LABELS.get(reason, reason)
+    detail = f"{extra['gap_pct']:.1%}" if "gap_pct" in extra else ""
+    notify.send_telegram_alert(notify.format_buy_skipped_alert(_display_name(ticker), reason_label, detail))
 
 
 def make_dummy_analyst_fn(base_seed: int) -> AnalystFn:
@@ -704,6 +716,15 @@ async def evaluate_holdings(
                 "realized_pnl_pct": realized_pnl_pct,
                 "holding_days": holding_days,
             },
+        )
+        notify.send_telegram_alert(
+            notify.format_sell_alert(
+                _display_name(ticker),
+                notify.REASON_LABELS.get(action.reason, action.reason),
+                current_price,
+                realized_pnl_pct,
+                reasoning=action.reasoning,
+            )
         )
 
     return portfolio

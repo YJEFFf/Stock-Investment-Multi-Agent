@@ -780,3 +780,36 @@ EC2 cron의 실제 실행 방식(`uv run python3 scripts/run_daily.py`)이 정�
 전부 `tmp_path` 기반으로 고치고 오염된 파일은 삭제했다. **테스트에 새
 로그 파라미터를 추가할 때마다 항상 "이 파라미터를 안 넘기는 기존 테스트가
 실제 파일에 쓰게 되는 건 아닌지" 확인할 것.**
+
+### 텔레그램 알림 양식 통일 + 종목명 표시 (2026-08-09)
+
+사용자가 "메시지가 많을 텐데 통일된 양식으로 정하자"고 요청 — 매수 체결,
+매수 스킵(게이트 승인 후 체결 실패), 매도 체결, 오류 4종류를 전부 같은 뼈대
+(이모지+`[SIMA]`+종류 한 줄 → 종목·핵심수치 한 줄 → 있으면 사유)로
+`src/notify.py`의 `format_buy_alert`/`format_buy_skipped_alert`/
+`format_sell_alert`/`format_error_alert`가 강제한다 — 호출부가 직접 문자열을
+조립하지 않게 해서 양식을 한 곳만 고치면 전체가 같이 바뀐다. 매수/매도/스킵
+알림은 각각 `execute_buy_order`/`_log_buy_skip`/`evaluate_holdings`의 실제
+이벤트 발생 지점(=trade_journal.jsonl을 쓰는 바로 그 지점)에서 같이 보낸다.
+
+사용자가 이어서 "종목코드 말고 종목명으로 보내달라"고 요청. `collectors.py`에
+`fetch_kospi200_ticker_names()`를 추가했다 — `fetch_kospi200_universe()`가
+이미 갖고 있는 (코드, 종목명) 쌍을 재사용하는 캐시 레이어일 뿐이라 새 스크래핑
+타깃이 없다. `fetch_kospi200_sector_map()`과 정확히 같은 패턴(파일 캐시, TTL
+30일, 갱신 실패 시 오래된 캐시로 폴백)이라 코드도 옆에 나란히 뒀다. `pipeline.py`
+의 `_display_name()`이 이 맵으로 코드→이름을 바꾸고, 실패해도 코드로 폴백할
+뿐 알림 자체를 막지 않는다.
+
+**이 작업 중 실제로 사고가 났다**: `execute_buy_order`/`evaluate_holdings`에
+알림 호출을 추가한 뒤 `tests/test_execute_buy_order.py`·`test_evaluate_holdings.py`
+를 돌렸는데, 두 파일 다 `notify.send_telegram_alert`나 `_display_name`(→
+`collectors.fetch_kospi200_ticker_names`)을 목킹하지 않고 있었다. `.env`에
+실제 텔레그램 토큰이 들어있는 상태라 테스트가 **실제로 사용자 휴대폰에
+가짜 테스트 데이터(가격 100원 등, 사유 "test")로 매수/매도/스킵 알림 12건
+가량을 발송**했고, 동시에 실제 네이버에 종목명을 긁어와 레포 루트에
+`.kospi200_ticker_name_cache.json`을 만들었다(내용 자체는 정상 데이터라
+삭제하지 않고 유지, `.gitignore`에 추가). 테스트 실행 시간이 평소 1초 미만
+대신 15초가 걸린 게 첫 단서였다 — **테스트가 갑자기 느려지면 목킹이 빠진
+네트워크 호출을 의심할 것.** 두 테스트 파일에 `notify.send_telegram_alert`와
+`pipeline._display_name`을 자동으로 목킹하는 `autouse` 픽스처를 추가해서
+재발을 막았다. 사용자에게 즉시 알렸다.

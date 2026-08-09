@@ -17,6 +17,15 @@ def _position(**overrides) -> Position:
 DAY = datetime(2026, 8, 9, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_notify_or_name_lookup(monkeypatch):
+    # evaluate_holdings가 매도마다 텔레그램 알림 + 종목명 조회를 시도한다 — 목킹
+    # 안 하면 테스트가 실제 텔레그램 메시지를 보내고 실제 네이버를 긁는다
+    # (2026-08-09, execute_buy_order 쪽과 같은 이유로 실수로 한 번 겪음).
+    monkeypatch.setattr(pipeline.notify, "send_telegram_alert", lambda message: True)
+    monkeypatch.setattr(pipeline, "_display_name", lambda ticker: ticker)
+
+
 def test_returns_unchanged_when_no_positions(monkeypatch):
     def fail(*a, **k):
         raise AssertionError("포지션이 없으면 KIS를 호출하면 안 된다")

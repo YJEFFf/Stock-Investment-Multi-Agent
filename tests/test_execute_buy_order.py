@@ -10,6 +10,15 @@ from src.schemas import Decision, GateResult, PortfolioState, Position
 TICKER = "005930"
 
 
+@pytest.fixture(autouse=True)
+def _no_real_notify_or_name_lookup(monkeypatch):
+    # execute_buy_order가 성공/스킵마다 텔레그램 알림 + 종목명 조회(collectors 경유)를
+    # 시도한다 — 목킹 안 하면 테스트가 실제 텔레그램 메시지를 보내고 실제 네이버를
+    # 긁는다(2026-08-09, 실수로 한 번 겪음).
+    monkeypatch.setattr(pipeline.notify, "send_telegram_alert", lambda message: True)
+    monkeypatch.setattr(pipeline, "_display_name", lambda ticker: ticker)
+
+
 def _decision(action="BUY") -> Decision:
     from src.schemas import AnalystOpinion
 
