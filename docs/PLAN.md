@@ -654,3 +654,50 @@ str | None`(결정론적 매도는 룰이 근거 그 자체라 None으로 남는
 조회하지 않고(매수 쪽 `fetch_fill_price`와 비대칭 — 아직 안 맞춤, 장중 재검증
 과제 중 하나) `current_price`를 그대로 체결가로 쓰기 때문에 이 지점의 값이
 정확하다.
+
+### 노션 연동 — 포트폴리오 워크스페이스 (2026-08-09)
+
+`src/notion_sync.py`. 노션 REST API를 `requests`로 직접 호출한다(SDK 미사용 —
+`kis.py`/`collectors.py`와 같은 패턴, 재시도는 네트워크 오류와 429만, 그 외
+4xx는 재시도해도 같은 응답이라 즉시 실패 처리). 사람이 나중에 수동으로 채울
+필드는 없다(사용자 확정) — `logs/trade_journal.jsonl`이 유일한 원천이고 이
+모듈은 그걸 노션이 읽기 좋은 형태로 옮기기만 한다.
+
+**워크스페이스 구조**(사용자가 미리 만들어 integration과 연결해둔 페이지를
+랜딩 페이지로 그대로 쓴다 — 새 페이지를 만들지 않는다): 랜딩 페이지에 소개+
+GitHub 링크 블록만 붙이고(`add_landing_page_content`), 하위에 "프로젝트 소개·
+설계 철학" 페이지(`create_intro_page`)와 "매매일지" 데이터베이스
+(`create_trade_journal_database`)를 만든다. 성과 지표(신호율/거부사유/IC)는
+따로 안 뺐다 — 사용자가 "그건 일지에 들어갈 만한 것"이라고 판단, IC 정도만
+나중에 추가 검토하기로 함.
+
+**소개 페이지는 링크로 넘기지 않고 내용을 페이지 안에 다 적는다**(사용자
+요청, 2026-08-09 — 처음엔 "전체 내용은 GitHub 참고"로 짧게 만들었다가 재작성).
+아키텍처 다이어그램과 핵심 계약(`AnalystOpinion`/`Decision`/`GateResult`)은
+코드 블록으로 원문 그대로 박아넣는다. `_intro_page_blocks()`가 내용의 유일한
+소스이고, `create_intro_page`(최초 생성)와 `refresh_intro_page`(기존 페이지의
+블록을 전부 지우고 같은 내용으로 재작성 — CLAUDE.md/PLAN.md가 바뀌면 다시
+실행)가 이걸 공유한다.
+
+**매매일지 동기화**(`sync_trade_journal`): 보유 종목 스냅샷이 아니라 **전체
+이력**이다 — 매수든 매도든 발생한 모든 이벤트가 각각 한 행으로 계속 쌓이고,
+청산된 포지션도 행이 지워지지 않는다(포지션을 완전히 팔아도 그 매수/매도
+기록은 그대로 남는다 — 매매일지의 목적 자체가 "무슨 일이 있었는지"의 이력이지
+"지금 뭘 들고 있는지"의 스냅샷이 아니다). 중복 방지는 노션에 매번 쿼리하는
+대신 로컬 파일(`logs/notion_sync_state.json`)에 이미 올라간 이벤트 키
+(`event:ticker:day`)를 남기는 방식 — `portfolio_state.json`과 같은 "로컬
+파일을 신뢰한다" 패턴. 실패한 이벤트는 키를 안 남겨서 다음 `run_daily.py`
+실행 때 자동 재시도된다. `run_daily.py`가 매일 실행 끝에 자동으로 돌리고
+(`NOTION_TRADE_JOURNAL_DB_ID` 미설정이면 조용히 스킵 — 부가 기능이 실패해도
+매매 자체엔 영향 없어야 한다), 실패하면 텔레그램으로만 알린다.
+
+**부수적으로 발견한, 배포를 막을 뻔한 버그(2026-08-09)**: `scripts/` 아래
+스크립트를 `python scripts/run_daily.py`처럼 직접 실행하면 `sys.path[0]`이
+`scripts/` 자신이 되어 `from src import ...`가 실패한다(`ModuleNotFoundError`).
+pytest는 루트의 `conftest.py` 덕에 문제없이 통과해서 지금까지 안 걸렸지만,
+EC2 cron의 실제 실행 방식(`uv run python3 scripts/run_daily.py`)이 정확히 이
+실패 경로였다 — **고치지 않았다면 다음 날(2026-08-10) 첫 실전 검증이 시작
+전에 바로 죽었을 것.** `scripts/run_daily.py`/`scripts/setup_notion_workspace.py`
+둘 다 최상단에서 레포 루트를 `sys.path`에 직접 추가하도록 고쳤다. 오늘
+날짜(일요일)라 `is_krx_trading_day`가 즉시 스킵을 반환해 실제 KIS/LLM 호출
+없이 안전하게 실행 경로를 검증할 수 있었다.

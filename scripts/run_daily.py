@@ -10,13 +10,20 @@ cron 환경에서는 파일이 유일한 상태 저장소다.
 
 import asyncio
 import logging
+import os
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from src import judgment, llm, notify, pipeline, sell
-from src.market_calendar import is_krx_trading_day
-from src.schemas import PortfolioState, RiskGateConfig
+# `python scripts/run_daily.py`로 직접 실행하면 sys.path[0]이 scripts/ 자신이라
+# `from src import ...`가 실패한다 (pytest는 conftest.py 덕에 루트가 자동으로
+# 잡히지만, 스크립트 직접 실행은 그 메커니즘을 안 탄다) — 레포 루트를 명시적으로 추가.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src import judgment, llm, notify, notion_sync, pipeline, sell  # noqa: E402
+from src.market_calendar import is_krx_trading_day  # noqa: E402
+from src.schemas import PortfolioState, RiskGateConfig  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("run_daily")
@@ -104,6 +111,24 @@ async def main() -> None:
     )
 
     _log_monitoring_summary()
+    _sync_notion()
+
+
+def _sync_notion() -> None:
+    """logs/trade_journal.jsonl의 새 이벤트를 노션 매매일지로 올린다. 워크스페이스가
+    아직 설정 안 됐으면(scripts/setup_notion_workspace.py 미실행) 조용히 건너뛴다 —
+    노션 연동은 부가 기능이라 이것 때문에 run_daily 자체가 실패하면 안 된다."""
+    database_id = os.environ.get("NOTION_TRADE_JOURNAL_DB_ID")
+    if not database_id:
+        logger.info("notion_sync_skipped reason=not_configured")
+        return
+
+    try:
+        summary = notion_sync.sync_trade_journal(pipeline.DEFAULT_TRADE_JOURNAL_LOG_PATH, database_id)
+        logger.info("notion_sync summary=%s", summary)
+    except Exception as exc:
+        logger.exception("notion_sync_failed")
+        notify.send_telegram_alert(f"[SIMA] 노션 동기화 실패 (매매 자체엔 영향 없음): {exc!r}")
 
 
 def _log_monitoring_summary() -> None:

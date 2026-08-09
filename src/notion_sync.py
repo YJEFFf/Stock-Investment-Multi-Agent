@@ -1,0 +1,453 @@
+"""매매일지·프로젝트 소개 페이지를 노션에 자동으로 채운다.
+
+포트폴리오 피스로서의 노션 워크스페이스 — 사람이 나중에 수동으로 채울 필드는
+없다(사용자 확정, 2026-08-09). logs/trade_journal.jsonl이 유일한 원천이고, 이
+모듈은 그걸 노션이 읽기 좋은 형태로 그대로 옮기기만 한다.
+
+kis.py와 같은 관례: 네트워크·429(rate limit)만 재시도하고, 그 외 4xx(스키마
+오류, 권한 없음 등)는 재시도해도 같은 응답이 나오므로 즉시 실패로 처리한다.
+"""
+
+import json
+import logging
+import os
+import time
+from pathlib import Path
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+NOTION_API_BASE = "https://api.notion.com/v1"
+NOTION_VERSION = "2022-06-28"
+REQUEST_TIMEOUT_SECONDS = 15
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 2.0
+
+GITHUB_URL = "https://github.com/YJEFFf/Stock-Investment-Multi-Agent"
+
+# CLAUDE.md/PLAN.md와 다른 파일로 관리하는 이유: 코드가 아니라 노션 표시용
+# 텍스트라 손보는 이유가 다르다(문서 내용이 아니라 노션 블록 포맷을 고치게 됨).
+DEFAULT_SYNC_STATE_PATH = Path("logs/notion_sync_state.json")
+
+REASON_LABELS = {
+    "stop_loss": "손절",
+    "take_profit_trail": "익절",
+    "llm_discretionary": "LLM재량매도",
+}
+
+
+def _headers() -> dict:
+    return {
+        "Authorization": f"Bearer {os.environ.get('NOTION_API_KEY', '')}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def _notion_request(method: str, path: str, body: dict | None = None) -> dict | None:
+    url = f"{NOTION_API_BASE}{path}"
+    last_error: Exception | str | None = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.request(
+                method, url, headers=_headers(), json=body, timeout=REQUEST_TIMEOUT_SECONDS
+            )
+        except requests.RequestException as exc:
+            last_error = exc
+            logger.warning("notion_request_failed method=%s path=%s attempt=%d error=%s", method, path, attempt, exc)
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            continue
+
+        if response.status_code == 429:
+            retry_after = float(response.headers.get("Retry-After", RETRY_BACKOFF_SECONDS))
+            last_error = "rate_limited"
+            logger.warning("notion_rate_limited path=%s attempt=%d retry_after=%.1f", path, attempt, retry_after)
+            time.sleep(retry_after)
+            continue
+
+        if response.status_code >= 400:
+            logger.error(
+                "notion_api_error method=%s path=%s status=%d body=%s",
+                method,
+                path,
+                response.status_code,
+                response.text[:500],
+            )
+            return None
+
+        return response.json()
+
+    logger.error("notion_request_exhausted method=%s path=%s error=%s", method, path, last_error)
+    return None
+
+
+# --- 블록 빌더 ---
+
+
+def _rich_text(content: str) -> list[dict]:
+    return [{"type": "text", "text": {"content": content}}]
+
+
+def _heading(content: str, level: int = 2) -> dict:
+    key = f"heading_{level}"
+    return {"object": "block", "type": key, key: {"rich_text": _rich_text(content)}}
+
+
+def _paragraph(content: str) -> dict:
+    return {"object": "block", "type": "paragraph", "paragraph": {"rich_text": _rich_text(content)}}
+
+
+def _bulleted(content: str) -> dict:
+    return {"object": "block", "type": "bulleted_list_item", "bulleted_list_item": {"rich_text": _rich_text(content)}}
+
+
+def _bookmark(url: str) -> dict:
+    return {"object": "block", "type": "bookmark", "bookmark": {"url": url}}
+
+
+def _divider() -> dict:
+    return {"object": "block", "type": "divider", "divider": {}}
+
+
+def _truncate(text: str | None, limit: int = 1900) -> str:
+    """노션 rich_text 블록 하나는 2000자 제한 — 원문 전체는 항상
+    logs/trade_journal.jsonl에 남아있으니 노션 쪽은 잘려도 괜찮다."""
+    if not text:
+        return ""
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+# --- 워크스페이스 뼈대 생성 (1회성 셋업) ---
+
+
+def add_landing_page_content(parent_page_id: str) -> bool:
+    """사용자가 미리 만들어 integration과 연결해둔 페이지 자체를 랜딩 페이지로
+    쓴다 — 새 페이지를 만드는 게 아니라 그 페이지에 소개+GitHub 링크 블록을
+    붙인다."""
+    children = [
+        _heading("SIMA", level=1),
+        _paragraph(
+            "한국 주식(KOSPI200) 대상 멀티에이전트 투자 판단 시스템 — "
+            "LLM 분석가들이 종목마다 독립적으로 의견을 내고, 결정론적 리스크 게이트가 최종 승인한다."
+        ),
+        _bookmark(GITHUB_URL),
+        _divider(),
+    ]
+    result = _notion_request("PATCH", f"/blocks/{parent_page_id}/children", {"children": children})
+    return result is not None
+
+
+def _code_block(content: str, language: str = "plain text") -> dict:
+    return {"object": "block", "type": "code", "code": {"rich_text": _rich_text(content), "language": language}}
+
+
+ARCHITECTURE_DIAGRAM = """\
+[수집: 코드]      시세·지표(한투·pykrx)   뉴스(RSS·크롤러)   공시(DART API)
+                        |                      |                  |
+[분석: LLM]        차트 분석가            뉴스 분석가         공시 분석가
+                        |                      |                  |
+                        +----------------------+------------------+
+                                               |
+[판단: LLM]                          강세/약세 토론  (반대 논거 강제 생성)
+                                               |
+                                    포트폴리오 매니저 (근거 종합)
+                                               |
+[게이트: 코드]                   리스크 게이트 (한도 초과 시 무조건 거부)
+                                               |
+[집행: 코드]                              주문 집행
+"""
+
+CORE_CONTRACT_CODE = """\
+class AnalystOpinion(BaseModel):
+    agent: str                       # "chart" | "news" | "disclosure" | "quant"
+    ticker: str
+    score: float                     # -1.0 ~ 1.0
+    confidence: float                # 0.0 ~ 1.0
+    evidence: list[str]              # 원문 ID + 프롬프트 버전 ("prompt:chart@a3f2c1")
+    as_of: datetime                  # 이 판단이 사용한 데이터의 최신 시점
+
+class Decision(BaseModel):
+    ticker: str
+    action: Literal["BUY", "HOLD"]   # 매도는 별도 경로
+    reason: str
+    inputs: list[AnalystOpinion]     # 이 결정을 만든 의견 전체
+    degraded: bool                   # 분석가 일부가 실패한 상태에서 나온 결정인가
+
+class GateResult(BaseModel):
+    approved: bool
+    rejected_by: str | None          # "position_limit" | "sector_concentration" | ...
+"""
+
+
+def _intro_page_blocks() -> list[dict]:
+    return [
+        _paragraph(
+            "KOSPI200 유니버스 대상 멀티에이전트 투자 판단 시스템. "
+            "LLM 분석가들이 종목마다 독립적으로 의견을 내고, 결정론적 리스크 게이트가 최종 승인한다."
+        ),
+        _heading("왜 이런 제약이 있는가", level=2),
+        _paragraph(
+            "이전 버전은 실패했다. 원인은 코드 품질이 아니라 설계였다. 스케줄러가 "
+            "\"pending 매수 신호가 5개 미만이면 분석을 다시 실행\"하는 구조였고, "
+            "이것이 사실상 일일 매수 할당량으로 작동했다. 같은 종목을 반복해서 보여주니 "
+            "결국 통과했다. 문턱을 낮춘 적은 없지만 재시도가 문턱을 대신 낮췄다."
+        ),
+        _paragraph(
+            "그 결과 매일 매수가 발생했고, 신호에 예측력이 있는지 자체를 측정할 수 없게 됐다 — "
+            "좋아서 산 건지 채워야 해서 산 건지 구분이 불가능했기 때문이다."
+        ),
+        _heading("절대 규칙", level=2),
+        _bulleted("기본 상태는 현금이다 — 매수 없음이 정상 출력이며, 실패나 예외가 아니다."),
+        _bulleted("목표 신호 개수 파라미터를 만들지 않는다 — 상위 N개 선택 금지."),
+        _bulleted("절대 문턱으로만 거른다 — 후보가 0개인 날이 있어야 정상이다."),
+        _bulleted("재시도는 데이터 수집 실패에만 허용한다 — 결과가 마음에 안 들어서 재시도 금지."),
+        _bulleted("LLM에게 종목 비교를 시키지 않는다 — 종목당 독립 호출로 판정, 다른 후보 정보는 컨텍스트에 안 넣는다."),
+        _bulleted("최종 승인권은 코드가 갖는다 — LLM은 거부권만 가진다."),
+        _bulleted("실거래 연결 금지 — 모의투자로만 검증, 실거래 전환은 사용자 명시적 지시가 있을 때만."),
+        _divider(),
+        _heading("아키텍처", level=2),
+        _paragraph("수집·게이트·집행은 결정론적 코드다. 분석가는 데이터를 직접 가져오지 않고 MarketContext로 주입받는다."),
+        _code_block(ARCHITECTURE_DIAGRAM),
+        _heading("핵심 계약 (src/schemas.py)", level=2),
+        _paragraph(
+            "계층 간 데이터는 자연어 문자열이 아니라 이 스키마로만 주고받는다. "
+            "분석가는 AnalystOpinion | None을 반환한다 — \"데이터 부족으로 판단 불가\"와 "
+            "\"판단했으나 점수가 낮음\"은 다른 상태라 None과 낮은 점수를 구분한다."
+        ),
+        _code_block(CORE_CONTRACT_CODE, language="python"),
+        _heading("리스크 게이트 수치 (2026-08-08 확정)", level=2),
+        _bulleted("종목당 최대 비중 15%"),
+        _bulleted("섹터 집중도 한도 40%"),
+        _bulleted("일일 손실 한도 -5% (도달 시 그날 신규 매수 중단)"),
+        _bulleted("총 노출 한도 100% (개별 한도로만 통제, 별도 상한 없음)"),
+        _heading("매도 로직 (2026-08-09 확정)", level=2),
+        _bulleted("결정론적 안전장치(항상 실행): 손절 -10% 전량 매도, 익절 +20%부터 1/3씩 트레일링 매도"),
+        _bulleted(
+            "LLM 재량 매도(보유 종목 재평가, 옵션): 매수용 강세/약세 토론+매니저와 대칭 구조이지만 "
+            "게이트를 거치지 않고 그대로 실행된다 — 대신 프롬프트 자체를 보수적으로 설계해 상쇄한다"
+        ),
+        _heading("기술 스택", level=2),
+        _bulleted("Python 3.11+, pydantic v2, asyncio"),
+        _bulleted(
+            "Anthropic API 직접 호출 — LangGraph/CrewAI/AutoGen 미사용. "
+            "에이전트 간 대화나 동적 툴 호출이 없고 병렬 호출 후 스키마 취합이 전부라 "
+            "프레임워크는 디버깅만 어렵게 만든다"
+        ),
+        _bulleted(
+            "분석가 호출은 asyncio.gather(..., return_exceptions=True) — "
+            "DART가 죽어도 차트 분석가는 돌아야 한다. 분석가 일부가 빠진 채 나온 결정은 "
+            "Decision.degraded=True로 표시하고 게이트에서 기준을 높인다"
+        ),
+        _bulleted("테스트는 pytest, LLM 호출은 고정 응답으로 목킹 — 파이프라인 로직은 네트워크 없이 전부 테스트 가능"),
+        _heading("구축 순서 — 아래에서 위로", level=2),
+        _paragraph(
+            "다이어그램의 아래쪽(게이트·집행)부터 만들었다. 분석가부터 만들면 결과가 나오는 순간 "
+            "\"이 종목 사볼까\"가 되고 게이트는 계속 뒤로 밀린다 — 이전 프로젝트가 무너진 지점이다."
+        ),
+        _bulleted("마일스톤 1 — 아무것도 사지 않는 시스템: 분석가 자리에 랜덤 점수 더미를 넣고 게이트·집행·로깅 완성"),
+        _bulleted("마일스톤 2 — 분석가 투입: 차트 → 뉴스 → 공시 순으로 하나씩 붙이며 신호 발생률 변화 기록"),
+        _bulleted(
+            "마일스톤 3 — 측정: IC(정보계수, 예측값과 실제 수익률의 순위상관) 0.03~0.05가 안정적으로 "
+            "나오면 유의미한 신호. 백테스트 수익률은 성공 지표로 안 쓴다 — LLM은 과거 뉴스 이후 "
+            "무슨 일이 있었는지 이미 학습해서 알고 있어 과거 구간 성능이 부풀려진다"
+        ),
+        _heading("감시 지표", level=2),
+        _bulleted("최근 20영업일 중 매수 신호가 난 날의 비율 — 매일 신호가 나면 시스템이 고장 난 것"),
+        _bulleted("게이트 거부 사유별 건수 — 특정 룰만 계속 발동하면 그 룰이 과하거나 분석가가 한쪽으로 쏠려 있다는 뜻"),
+        _bulleted("분석가별 호출 수·실패율·토큰 사용량"),
+        _divider(),
+        _paragraph("전체 코드와 설계 문서(CLAUDE.md, docs/PLAN.md)는 GitHub에서 그대로 볼 수 있다."),
+        _bookmark(GITHUB_URL),
+    ]
+
+
+def create_intro_page(parent_page_id: str) -> str | None:
+    """CLAUDE.md/docs/PLAN.md 요약 — 왜 이렇게 설계했는지 방문자에게 보여주는 페이지.
+    링크를 따라가게 하지 않고 핵심 내용을 페이지 안에 직접 다 적어둔다(사용자 요청,
+    2026-08-09)."""
+    body = {
+        "parent": {"type": "page_id", "page_id": parent_page_id},
+        "properties": {"title": {"title": _rich_text("프로젝트 소개 · 설계 철학")}},
+        "children": _intro_page_blocks(),
+    }
+    result = _notion_request("POST", "/pages", body)
+    return result["id"] if result else None
+
+
+def _list_block_children(block_id: str) -> list[dict]:
+    result = _notion_request("GET", f"/blocks/{block_id}/children?page_size=100")
+    return result["results"] if result else []
+
+
+def refresh_intro_page(page_id: str) -> bool:
+    """이미 만들어진 소개 페이지의 내용을 최신 _intro_page_blocks()로 통째로
+    교체한다 — CLAUDE.md/docs/PLAN.md가 바뀌었을 때 다시 실행해서 노션도
+    맞춘다. 기존 블록을 전부 지우고 새로 채우는 방식(부분 diff가 아니다)."""
+    for block in _list_block_children(page_id):
+        _notion_request("DELETE", f"/blocks/{block['id']}")
+
+    result = _notion_request("PATCH", f"/blocks/{page_id}/children", {"children": _intro_page_blocks()})
+    return result is not None
+
+
+def create_trade_journal_database(parent_page_id: str) -> str | None:
+    body = {
+        "parent": {"type": "page_id", "page_id": parent_page_id},
+        "title": [{"type": "text", "text": {"content": "매매일지"}}],
+        "properties": {
+            "이름": {"title": {}},
+            "날짜": {"date": {}},
+            "티커": {"rich_text": {}},
+            "구분": {
+                "select": {
+                    "options": [
+                        {"name": "매수", "color": "green"},
+                        {"name": "매도", "color": "red"},
+                    ]
+                }
+            },
+            "사유": {
+                "select": {
+                    "options": [
+                        {"name": "신규매수", "color": "green"},
+                        {"name": "손절", "color": "red"},
+                        {"name": "익절", "color": "orange"},
+                        {"name": "LLM재량매도", "color": "yellow"},
+                    ]
+                }
+            },
+            "가격": {"number": {"format": "won"}},
+            "수량": {"number": {"format": "number"}},
+            "실현손익률": {"number": {"format": "percent"}},
+            "보유일수": {"number": {"format": "number"}},
+        },
+    }
+    result = _notion_request("POST", "/databases", body)
+    return result["id"] if result else None
+
+
+# --- 매매일지 동기화 ---
+
+
+def _buy_row_properties(entry: dict) -> dict:
+    return {
+        "이름": {"title": _rich_text(f"{entry['ticker']} 매수")},
+        "날짜": {"date": {"start": entry["day"]}},
+        "티커": {"rich_text": _rich_text(entry["ticker"])},
+        "구분": {"select": {"name": "매수"}},
+        "사유": {"select": {"name": "신규매수"}},
+        "가격": {"number": entry["entry_price"]},
+        "수량": {"number": entry["quantity"]},
+    }
+
+
+def _buy_row_children(entry: dict) -> list[dict]:
+    decision = entry["decision"]
+    blocks = [_heading("매니저 최종 판단", level=3), _paragraph(_truncate(decision["reason"]))]
+
+    if decision.get("inputs"):
+        blocks.append(_heading("분석가 의견", level=3))
+        for op in decision["inputs"]:
+            blocks.append(_bulleted(f"{op['agent']}: score={op['score']:.2f}, confidence={op['confidence']:.2f}"))
+
+    if decision.get("debate"):
+        blocks.append(_heading("토론 논거", level=3))
+        for d in decision["debate"]:
+            blocks.append(_bulleted(f"[{d['stance']}] (강도 {d['strength']:.2f}) {_truncate(d['argument'], 500)}"))
+
+    return blocks
+
+
+def _sell_row_properties(entry: dict) -> dict:
+    properties = {
+        "이름": {"title": _rich_text(f"{entry['ticker']} 매도")},
+        "날짜": {"date": {"start": entry["day"]}},
+        "티커": {"rich_text": _rich_text(entry["ticker"])},
+        "구분": {"select": {"name": "매도"}},
+        "사유": {"select": {"name": REASON_LABELS.get(entry["reason"], entry["reason"])}},
+        "가격": {"number": entry["exit_price"]},
+    }
+    if entry.get("realized_pnl_pct") is not None:
+        properties["실현손익률"] = {"number": entry["realized_pnl_pct"]}
+    if entry.get("holding_days") is not None:
+        properties["보유일수"] = {"number": entry["holding_days"]}
+    return properties
+
+
+def _sell_row_children(entry: dict) -> list[dict]:
+    if not entry.get("reasoning"):
+        return []
+    return [_heading("판단 사유", level=3), _paragraph(_truncate(entry["reasoning"]))]
+
+
+def _entry_key(entry: dict) -> str:
+    return f"{entry['event']}:{entry['ticker']}:{entry['day']}"
+
+
+def _load_synced_keys(state_path: Path) -> set[str]:
+    if not state_path.exists():
+        return set()
+    return set(json.loads(state_path.read_text()).get("synced_keys", []))
+
+
+def _save_synced_keys(state_path: Path, keys: set[str]) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({"synced_keys": sorted(keys)}, ensure_ascii=False, indent=2))
+
+
+def sync_trade_journal(
+    trade_journal_log_path: Path,
+    database_id: str,
+    state_path: Path = DEFAULT_SYNC_STATE_PATH,
+) -> dict:
+    """logs/trade_journal.jsonl에서 아직 노션에 안 올라간 이벤트만 새로 올린다.
+
+    이미 올라간 이벤트는 state_path(로컬 파일)에 키로 남겨 다시 안 올린다 —
+    노션에 매번 쿼리해서 중복을 확인하는 대신 로컬 상태를 신뢰한다
+    (portfolio_state.json과 같은 패턴). 실패한 이벤트는 키를 안 남기므로
+    다음 실행 때 자동으로 재시도된다.
+    """
+    if not trade_journal_log_path.exists():
+        return {"synced": 0, "failed": 0, "skipped": 0}
+
+    synced_keys = _load_synced_keys(state_path)
+    lines = [line for line in trade_journal_log_path.read_text().splitlines() if line.strip()]
+
+    synced = 0
+    failed = 0
+    skipped = 0
+    for line in lines:
+        entry = json.loads(line)
+        key = _entry_key(entry)
+        if key in synced_keys:
+            skipped += 1
+            continue
+
+        if entry["event"] == "buy":
+            properties = _buy_row_properties(entry)
+            children = _buy_row_children(entry)
+        else:
+            properties = _sell_row_properties(entry)
+            children = _sell_row_children(entry)
+
+        result = _notion_request(
+            "POST",
+            "/pages",
+            {"parent": {"database_id": database_id}, "properties": properties, "children": children},
+        )
+        if result is None:
+            logger.warning("notion_sync_row_failed key=%s", key)
+            failed += 1
+            continue
+
+        synced_keys.add(key)
+        synced += 1
+
+    _save_synced_keys(state_path, synced_keys)
+    logger.info("notion_sync_done synced=%d failed=%d skipped=%d", synced, failed, skipped)
+    return {"synced": synced, "failed": failed, "skipped": skipped}
