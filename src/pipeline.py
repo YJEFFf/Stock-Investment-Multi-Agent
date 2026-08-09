@@ -670,3 +670,71 @@ def summarize_log(log_path: Path, total_days: int) -> dict:
         "signal_day_ratio": (len(signal_days) / total_days) if total_days else 0.0,
         "rejected_by_counts": rejected_by_counts,
     }
+
+
+def summarize_recent_trading_days(log_path: Path, n_days: int) -> dict:
+    """cron이 매일 같은 파일에 계속 이어 쓰는 실환경용 래퍼.
+
+    summarize_log(total_days=N)는 파일 안의 모든 기록을 N으로 나누는데, 이는
+    "정확히 N일치만 담긴 로그"를 전제한다(마일스톤1 시뮬레이션·실측 테스트가 그렇게
+    썼다). 실제 cron 로그는 배포 이후 계속 누적되므로 그 가정이 깨진다 — 최근
+    n_days개의 서로 다른 날짜만 추려서 그 위에서 같은 집계를 돌린다. 로그에 아직
+    n_days보다 적은 날짜만 쌓여있으면 있는 만큼만으로 계산한다(허수로 채우지 않음).
+    """
+    if not log_path.exists():
+        return {"total_days": 0, "signal_days": 0, "signal_day_ratio": 0.0, "rejected_by_counts": {}}
+
+    lines = [line for line in log_path.read_text().splitlines() if line.strip()]
+    entries = [json.loads(line) for line in lines]
+
+    distinct_days = sorted({e["day"] for e in entries})
+    recent_days = set(distinct_days[-n_days:])
+    recent_entries = [e for e in entries if e["day"] in recent_days]
+
+    signal_days: set[str] = set()
+    rejected_by_counts: dict[str, int] = {}
+    for e in recent_entries:
+        if e["action"] == "BUY" and e["approved"]:
+            signal_days.add(e["day"])
+        if not e["approved"] and e["rejected_by"]:
+            rejected_by_counts[e["rejected_by"]] = rejected_by_counts.get(e["rejected_by"], 0) + 1
+
+    total_days = len(recent_days)
+    return {
+        "total_days": total_days,
+        "signal_days": len(signal_days),
+        "signal_day_ratio": (len(signal_days) / total_days) if total_days else 0.0,
+        "rejected_by_counts": rejected_by_counts,
+    }
+
+
+def summarize_llm_calls(log_path: Path, since: datetime | None = None) -> dict:
+    """분석가/토론/매니저(label)별 호출수·실패율·토큰사용량 집계 (CLAUDE.md "감시 지표").
+
+    llm.call_structured가 매 호출마다 logs/llm_calls.jsonl에 남기는 원본을 읽는다.
+    `since`를 주면 그 시각 이후 기록만 본다 — run_daily.py는 "최근 20영업일"과
+    같은 창을 쓰기 위해 넘긴다.
+    """
+    if not log_path.exists():
+        return {}
+
+    lines = [line for line in log_path.read_text().splitlines() if line.strip()]
+    entries = [json.loads(line) for line in lines]
+    if since is not None:
+        entries = [e for e in entries if datetime.fromisoformat(e["timestamp"]) >= since]
+
+    by_label: dict[str, dict] = {}
+    for e in entries:
+        stats = by_label.setdefault(
+            e["label"], {"calls": 0, "failures": 0, "input_tokens": 0, "output_tokens": 0}
+        )
+        stats["calls"] += 1
+        if not e["success"]:
+            stats["failures"] += 1
+        stats["input_tokens"] += e["input_tokens"]
+        stats["output_tokens"] += e["output_tokens"]
+
+    for stats in by_label.values():
+        stats["failure_rate"] = stats["failures"] / stats["calls"] if stats["calls"] else 0.0
+
+    return by_label

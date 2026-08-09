@@ -1,6 +1,8 @@
 import json
 import logging
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, TypeVar
 
 import anthropic
@@ -19,9 +21,19 @@ DEFAULT_EFFORT = "low"  # 채점형 판단이라 깊은 추론까지는 불필�
 # max_retries만큼 재시도하므로, 여기서는 "응답은 왔는데 우리 스키마와 안 맞는" 경우만 다룬다.
 MAX_STRUCTURED_RETRIES = 2
 
+# CLAUDE.md "감시 지표" — 분석가별(label) 호출수·실패율·토큰사용량 집계용 원본 로그.
+# pipeline.py의 DEFAULT_LOG_PATH/DEFAULT_SELL_LOG_PATH와 같은 패턴(호출부에서 override 가능).
+DEFAULT_LLM_CALL_LOG_PATH = Path("logs/llm_calls.jsonl")
+
 _client = AsyncAnthropic(max_retries=3, timeout=30.0)
 
 T = TypeVar("T", bound=BaseModel)
+
+
+def _append_call_log(log_path: Path, entry: dict) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a") as f:
+        f.write(json.dumps(entry, default=str) + "\n")
 
 
 async def call_structured(
@@ -32,17 +44,26 @@ async def call_structured(
     model: str = DEFAULT_MODEL,
     max_tokens: int = 1024,
     effort: str = DEFAULT_EFFORT,
+    label: str = "unknown",
+    log_path: Path = DEFAULT_LLM_CALL_LOG_PATH,
 ) -> T:
     """구조화 출력을 받아 response_model로 검증한다.
 
     output_config.format으로 JSON 형태 자체는 API가 보장하지만, score/confidence의
     수치 범위 같은 의미적 제약은 pydantic이 검증한다. 그 검증에 실패했을 때만(=파싱
     실패와 동급) 재시도한다 — "점수가 마음에 안 들어서" 재시도하는 경로는 없다.
+
+    `label`은 이 호출이 어떤 분석가/판단 단계에서 왔는지("chart", "news",
+    "debate_bull", "portfolio_manager_buy" 등) 식별하는 태그다 — 이 함수는 모든
+    분석가·토론·매니저가 공유하는 통로라 여기서 남기지 않으면 나중에 호출별
+    분석가 귀속이 불가능해진다.
     """
     last_error: Exception | None = None
+    total_input_tokens = 0
+    total_output_tokens = 0
+    start = time.monotonic()
 
     for attempt in range(1, MAX_STRUCTURED_RETRIES + 1):
-        start = time.monotonic()
         try:
             response = await _client.messages.create(
                 model=model,
@@ -59,28 +80,72 @@ async def call_structured(
             logger.warning("llm_call_transport_failed attempt=%d error=%s", attempt, exc)
             continue
 
-        elapsed = time.monotonic() - start
+        total_input_tokens += response.usage.input_tokens
+        total_output_tokens += response.usage.output_tokens
         logger.info(
-            "llm_call model=%s input_tokens=%d output_tokens=%d elapsed_s=%.2f stop_reason=%s",
+            "llm_call label=%s model=%s input_tokens=%d output_tokens=%d stop_reason=%s",
+            label,
             model,
             response.usage.input_tokens,
             response.usage.output_tokens,
-            elapsed,
             response.stop_reason,
         )
 
         if response.stop_reason == "refusal":
+            _append_call_log(
+                log_path,
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "label": label,
+                    "model": model,
+                    "attempts": attempt,
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                    "elapsed_s": round(time.monotonic() - start, 2),
+                    "success": False,
+                    "error": "refusal",
+                },
+            )
             raise RuntimeError(f"LLM refused the request: {response.stop_reason}")
 
         try:
             text = next(b.text for b in response.content if b.type == "text")
             data = json.loads(text)
-            return response_model.model_validate(data)
+            result = response_model.model_validate(data)
         except (StopIteration, json.JSONDecodeError, ValidationError) as exc:
             last_error = exc
             logger.warning("llm_call_validation_failed attempt=%d error=%s", attempt, exc)
             continue
 
+        _append_call_log(
+            log_path,
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "label": label,
+                "model": model,
+                "attempts": attempt,
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "elapsed_s": round(time.monotonic() - start, 2),
+                "success": True,
+            },
+        )
+        return result
+
+    _append_call_log(
+        log_path,
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "label": label,
+            "model": model,
+            "attempts": MAX_STRUCTURED_RETRIES,
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "elapsed_s": round(time.monotonic() - start, 2),
+            "success": False,
+            "error": repr(last_error),
+        },
+    )
     raise RuntimeError(
         f"LLM structured call failed after {MAX_STRUCTURED_RETRIES} attempts"
     ) from last_error

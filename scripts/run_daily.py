@@ -10,11 +10,11 @@ cron 환경에서는 파일이 유일한 상태 저장소다.
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from src import judgment, notify, pipeline, sell
+from src import judgment, llm, notify, pipeline, sell
 from src.market_calendar import is_krx_trading_day
 from src.schemas import PortfolioState, RiskGateConfig
 
@@ -23,6 +23,11 @@ logger = logging.getLogger("run_daily")
 
 PORTFOLIO_STATE_PATH = Path("logs/portfolio_state.json")
 KST = ZoneInfo("Asia/Seoul")
+
+# CLAUDE.md "감시 지표" 창. 20영업일 ≈ 달력일 30일(주말+공휴일 감안 여유치) — 이 숫자는
+# 판단에 쓰이는 문턱이 아니라 리포트 조회창일 뿐이라 정밀할 필요가 없다.
+MONITORING_WINDOW_TRADING_DAYS = 20
+MONITORING_WINDOW_CALENDAR_DAYS = 30
 
 
 def _load_portfolio() -> PortfolioState:
@@ -97,6 +102,35 @@ async def main() -> None:
         portfolio.cash_weight,
         len(portfolio.positions),
     )
+
+    _log_monitoring_summary()
+
+
+def _log_monitoring_summary() -> None:
+    """CLAUDE.md "감시 지표"를 매일 cron 로그에 남긴다 — 읽기 전용 리포트, 판단 로직
+    어디에도 이 결과를 되먹임하지 않는다(사람이 보라고 남기는 숫자다)."""
+    signal_summary = pipeline.summarize_recent_trading_days(
+        pipeline.DEFAULT_LOG_PATH, MONITORING_WINDOW_TRADING_DAYS
+    )
+    logger.info(
+        "monitoring_signal_rate days=%d signal_days=%d signal_day_ratio=%.3f rejected_by=%s",
+        signal_summary["total_days"],
+        signal_summary["signal_days"],
+        signal_summary["signal_day_ratio"],
+        signal_summary["rejected_by_counts"],
+    )
+
+    since = datetime.now(timezone.utc) - timedelta(days=MONITORING_WINDOW_CALENDAR_DAYS)
+    llm_summary = pipeline.summarize_llm_calls(llm.DEFAULT_LLM_CALL_LOG_PATH, since=since)
+    for label, stats in sorted(llm_summary.items()):
+        logger.info(
+            "monitoring_llm_calls label=%s calls=%d failure_rate=%.3f input_tokens=%d output_tokens=%d",
+            label,
+            stats["calls"],
+            stats["failure_rate"],
+            stats["input_tokens"],
+            stats["output_tokens"],
+        )
 
 
 if __name__ == "__main__":

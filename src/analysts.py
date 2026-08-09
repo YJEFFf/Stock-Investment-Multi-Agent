@@ -105,6 +105,7 @@ async def chart_analyst(context: MarketContext) -> AnalystOpinion | None:
         user=prompt,
         response_model=_ChartAnalysisResponse,
         json_schema=_CHART_RESPONSE_SCHEMA,
+        label="chart",
     )
 
     return AnalystOpinion(
@@ -175,6 +176,7 @@ async def news_analyst(context: NewsContext) -> AnalystOpinion | None:
         user=prompt,
         response_model=_NewsAnalysisResponse,
         json_schema=_NEWS_RESPONSE_SCHEMA,
+        label="news",
     )
 
     return AnalystOpinion(
@@ -243,6 +245,7 @@ async def disclosure_analyst(context: DisclosureContext) -> AnalystOpinion | Non
         user=prompt,
         response_model=_DisclosureAnalysisResponse,
         json_schema=_DISCLOSURE_RESPONSE_SCHEMA,
+        label="disclosure",
     )
 
     return AnalystOpinion(

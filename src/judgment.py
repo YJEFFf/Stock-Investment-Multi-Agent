@@ -57,6 +57,7 @@ async def _run_debate_side(
         user=prompt,
         response_model=_DebateResponse,
         json_schema=_DEBATE_RESPONSE_SCHEMA,
+        label=prompt_path.stem,
     )
 
     # evidence는 stance가 아니라 실제 쓰인 프롬프트 파일명 기준 — 매수용
@@ -127,6 +128,7 @@ async def portfolio_manager(
         user=prompt,
         response_model=_ManagerResponse,
         json_schema=_MANAGER_RESPONSE_SCHEMA,
+        label="portfolio_manager_buy",
     )
 
     return Decision(
@@ -222,6 +224,7 @@ async def portfolio_manager_sell(
         user=prompt,
         response_model=_SellManagerResponse,
         json_schema=_SELL_MANAGER_RESPONSE_SCHEMA,
+        label="portfolio_manager_sell",
     )
 
     if result.action == "HOLD":
