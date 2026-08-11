@@ -11,6 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
+
 import scripts.decide_llm_sell as dls
 from src import kis, portfolio_store
 from src.schemas import AnalystOpinion, PortfolioState, Position, SellAction
@@ -20,6 +22,14 @@ def _position(**overrides) -> Position:
     defaults = dict(ticker="005930", sector="반도체", weight=0.10, entry_price=100.0, peak_price=100.0)
     defaults.update(overrides)
     return Position(**defaults)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_notify_or_name_lookup(monkeypatch):
+    # main()이 이제 판단 결과 요약(0건 포함)을 텔레그램으로 보낸다 — 목킹 안 하면
+    # 테스트가 실제 텔레그램 메시지를 보내고 실제 네이버를 긁는다.
+    monkeypatch.setattr(dls.notify, "send_telegram_alert", lambda message: True)
+    monkeypatch.setattr(dls.pipeline, "display_name", lambda ticker: ticker)
 
 
 def test_noop_when_not_trading_day(monkeypatch, tmp_path):

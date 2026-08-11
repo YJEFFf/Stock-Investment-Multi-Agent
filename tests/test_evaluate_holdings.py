@@ -23,7 +23,7 @@ def _no_real_notify_or_name_lookup(monkeypatch):
     # 안 하면 테스트가 실제 텔레그램 메시지를 보내고 실제 네이버를 긁는다
     # (2026-08-09, execute_buy_order 쪽과 같은 이유로 실수로 한 번 겪음).
     monkeypatch.setattr(pipeline.notify, "send_telegram_alert", lambda message: True)
-    monkeypatch.setattr(pipeline, "_display_name", lambda ticker: ticker)
+    monkeypatch.setattr(pipeline, "display_name", lambda ticker: ticker)
 
 
 def test_returns_unchanged_when_no_positions(monkeypatch):

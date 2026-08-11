@@ -13,8 +13,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
+
 import scripts.decide_buys as db
 from src.schemas import AnalystOpinion, Decision, GateResult, PortfolioState
+
+
+@pytest.fixture(autouse=True)
+def _no_real_notify_or_name_lookup(monkeypatch):
+    # main()이 이제 판단 결과 요약(0건 포함)을 텔레그램으로 보낸다 — 목킹 안 하면
+    # 테스트가 실제 텔레그램 메시지를 보내고 실제 네이버를 긁는다(2026-08-09,
+    # execute_buy_order 쪽에서 실수로 한 번 겪은 것과 같은 함정, 2026-08-11 재발).
+    monkeypatch.setattr(db.notify, "send_telegram_alert", lambda message: True)
+    monkeypatch.setattr(db.pipeline, "display_name", lambda ticker: ticker)
 
 
 def _decision(ticker="005930", action="BUY") -> Decision:

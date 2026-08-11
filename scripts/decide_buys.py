@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import judgment, pipeline  # noqa: E402
+from src import judgment, notify, pipeline  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.portfolio_store import load_portfolio  # noqa: E402
 from src.schemas import Decision, GateResult, PortfolioState, RiskGateConfig  # noqa: E402
@@ -97,6 +97,9 @@ async def main() -> None:
     PENDING_BUYS_PATH.write_text(
         json.dumps({"day": today_kst.isoformat(), "decisions": recorded}, ensure_ascii=False, indent=2)
     )
+
+    names = [pipeline.display_name(d["ticker"]) for d in recorded]
+    notify.send_telegram_alert(notify.format_buy_decision_alert(today_kst.isoformat(), names))
 
     logger.info(
         "decide_buys_done day=%s approved=%d tickers=%s",

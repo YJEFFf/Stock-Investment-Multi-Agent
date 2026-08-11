@@ -16,7 +16,7 @@ def _no_real_notify_or_name_lookup(monkeypatch):
     # 시도한다 — 목킹 안 하면 테스트가 실제 텔레그램 메시지를 보내고 실제 네이버를
     # 긁는다(2026-08-09, 실수로 한 번 겪음).
     monkeypatch.setattr(pipeline.notify, "send_telegram_alert", lambda message: True)
-    monkeypatch.setattr(pipeline, "_display_name", lambda ticker: ticker)
+    monkeypatch.setattr(pipeline, "display_name", lambda ticker: ticker)
 
 
 def _decision(action="BUY") -> Decision:

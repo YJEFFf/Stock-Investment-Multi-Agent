@@ -83,6 +83,9 @@ async def main() -> None:
         json.dumps({"decided_on": today_kst.isoformat(), "actions": actions}, ensure_ascii=False, indent=2)
     )
 
+    names = [pipeline.display_name(a["ticker"]) for a in actions]
+    notify.send_telegram_alert(notify.format_sell_decision_alert(today_kst.isoformat(), names))
+
     logger.info(
         "decide_llm_sell_done day=%s decided=%d tickers=%s",
         today_kst.isoformat(),

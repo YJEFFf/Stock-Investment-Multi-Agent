@@ -67,6 +67,27 @@ def format_error_alert(context: str, error: str) -> str:
     return f"⚠️ [SIMA] 오류 — {context}\n{_truncate(error, 500)}"
 
 
+def format_buy_decision_alert(day: str, names: list[str]) -> str:
+    """decide_buys.py(08:30)가 판단만 마쳤을 때 보내는 요약 — 0건이어도 보낸다.
+    실제 매수 체결 알림(format_buy_alert)과 달리 "판단 단계가 살아서 끝까지
+    돌았다"는 것 자체가 목적이라, 승인 0건도 조용히 넘기지 않는다(사용자 요청,
+    2026-08-11 — 침묵이 "신호 없음"인지 "cron이 안 돎"인지 구분이 안 되는 문제)."""
+    if not names:
+        return f"🔎 [SIMA] 매수 판단 완료 ({day})\n승인 0건 — 오늘은 매수 후보 없음"
+    return f"🔎 [SIMA] 매수 판단 완료 ({day})\n승인 {len(names)}건: {', '.join(names)}\n집행은 09:00 장 시작 직후"
+
+
+def format_sell_decision_alert(day: str, names: list[str]) -> str:
+    """decide_llm_sell.py(15:35)가 판단만 마쳤을 때 보내는 요약 — 0건이어도
+    보낸다. format_buy_decision_alert와 같은 이유(사용자 요청, 2026-08-11)."""
+    if not names:
+        return f"🔎 [SIMA] 재량 매도 판단 완료 ({day})\n매도 결정 0건 — 보유 종목 유지"
+    return (
+        f"🔎 [SIMA] 재량 매도 판단 완료 ({day})\n매도 결정 {len(names)}건: {', '.join(names)}"
+        "\n집행은 다음 거래일 09:00 장 시작 직후"
+    )
+
+
 def send_telegram_alert(message: str) -> bool:
     """성공하면 True, 토큰/chat_id 미설정이거나 전송 실패면 False (예외를 던지지 않는다)."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")

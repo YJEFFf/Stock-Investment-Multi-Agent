@@ -102,7 +102,7 @@ def test_full_daily_workflow_sell_then_buy_end_to_end(monkeypatch, tmp_path):
     monkeypatch.setattr(rd.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
     # 종목명 캐시(.kospi200_ticker_name_cache.json)는 레포 루트의 실제 파일이라
     # chdir로도 못 가린다 — 테스트를 그 파일 상태와 무관하게 만들려고 코드 그대로 쓰게 둔다.
-    monkeypatch.setattr(rd.pipeline, "_display_name", lambda ticker: ticker)
+    monkeypatch.setattr(rd.pipeline, "display_name", lambda ticker: ticker)
     monkeypatch.delenv("NOTION_TRADE_JOURNAL_DB_ID", raising=False)
     monkeypatch.delenv("NOTION_DAILY_REPORT_DB_ID", raising=False)
 

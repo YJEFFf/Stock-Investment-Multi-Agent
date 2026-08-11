@@ -289,7 +289,7 @@ async def execute_buy_order(
             "decision": decision.model_dump(mode="json"),
         },
     )
-    notify.send_telegram_alert(notify.format_buy_alert(_display_name(ticker), entry_price, quantity, decision.reason))
+    notify.send_telegram_alert(notify.format_buy_alert(display_name(ticker), entry_price, quantity, decision.reason))
 
     return PortfolioState(
         positions=positions,
@@ -304,7 +304,7 @@ def _append_log(log_path: Path, entry: dict) -> None:
         f.write(json.dumps(entry, default=str) + "\n")
 
 
-def _display_name(ticker: str) -> str:
+def display_name(ticker: str) -> str:
     """텔레그램 알림에 종목코드 대신 종목명을 보여주려고 쓴다(사용자 요청,
     2026-08-09). collectors.fetch_kospi200_ticker_names()가 30일 캐시라 대부분
     파일 읽기 한 번으로 끝난다. 실패해도 코드로 폴백할 뿐 알림 자체를 막지 않는다."""
@@ -321,7 +321,7 @@ def _log_buy_skip(log_path: Path, day, ticker: str, reason: str, **extra) -> Non
     _append_log(log_path, {"event": "buy_skipped", "day": day.isoformat(), "ticker": ticker, "reason": reason, **extra})
     reason_label = notify.REASON_LABELS.get(reason, reason)
     detail = f"{extra['gap_pct']:.1%}" if "gap_pct" in extra else ""
-    notify.send_telegram_alert(notify.format_buy_skipped_alert(_display_name(ticker), reason_label, detail))
+    notify.send_telegram_alert(notify.format_buy_skipped_alert(display_name(ticker), reason_label, detail))
 
 
 def make_dummy_analyst_fn(base_seed: int) -> AnalystFn:
@@ -743,7 +743,7 @@ async def finalize_sell(
     )
     notify.send_telegram_alert(
         notify.format_sell_alert(
-            _display_name(position.ticker),
+            display_name(position.ticker),
             notify.REASON_LABELS.get(action.reason, action.reason),
             current_price,
             realized_pnl_pct,
