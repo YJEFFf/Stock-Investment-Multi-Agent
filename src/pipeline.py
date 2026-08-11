@@ -686,46 +686,70 @@ async def evaluate_holdings(
         if action is None:
             continue
 
-        portfolio = await sell_execute_fn(portfolio, action, current_price)
-        _append_log(
-            log_path,
-            {
-                "day": day.date().isoformat(),
-                "ticker": ticker,
-                "reason": action.reason,
-                "sell_fraction": action.sell_fraction,
-                "price": current_price,
-            },
+        portfolio = await finalize_sell(
+            portfolio, action, position, current_price, day, sell_execute_fn, log_path, trade_journal_log_path
         )
 
-        realized_pnl_pct = (
-            (current_price - position.entry_price) / position.entry_price if position.entry_price else None
+    return portfolio
+
+
+async def finalize_sell(
+    portfolio: PortfolioState,
+    action: SellAction,
+    position: Position,
+    current_price: float,
+    day: datetime,
+    sell_execute_fn: SellExecuteFn,
+    log_path: Path,
+    trade_journal_log_path: Path,
+) -> PortfolioState:
+    """이미 정해진 SellAction 하나를 집행 + 로그 + 알림까지 마무리한다.
+
+    evaluate_holdings(판단과 동시에 집행, C의 1분 체크가 씀)와 execute_open.py
+    (전날 장 마감 후 정해둔 LLM 재량 매도를 다음날 장 시작 때 집행, D/B 분리)가
+    이 함수를 공유한다 — "액션이 이미 정해졌을 때 어떻게 집행하고 남기는가"는
+    판단이 언제 내려졌는지와 무관하게 항상 같아야 한다.
+    """
+    portfolio = await sell_execute_fn(portfolio, action, current_price)
+    _append_log(
+        log_path,
+        {
+            "day": day.date().isoformat(),
+            "ticker": position.ticker,
+            "reason": action.reason,
+            "sell_fraction": action.sell_fraction,
+            "price": current_price,
+        },
+    )
+
+    realized_pnl_pct = (
+        (current_price - position.entry_price) / position.entry_price if position.entry_price else None
+    )
+    holding_days = (day.date() - position.entry_day).days if position.entry_day else None
+    _append_log(
+        trade_journal_log_path,
+        {
+            "event": "sell",
+            "day": day.date().isoformat(),
+            "ticker": position.ticker,
+            "reason": action.reason,
+            "reasoning": action.reasoning,
+            "sell_fraction": action.sell_fraction,
+            "exit_price": current_price,
+            "entry_price": position.entry_price,
+            "realized_pnl_pct": realized_pnl_pct,
+            "holding_days": holding_days,
+        },
+    )
+    notify.send_telegram_alert(
+        notify.format_sell_alert(
+            _display_name(position.ticker),
+            notify.REASON_LABELS.get(action.reason, action.reason),
+            current_price,
+            realized_pnl_pct,
+            reasoning=action.reasoning,
         )
-        holding_days = (day.date() - position.entry_day).days if position.entry_day else None
-        _append_log(
-            trade_journal_log_path,
-            {
-                "event": "sell",
-                "day": day.date().isoformat(),
-                "ticker": ticker,
-                "reason": action.reason,
-                "reasoning": action.reasoning,
-                "sell_fraction": action.sell_fraction,
-                "exit_price": current_price,
-                "entry_price": position.entry_price,
-                "realized_pnl_pct": realized_pnl_pct,
-                "holding_days": holding_days,
-            },
-        )
-        notify.send_telegram_alert(
-            notify.format_sell_alert(
-                _display_name(ticker),
-                notify.REASON_LABELS.get(action.reason, action.reason),
-                current_price,
-                realized_pnl_pct,
-                reasoning=action.reasoning,
-            )
-        )
+    )
 
     return portfolio
 

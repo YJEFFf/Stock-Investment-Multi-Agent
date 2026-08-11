@@ -23,12 +23,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import judgment, llm, notify, notion_sync, pipeline, sell  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
+from src.portfolio_store import load_portfolio as _load_portfolio  # noqa: E402
+from src.portfolio_store import save_portfolio as _save_portfolio  # noqa: E402
 from src.schemas import PortfolioState, RiskGateConfig  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("run_daily")
 
-PORTFOLIO_STATE_PATH = Path("logs/portfolio_state.json")
 KST = ZoneInfo("Asia/Seoul")
 
 # CLAUDE.md "감시 지표" 창. 20영업일 ≈ 달력일 30일(주말+공휴일 감안 여유치) — 이 숫자는
@@ -36,16 +37,13 @@ KST = ZoneInfo("Asia/Seoul")
 MONITORING_WINDOW_TRADING_DAYS = 20
 MONITORING_WINDOW_CALENDAR_DAYS = 30
 
-
-def _load_portfolio() -> PortfolioState:
-    if PORTFOLIO_STATE_PATH.exists():
-        return PortfolioState.model_validate_json(PORTFOLIO_STATE_PATH.read_text())
-    return PortfolioState()
-
-
-def _save_portfolio(portfolio: PortfolioState) -> None:
-    PORTFOLIO_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PORTFOLIO_STATE_PATH.write_text(portfolio.model_dump_json(indent=2))
+# NOTE(2026-08-11): 이 스크립트는 더 이상 cron에 안 걸려 있다. 하루 파이프라인이
+# A(decide_buys, 07:00) / B(execute_open, 09:00) / C(check_stop_loss, 1분마다) /
+# D(decide_llm_sell, 15:35) 네 단계로 쪼개졌다(docs/PLAN.md 참고) — 매도가 먼저
+# 자리잡아야 한다는 원칙(§ "매도 로직 일별 배선")과 이번 스케줄 분리는 다른
+# 이유(시세 타이밍)로 갈라진 것뿐, 로직 자체는 그대로 재사용한다. 이 파일은
+# 로컬/수동으로 전체 흐름을 한 번에 돌려보고 싶을 때 쓰는 개발용 진입점으로
+# 남겨둔다.
 
 
 async def main() -> None:

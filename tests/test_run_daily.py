@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 import scripts.run_daily as rd
+from src import portfolio_store
 from src.schemas import Decision, GateResult, PortfolioState, Position
 
 # _isolate 픽스처가 테스트 전체에서 rd._sync_notion/_log_monitoring_summary를
@@ -40,7 +41,7 @@ def _decision(ticker="005930", action="BUY", approved=True):
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
-    monkeypatch.setattr(rd, "PORTFOLIO_STATE_PATH", tmp_path / "portfolio_state.json")
+    monkeypatch.setattr(portfolio_store, "PORTFOLIO_STATE_PATH", tmp_path / "portfolio_state.json")
     monkeypatch.setattr(rd, "is_krx_trading_day", lambda day: True)
     monkeypatch.setattr(rd, "_log_monitoring_summary", lambda: None)
     monkeypatch.setattr(rd, "_sync_notion", lambda today, portfolio: None)
@@ -68,7 +69,7 @@ def test_main_skips_everything_on_non_trading_day(monkeypatch):
     asyncio.run(rd.main())
 
     assert calls == {"evaluate_holdings": 0, "run_daily": 0, "monitoring": 0, "notion": 0}
-    assert not rd.PORTFOLIO_STATE_PATH.exists()
+    assert not portfolio_store.PORTFOLIO_STATE_PATH.exists()
 
 
 def test_main_happy_path_runs_all_stages_in_order(monkeypatch):
@@ -103,7 +104,7 @@ def test_main_happy_path_runs_all_stages_in_order(monkeypatch):
     assert order == ["evaluate_holdings", "run_daily", "monitoring", "notion"]
     assert notion_calls[0][1] == after_buy
 
-    saved = PortfolioState.model_validate_json(rd.PORTFOLIO_STATE_PATH.read_text())
+    saved = PortfolioState.model_validate_json(portfolio_store.PORTFOLIO_STATE_PATH.read_text())
     assert saved == after_buy
 
 
@@ -122,7 +123,7 @@ def test_main_saves_portfolio_after_evaluate_holdings_even_if_run_daily_fails(mo
     with pytest.raises(RuntimeError):
         asyncio.run(rd.main())
 
-    saved = PortfolioState.model_validate_json(rd.PORTFOLIO_STATE_PATH.read_text())
+    saved = PortfolioState.model_validate_json(portfolio_store.PORTFOLIO_STATE_PATH.read_text())
     assert saved == after_sell  # evaluate_holdings 이후 저장은 살아있어야 한다
 
 
@@ -150,23 +151,8 @@ def test_main_continues_to_buy_judgment_when_evaluate_holdings_fails(monkeypatch
     assert "evaluate_holdings 실패" in alerts[0]
     assert "RuntimeError" in alerts[0]
     # evaluate_holdings가 실패해도 run_daily는 실패 전 포트폴리오 그대로 이어받아 저장한다.
-    saved = PortfolioState.model_validate_json(rd.PORTFOLIO_STATE_PATH.read_text())
+    saved = PortfolioState.model_validate_json(portfolio_store.PORTFOLIO_STATE_PATH.read_text())
     assert saved == PortfolioState()
-
-
-def test_load_portfolio_returns_default_when_no_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(rd, "PORTFOLIO_STATE_PATH", tmp_path / "does_not_exist.json")
-    assert rd._load_portfolio() == PortfolioState()
-
-
-def test_save_and_load_portfolio_roundtrip(tmp_path, monkeypatch):
-    path = tmp_path / "nested" / "portfolio_state.json"
-    monkeypatch.setattr(rd, "PORTFOLIO_STATE_PATH", path)
-
-    portfolio = PortfolioState(cash_weight=0.7, positions=[Position(ticker="005930", sector="반도체", weight=0.3)])
-    rd._save_portfolio(portfolio)
-
-    assert rd._load_portfolio() == portfolio
 
 
 def test_sync_notion_skips_when_neither_db_configured(monkeypatch):
