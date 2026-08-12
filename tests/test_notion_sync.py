@@ -7,6 +7,14 @@ from src import notion_sync
 from src.schemas import PortfolioState, Position
 
 
+@pytest.fixture(autouse=True)
+def _no_real_ticker_name_lookup(monkeypatch):
+    # _display_name이 실제 네이버 스크래핑(collectors.fetch_kospi200_ticker_names)을
+    # 타지 않도록 기본적으로 막는다 — None을 반환하면 _display_name이 코드로
+    # 폴백하므로, 이걸 쓰지 않는 기존 테스트들은 전과 동일하게 동작한다.
+    monkeypatch.setattr(notion_sync.collectors, "fetch_kospi200_ticker_names", lambda: None)
+
+
 class _FakeResponse:
     def __init__(self, status_code=200, body=None, headers=None, text=""):
         self.status_code = status_code
@@ -228,6 +236,25 @@ def test_buy_row_properties_and_children():
     assert any("종합 판단 근거" in b["paragraph"]["rich_text"][0]["text"]["content"] for b in paragraphs)
 
 
+def test_row_titles_use_display_name_but_ticker_column_keeps_code(monkeypatch):
+    monkeypatch.setattr(notion_sync.collectors, "fetch_kospi200_ticker_names", lambda: {"005930": "삼성전자"})
+
+    buy_props = notion_sync._buy_row_properties(_buy_entry())
+    assert buy_props["이름"]["title"][0]["text"]["content"] == "삼성전자 매수"
+    assert buy_props["티커"]["rich_text"][0]["text"]["content"] == "005930"
+
+    sell_props = notion_sync._sell_row_properties(_sell_entry())
+    assert sell_props["이름"]["title"][0]["text"]["content"] == "삼성전자 매도"
+
+    skip_props = notion_sync._buy_skipped_row_properties(_buy_skipped_entry())
+    assert skip_props["이름"]["title"][0]["text"]["content"] == "삼성전자 매수 스킵"
+
+
+def test_display_name_falls_back_to_ticker_when_lookup_fails(monkeypatch):
+    monkeypatch.setattr(notion_sync.collectors, "fetch_kospi200_ticker_names", lambda: None)
+    assert notion_sync._display_name("005930") == "005930"
+
+
 def test_create_intro_page_writes_full_content_not_just_a_link(monkeypatch):
     captured = {}
 
@@ -365,6 +392,30 @@ def test_sync_daily_report_creates_one_page_summarizing_the_day(monkeypatch, tmp
     assert "특별한 일" in all_text
 
     assert json.loads(state_path.read_text())["synced_days"] == ["2026-08-10"]
+
+
+def test_daily_report_shows_display_names_and_cash_weight_to_two_decimals(monkeypatch):
+    monkeypatch.setattr(
+        notion_sync.collectors, "fetch_kospi200_ticker_names", lambda: {"005930": "삼성전자", "035420": "네이버"}
+    )
+
+    portfolio = PortfolioState(
+        positions=[Position(ticker="005930", sector="반도체", weight=0.08, entry_price=231200.0, quantity=10)],
+        cash_weight=0.8765,
+    )
+    blocks = notion_sync._daily_report_children(
+        "2026-08-10",
+        decisions_today=[{"ticker": "005930", "action": "BUY", "approved": True, "rejected_by": None, "avg_score": 0.9}],
+        buys=[_buy_entry()],
+        sells=[],
+        skips=[_buy_skipped_entry(ticker="035420")],
+        portfolio=portfolio,
+    )
+    all_text = json.dumps(blocks, ensure_ascii=False)
+
+    assert "삼성전자" in all_text
+    assert "네이버" in all_text
+    assert "현금 비중: 87.65%" in all_text
 
 
 def test_sync_daily_report_skips_if_already_synced_for_day(monkeypatch, tmp_path):

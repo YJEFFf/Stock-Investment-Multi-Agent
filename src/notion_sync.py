@@ -17,6 +17,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from src import collectors
 from src.schemas import PortfolioState
 
 load_dotenv()
@@ -53,6 +54,16 @@ REASON_LABELS = {
     "quantity_zero": "수량0",
     "order_rejected": "주문거부",
 }
+
+
+def _display_name(ticker: str) -> str:
+    """노션에는 종목코드 대신 종목명을 보여준다(사용자 요청, 2026-08-12).
+    pipeline.display_name과 로직이 같지만 여기서 따로 두는 이유는
+    DEFAULT_TRADE_JOURNAL_LOG_PATH 등과 같다 — 노션 표시용 텍스트를 고치는 이유와
+    판단 로직을 고치는 이유가 다르니 pipeline을 임포트하지 않는다. 실패해도
+    코드로 폴백할 뿐 동기화 자체를 막지 않는다."""
+    names = collectors.fetch_kospi200_ticker_names()
+    return (names or {}).get(ticker, ticker)
 
 
 def _headers() -> dict:
@@ -351,7 +362,7 @@ def create_trade_journal_database(parent_page_id: str) -> str | None:
 
 def _buy_row_properties(entry: dict) -> dict:
     return {
-        "이름": {"title": _rich_text(f"{entry['ticker']} 매수")},
+        "이름": {"title": _rich_text(f"{_display_name(entry['ticker'])} 매수")},
         "날짜": {"date": {"start": entry["day"]}},
         "티커": {"rich_text": _rich_text(entry["ticker"])},
         "구분": {"select": {"name": "매수"}},
@@ -380,7 +391,7 @@ def _buy_row_children(entry: dict) -> list[dict]:
 
 def _sell_row_properties(entry: dict) -> dict:
     properties = {
-        "이름": {"title": _rich_text(f"{entry['ticker']} 매도")},
+        "이름": {"title": _rich_text(f"{_display_name(entry['ticker'])} 매도")},
         "날짜": {"date": {"start": entry["day"]}},
         "티커": {"rich_text": _rich_text(entry["ticker"])},
         "구분": {"select": {"name": "매도"}},
@@ -402,7 +413,7 @@ def _sell_row_children(entry: dict) -> list[dict]:
 
 def _buy_skipped_row_properties(entry: dict) -> dict:
     return {
-        "이름": {"title": _rich_text(f"{entry['ticker']} 매수 스킵")},
+        "이름": {"title": _rich_text(f"{_display_name(entry['ticker'])} 매수 스킵")},
         "날짜": {"date": {"start": entry["day"]}},
         "티커": {"rich_text": _rich_text(entry["ticker"])},
         "구분": {"select": {"name": "매수스킵"}},
@@ -547,14 +558,14 @@ def _daily_report_children(
             score_text = f"{avg_score:.2f}" if avg_score is not None else "-"
             reason = _truncate(d.get("reason"), 300)
             suffix = f" — {reason}" if reason else ""
-            blocks.append(_bulleted(f"{d['ticker']}: {_decision_label(d)} (avg_score={score_text}){suffix}"))
+            blocks.append(_bulleted(f"{_display_name(d['ticker'])}: {_decision_label(d)} (avg_score={score_text}){suffix}"))
     else:
         blocks.append(_paragraph("오늘은 판단 로그가 없다 — 휴장일이었거나 유니버스 수집에 실패했을 수 있다."))
 
     blocks.append(_heading(f"매수 ({len(buys)}건)", level=2))
     if buys:
         for b in buys:
-            blocks.append(_bulleted(f"{b['ticker']}: {b['quantity']}주 @ {b['entry_price']:,.0f}"))
+            blocks.append(_bulleted(f"{_display_name(b['ticker'])}: {b['quantity']}주 @ {b['entry_price']:,.0f}"))
     else:
         blocks.append(_paragraph("오늘 매수 없음."))
 
@@ -563,7 +574,7 @@ def _daily_report_children(
         for s in sells:
             reason_label = REASON_LABELS.get(s["reason"], s["reason"])
             pnl = f", 실현손익 {s['realized_pnl_pct']:+.1%}" if s.get("realized_pnl_pct") is not None else ""
-            blocks.append(_bulleted(f"{s['ticker']}: {reason_label}{pnl}"))
+            blocks.append(_bulleted(f"{_display_name(s['ticker'])}: {reason_label}{pnl}"))
     else:
         blocks.append(_paragraph("오늘 매도 없음."))
 
@@ -572,17 +583,17 @@ def _daily_report_children(
         for sk in skips:
             reason_label = REASON_LABELS.get(sk["reason"], sk["reason"])
             detail = f" (갭 {sk['gap_pct']:.1%})" if sk.get("gap_pct") is not None else ""
-            blocks.append(_bulleted(f"{sk['ticker']}: {reason_label}{detail}"))
+            blocks.append(_bulleted(f"{_display_name(sk['ticker'])}: {reason_label}{detail}"))
 
     blocks.append(_heading(f"장마감 기준 보유 종목 ({len(portfolio.positions)}개)", level=2))
     if portfolio.positions:
         for p in portfolio.positions:
             entry_price = f"{p.entry_price:,.0f}" if p.entry_price is not None else "-"
             quantity = p.quantity if p.quantity is not None else "-"
-            blocks.append(_bulleted(f"{p.ticker}: 비중 {p.weight:.1%}, 진입가 {entry_price}, 수량 {quantity}"))
+            blocks.append(_bulleted(f"{_display_name(p.ticker)}: 비중 {p.weight:.1%}, 진입가 {entry_price}, 수량 {quantity}"))
     else:
         blocks.append(_paragraph("보유 종목 없음 — 전액 현금."))
-    blocks.append(_paragraph(f"현금 비중: {portfolio.cash_weight:.1%}"))
+    blocks.append(_paragraph(f"현금 비중: {portfolio.cash_weight:.2%}"))
 
     return blocks
 
