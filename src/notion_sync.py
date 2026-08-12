@@ -431,8 +431,14 @@ def _buy_skipped_row_children(entry: dict) -> list[dict]:
     ]
 
 
-def _entry_key(entry: dict) -> str:
-    return f"{entry['event']}:{entry['ticker']}:{entry['day']}"
+def _entry_key(entry: dict, occurrence: int = 0) -> str:
+    """occurrence는 같은 (event, ticker, day) 조합이 로그에 몇 번째로 등장했는지다
+    — 트레일링 익절처럼 같은 종목을 같은 날 두 번(1/3씩) 매도하면 기본 키가
+    충돌해서 두 번째 매도가 노션에 조용히 스킵됐다(2026-08-12 발견). 첫 번째
+    등장은 기존 키 형식을 그대로 써서 이미 동기화된 state 파일과 계속 맞물리게
+    하고, 두 번째부터만 접미사를 붙인다."""
+    base = f"{entry['event']}:{entry['ticker']}:{entry['day']}"
+    return base if occurrence == 0 else f"{base}:{occurrence}"
 
 
 def _load_synced_keys(state_path: Path) -> set[str]:
@@ -464,12 +470,16 @@ def sync_trade_journal(
     synced_keys = _load_synced_keys(state_path)
     lines = [line for line in trade_journal_log_path.read_text().splitlines() if line.strip()]
 
+    occurrence_counts: dict[tuple[str, str, str], int] = {}
     synced = 0
     failed = 0
     skipped = 0
     for line in lines:
         entry = json.loads(line)
-        key = _entry_key(entry)
+        group = (entry["event"], entry["ticker"], entry["day"])
+        occurrence = occurrence_counts.get(group, 0)
+        occurrence_counts[group] = occurrence + 1
+        key = _entry_key(entry, occurrence)
         if key in synced_keys:
             skipped += 1
             continue

@@ -179,6 +179,51 @@ def test_sync_trade_journal_handles_buy_skipped_events(monkeypatch, tmp_path):
     assert "4.2%" in body_text
 
 
+def test_sync_trade_journal_syncs_both_same_day_same_ticker_sells(monkeypatch, tmp_path):
+    # 트레일링 익절처럼 같은 종목을 같은 날 두 번(1/3씩) 매도하면 event:ticker:day
+    # 키가 충돌해서 두 번째 매도가 조용히 스킵됐던 버그(2026-08-12 발견)의 회귀 테스트.
+    log_path = tmp_path / "trade_journal.jsonl"
+    first_sell = _sell_entry(ticker="192820", day="2026-08-12", reason="take_profit_trail")
+    first_sell["exit_price"] = 252000.0
+    second_sell = _sell_entry(ticker="192820", day="2026-08-12", reason="take_profit_trail")
+    second_sell["exit_price"] = 240500.0
+    _write_jsonl(log_path, [first_sell, second_sell])
+
+    captured_bodies = []
+    monkeypatch.setattr(
+        notion_sync, "_notion_request", lambda method, path, body=None: captured_bodies.append(body) or {"id": "row-x"}
+    )
+
+    state_path = tmp_path / "state.json"
+    summary = notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path)
+
+    assert summary == {"synced": 2, "failed": 0, "skipped": 0}
+    prices = {b["properties"]["가격"]["number"] for b in captured_bodies}
+    assert prices == {252000.0, 240500.0}
+    assert json.loads(state_path.read_text())["synced_keys"] == sorted(
+        ["sell:192820:2026-08-12", "sell:192820:2026-08-12:1"]
+    )
+
+
+def test_sync_trade_journal_keeps_unsuffixed_key_for_single_occurrence(monkeypatch, tmp_path):
+    # 하루 한 번만 발생하는 흔한 경우엔 키 형식이 기존 그대로여야, 이미 배포된 서버의
+    # notion_sync_state.json에 쌓인 과거 키들과 계속 맞물려서 중복 재동기화가 안 된다.
+    log_path = tmp_path / "trade_journal.jsonl"
+    _write_jsonl(log_path, [_buy_entry()])
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"synced_keys": ["buy:005930:2026-08-10"]}))
+
+    def fail_request(*a, **k):
+        raise AssertionError("이미 동기화된 항목은 다시 요청하면 안 된다")
+
+    monkeypatch.setattr(notion_sync, "_notion_request", fail_request)
+
+    summary = notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path)
+
+    assert summary == {"synced": 0, "failed": 0, "skipped": 1}
+
+
 def test_sync_trade_journal_skips_already_synced_entries(monkeypatch, tmp_path):
     log_path = tmp_path / "trade_journal.jsonl"
     entry = _buy_entry()
