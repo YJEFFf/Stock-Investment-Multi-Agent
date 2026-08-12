@@ -399,7 +399,7 @@ def _sell_row_properties(entry: dict) -> dict:
         "가격": {"number": entry["exit_price"]},
     }
     if entry.get("realized_pnl_pct") is not None:
-        properties["실현손익률"] = {"number": entry["realized_pnl_pct"]}
+        properties["실현손익률"] = {"number": round(entry["realized_pnl_pct"], 4)}
     if entry.get("holding_days") is not None:
         properties["보유일수"] = {"number": entry["holding_days"]}
     return properties
@@ -422,7 +422,7 @@ def _buy_skipped_row_properties(entry: dict) -> dict:
 
 
 def _buy_skipped_row_children(entry: dict) -> list[dict]:
-    detail = f" (갭 {entry['gap_pct']:.1%})" if entry.get("gap_pct") is not None else ""
+    detail = f" (갭 {entry['gap_pct']:.2%})" if entry.get("gap_pct") is not None else ""
     return [
         _paragraph(
             "리스크 게이트는 승인했지만 체결 직전 단계에서 실제 매수까지는 가지 못했다 — "
@@ -583,7 +583,7 @@ def _daily_report_children(
     if sells:
         for s in sells:
             reason_label = REASON_LABELS.get(s["reason"], s["reason"])
-            pnl = f", 실현손익 {s['realized_pnl_pct']:+.1%}" if s.get("realized_pnl_pct") is not None else ""
+            pnl = f", 실현손익 {s['realized_pnl_pct']:+.2%}" if s.get("realized_pnl_pct") is not None else ""
             blocks.append(_bulleted(f"{_display_name(s['ticker'])}: {reason_label}{pnl}"))
     else:
         blocks.append(_paragraph("오늘 매도 없음."))
@@ -592,7 +592,7 @@ def _daily_report_children(
         blocks.append(_heading(f"특별한 일 — 게이트는 통과했지만 체결 못 함 ({len(skips)}건)", level=2))
         for sk in skips:
             reason_label = REASON_LABELS.get(sk["reason"], sk["reason"])
-            detail = f" (갭 {sk['gap_pct']:.1%})" if sk.get("gap_pct") is not None else ""
+            detail = f" (갭 {sk['gap_pct']:.2%})" if sk.get("gap_pct") is not None else ""
             blocks.append(_bulleted(f"{_display_name(sk['ticker'])}: {reason_label}{detail}"))
 
     blocks.append(_heading(f"장마감 기준 보유 종목 ({len(portfolio.positions)}개)", level=2))
@@ -600,7 +600,7 @@ def _daily_report_children(
         for p in portfolio.positions:
             entry_price = f"{p.entry_price:,.0f}" if p.entry_price is not None else "-"
             quantity = p.quantity if p.quantity is not None else "-"
-            blocks.append(_bulleted(f"{_display_name(p.ticker)}: 비중 {p.weight:.1%}, 진입가 {entry_price}, 수량 {quantity}"))
+            blocks.append(_bulleted(f"{_display_name(p.ticker)}: 비중 {p.weight:.2%}, 진입가 {entry_price}, 수량 {quantity}"))
     else:
         blocks.append(_paragraph("보유 종목 없음 — 전액 현금."))
     blocks.append(_paragraph(f"현금 비중: {portfolio.cash_weight:.2%}"))
@@ -615,7 +615,7 @@ def _daily_report_properties(day: str, buys: list[dict], sells: list[dict], port
         "매수": {"number": len(buys)},
         "매도": {"number": len(sells)},
         "보유종목수": {"number": len(portfolio.positions)},
-        "현금비중": {"number": portfolio.cash_weight},
+        "현금비중": {"number": round(portfolio.cash_weight, 4)},
     }
 
 

@@ -176,7 +176,7 @@ def test_sync_trade_journal_handles_buy_skipped_events(monkeypatch, tmp_path):
     assert props["구분"] == {"select": {"name": "매수스킵"}}
     assert props["사유"] == {"select": {"name": "갭초과"}}
     body_text = json.dumps(captured_bodies[0]["children"], ensure_ascii=False)
-    assert "4.2%" in body_text
+    assert "4.20%" in body_text
 
 
 def test_sync_trade_journal_syncs_both_same_day_same_ticker_sells(monkeypatch, tmp_path):
@@ -279,6 +279,19 @@ def test_buy_row_properties_and_children():
     children = notion_sync._buy_row_children(entry)
     paragraphs = [b for b in children if b["type"] == "paragraph"]
     assert any("종합 판단 근거" in b["paragraph"]["rich_text"][0]["text"]["content"] for b in paragraphs)
+
+
+def test_sell_row_properties_rounds_realized_pnl_to_two_decimal_percent():
+    entry = _sell_entry()
+    entry["realized_pnl_pct"] = 0.14523809523809525
+    props = notion_sync._sell_row_properties(entry)
+    assert props["실현손익률"] == {"number": 0.1452}
+
+
+def test_daily_report_properties_rounds_cash_weight_to_two_decimal_percent():
+    portfolio = PortfolioState(cash_weight=0.7243999999999999)
+    props = notion_sync._daily_report_properties("2026-08-12", buys=[], sells=[], portfolio=portfolio)
+    assert props["현금비중"] == {"number": 0.7244}
 
 
 def test_row_titles_use_display_name_but_ticker_column_keeps_code(monkeypatch):
