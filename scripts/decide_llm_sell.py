@@ -21,6 +21,7 @@ portfolio_state.json은 원자적으로 쓰이므로(os.replace) 읽기만 할 �
 import asyncio
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,7 +29,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import judgment, kis, notify, pipeline  # noqa: E402
+from src import judgment, kis, notify, notion_sync, pipeline  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.portfolio_store import load_portfolio  # noqa: E402
 
@@ -37,6 +38,30 @@ logger = logging.getLogger("decide_llm_sell")
 
 KST = ZoneInfo("Asia/Seoul")
 PENDING_SELLS_PATH = Path("logs/pending_sells.json")
+
+
+def _sync_daily_report(today_kst, portfolio) -> None:
+    """오늘 하루(판단·매수·매도·최종 보유 종목)를 노션 일일 리포트로 남긴다.
+    여기서 부르는 이유: check_stop_loss.py가 09:00-15:30 매분 결정론적
+    손절/익절로 보유 종목을 바꿀 수 있어서, 이 스크립트(15:35, 장마감 후)가
+    도는 시점의 portfolio가 그날의 진짜 "장마감 기준" 스냅샷이다 — 이
+    스크립트 자신은 상태를 안 바꾸므로(판단만 하고 집행은 다음날 아침) 그
+    스냅샷이 여기서 흔들리지 않는다.
+
+    워크스페이스가 아직 설정 안 됐으면(scripts/setup_notion_workspace.py
+    미실행) 조용히 건너뛴다 — 노션 연동은 부가 기능이라 이것 때문에
+    decide_llm_sell 자체가 실패하면 안 된다."""
+    daily_report_db_id = os.environ.get("NOTION_DAILY_REPORT_DB_ID")
+    if not daily_report_db_id:
+        logger.info("notion_daily_report_sync_skipped reason=not_configured")
+        return
+
+    try:
+        created = notion_sync.sync_daily_report(today_kst.isoformat(), portfolio, daily_report_db_id)
+        logger.info("notion_daily_report_synced=%s", created)
+    except Exception as exc:
+        logger.exception("notion_daily_report_sync_failed")
+        notify.send_telegram_alert(notify.format_error_alert("노션 일일 리포트 동기화 실패 (매매 자체엔 영향 없음)", repr(exc)))
 
 
 async def main() -> None:
@@ -92,6 +117,8 @@ async def main() -> None:
         len(actions),
         [a["ticker"] for a in actions],
     )
+
+    _sync_daily_report(today_kst, portfolio)
 
 
 if __name__ == "__main__":

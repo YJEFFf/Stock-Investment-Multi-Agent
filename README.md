@@ -82,9 +82,9 @@ docs/PLAN.md            # 설계 배경과 근거
 | 시각 | 스크립트 | 하는 일 |
 |---|---|---|
 | 08:30 | `decide_buys.sh` | 유니버스 → 정량 필터 → 분석가 → 토론+매니저 → 게이트. 승인된 BUY를 `logs/pending_buys.json`에 기록만 하고 집행 안 함 |
-| 09:00 | `execute_open.sh` | 전날 15:35에 정해둔 매도(`pending_sells.json`)를 먼저 집행 → 오늘 08:30에 정해둔 매수(`pending_buys.json`) 집행 |
+| 09:00 | `execute_open.sh` | 전날 15:35에 정해둔 매도(`pending_sells.json`)를 먼저 집행 → 오늘 08:30에 정해둔 매수(`pending_buys.json`) 집행. 그 직후 노션 매매일지(`notion_sync.sync_trade_journal`) 동기화 |
 | 09:00–15:30 (매분) | `check_stop_loss.sh` | 보유 종목 전부 결정론적 손절(-10%)/트레일링 익절(+20%)만 체크·집행. LLM 없음 |
-| 15:35 | `decide_llm_sell.sh` | 보유 종목 LLM 재량 매도 판단만 (`pending_sells.json`에 기록). 장 마감 후라 집행은 다음 거래일 09:00으로 미룸 |
+| 15:35 | `decide_llm_sell.sh` | 보유 종목 LLM 재량 매도 판단만 (`pending_sells.json`에 기록). 장 마감 후라 집행은 다음 거래일 09:00으로 미룸. 그 직후 노션 일일 리포트(`notion_sync.sync_daily_report`) 동기화 — 이 시점 portfolio가 그날의 진짜 장마감 스냅샷이라 여기서 만든다 |
 
 휴장일(주말·KRX 공휴일)은 `market_calendar.is_krx_trading_day`가 각 스크립트
 맨 앞에서 걸러 LLM/KIS 호출 없이 조용히 종료한다. 전체 파이프라인이 예외로

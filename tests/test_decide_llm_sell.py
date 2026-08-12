@@ -30,6 +30,11 @@ def _no_real_notify_or_name_lookup(monkeypatch):
     # 테스트가 실제 텔레그램 메시지를 보내고 실제 네이버를 긁는다.
     monkeypatch.setattr(dls.notify, "send_telegram_alert", lambda message: True)
     monkeypatch.setattr(dls.pipeline, "display_name", lambda ticker: ticker)
+    # notion_sync.py가 import 시점에 .env를 읽어 NOTION_*를 채워둘 수 있다 — 로컬에
+    # 실제 노션 워크스페이스가 설정돼 있으면 이 값들이 살아있어 테스트가 실제
+    # API를 호출해버린다. 노션 동기화 자체는 test_sync_daily_report_* 테스트에서
+    # 따로 검증하므로, 그 외 테스트에서는 기본적으로 꺼둔다.
+    monkeypatch.delenv("NOTION_DAILY_REPORT_DB_ID", raising=False)
 
 
 def test_noop_when_not_trading_day(monkeypatch, tmp_path):
@@ -109,6 +114,54 @@ def test_skips_position_when_price_unavailable(monkeypatch, tmp_path):
 
     payload = json.loads(dls.PENDING_SELLS_PATH.read_text())
     assert payload["actions"] == []
+
+
+def test_sync_daily_report_skipped_when_not_configured(monkeypatch):
+    monkeypatch.delenv("NOTION_DAILY_REPORT_DB_ID", raising=False)
+
+    def fail(*a, **k):
+        raise AssertionError("설정 안 됐으면 notion_sync를 호출하면 안 된다")
+
+    monkeypatch.setattr(dls.notion_sync, "sync_daily_report", fail)
+
+    dls._sync_daily_report(None, PortfolioState(cash_weight=1.0))
+
+
+def test_sync_daily_report_called_when_configured(monkeypatch):
+    monkeypatch.setenv("NOTION_DAILY_REPORT_DB_ID", "db-report")
+
+    from datetime import date
+
+    captured = {}
+    monkeypatch.setattr(
+        dls.notion_sync,
+        "sync_daily_report",
+        lambda day, portfolio, db_id: captured.setdefault("args", (day, db_id)) or True,
+    )
+
+    portfolio = PortfolioState(cash_weight=1.0)
+    dls._sync_daily_report(date(2026, 8, 12), portfolio)
+
+    assert captured["args"] == ("2026-08-12", "db-report")
+
+
+def test_sync_daily_report_sends_error_alert_on_failure(monkeypatch):
+    monkeypatch.setenv("NOTION_DAILY_REPORT_DB_ID", "db-report")
+
+    from datetime import date
+
+    def fail(day, portfolio, db_id):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(dls.notion_sync, "sync_daily_report", fail)
+
+    alerts = []
+    monkeypatch.setattr(dls.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    dls._sync_daily_report(date(2026, 8, 12), PortfolioState(cash_weight=1.0))
+
+    assert len(alerts) == 1
+    assert "노션 일일 리포트 동기화 실패" in alerts[0]
 
 
 def test_hold_when_judge_sell_returns_none(monkeypatch, tmp_path):
