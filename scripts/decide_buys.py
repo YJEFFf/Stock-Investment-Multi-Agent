@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -63,7 +63,11 @@ async def main() -> None:
         logger.info("not_a_trading_day day=%s — skip (주말/공휴일, LLM 호출 없음)", today_kst.isoformat())
         return
 
-    day = datetime.now(timezone.utc)
+    # KST로 만든다(UTC 아님) — 08:30 KST cron은 UTC로는 전날 23:30이라, UTC로 찍으면
+    # pipeline.jsonl에 "day"가 전날 날짜로 남는다. notion_sync.sync_daily_report가
+    # today_kst로 그날 날짜를 필터링하므로 하루씩 어긋나 매일 "판단 로그가 없다"로
+    # 나왔던 버그(2026-08-13 발견).
+    day = datetime.now(KST)
     config = RiskGateConfig()
     portfolio = load_portfolio()
 

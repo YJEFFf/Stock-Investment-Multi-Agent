@@ -132,17 +132,45 @@ def test_sync_daily_report_called_when_configured(monkeypatch):
 
     from datetime import date
 
+    monkeypatch.setattr(dls.kis, "fetch_account_balance", lambda: 100_000_000.0)
+
     captured = {}
     monkeypatch.setattr(
         dls.notion_sync,
         "sync_daily_report",
-        lambda day, portfolio, db_id: captured.setdefault("args", (day, db_id)) or True,
+        lambda day, portfolio, db_id, total_value=None: captured.setdefault(
+            "args", (day, db_id, total_value)
+        )
+        or True,
     )
 
     portfolio = PortfolioState(cash_weight=1.0)
     dls._sync_daily_report(date(2026, 8, 12), portfolio)
 
-    assert captured["args"] == ("2026-08-12", "db-report")
+    assert captured["args"] == ("2026-08-12", "db-report", 100_000_000.0)
+
+
+def test_sync_daily_report_passes_none_total_value_when_balance_unavailable(monkeypatch):
+    monkeypatch.setenv("NOTION_DAILY_REPORT_DB_ID", "db-report")
+
+    from datetime import date
+
+    monkeypatch.setattr(dls.kis, "fetch_account_balance", lambda: None)
+
+    captured = {}
+    monkeypatch.setattr(
+        dls.notion_sync,
+        "sync_daily_report",
+        lambda day, portfolio, db_id, total_value=None: captured.setdefault(
+            "args", (day, db_id, total_value)
+        )
+        or True,
+    )
+
+    portfolio = PortfolioState(cash_weight=1.0)
+    dls._sync_daily_report(date(2026, 8, 12), portfolio)
+
+    assert captured["args"] == ("2026-08-12", "db-report", None)
 
 
 def test_sync_daily_report_sends_error_alert_on_failure(monkeypatch):
@@ -150,7 +178,9 @@ def test_sync_daily_report_sends_error_alert_on_failure(monkeypatch):
 
     from datetime import date
 
-    def fail(day, portfolio, db_id):
+    monkeypatch.setattr(dls.kis, "fetch_account_balance", lambda: 100_000_000.0)
+
+    def fail(day, portfolio, db_id, total_value=None):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(dls.notion_sync, "sync_daily_report", fail)

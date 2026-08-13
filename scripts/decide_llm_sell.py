@@ -50,14 +50,23 @@ def _sync_daily_report(today_kst, portfolio) -> None:
 
     워크스페이스가 아직 설정 안 됐으면(scripts/setup_notion_workspace.py
     미실행) 조용히 건너뛴다 — 노션 연동은 부가 기능이라 이것 때문에
-    decide_llm_sell 자체가 실패하면 안 된다."""
+    decide_llm_sell 자체가 실패하면 안 된다.
+
+    "총정리"(투자한 금액/남은 현금/총 금액)에 쓸 절대 원화 금액은
+    PortfolioState(비중만 있음)로는 못 만든다 — kis.fetch_account_balance()로
+    브로커의 실제 총평가금액을 조회해서 넘긴다. 조회 실패해도(None) 리포트
+    자체는 만든다 — 그 절만 생략된다(notion_sync.sync_daily_report 참고)."""
     daily_report_db_id = os.environ.get("NOTION_DAILY_REPORT_DB_ID")
     if not daily_report_db_id:
         logger.info("notion_daily_report_sync_skipped reason=not_configured")
         return
 
+    total_value = kis.fetch_account_balance()
+
     try:
-        created = notion_sync.sync_daily_report(today_kst.isoformat(), portfolio, daily_report_db_id)
+        created = notion_sync.sync_daily_report(
+            today_kst.isoformat(), portfolio, daily_report_db_id, total_value=total_value
+        )
         logger.info("notion_daily_report_synced=%s", created)
     except Exception as exc:
         logger.exception("notion_daily_report_sync_failed")

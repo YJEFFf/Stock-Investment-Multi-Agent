@@ -179,14 +179,17 @@ def test_sync_notion_calls_both_when_configured(monkeypatch):
     monkeypatch.setattr(
         rd.notion_sync,
         "sync_daily_report",
-        lambda day, portfolio, db_id: captured.setdefault("report_call", (day, db_id)),
+        lambda day, portfolio, db_id, total_value=None: captured.setdefault(
+            "report_call", (day, db_id, total_value)
+        ),
     )
+    monkeypatch.setattr(rd.kis, "fetch_account_balance", lambda: 100_000_000.0)
 
     portfolio = PortfolioState(cash_weight=0.5)
     _real_sync_notion(date(2026, 8, 10), portfolio)
 
     assert captured["trade_db"] == "db-trade"
-    assert captured["report_call"] == ("2026-08-10", "db-report")
+    assert captured["report_call"] == ("2026-08-10", "db-report", 100_000_000.0)
 
 
 def test_sync_notion_sends_error_alert_on_failure(monkeypatch):

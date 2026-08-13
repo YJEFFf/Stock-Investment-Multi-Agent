@@ -940,3 +940,46 @@ EC2 cron의 실제 실행 방식(`uv run python3 scripts/run_daily.py`)이 정�
 `run_daily.py`의 `_sync_notion`(매매일지+리포트를 한 번에 호출)은 그대로
 남겨뒀다 — 로컬에서 전체 파이프라인을 수동으로 한 번에 돌려볼 때는 두 산출물이
 같은 시점(스크립트 종료 직후)에 나와도 문제없다.
+
+### 일일 리포트 "오늘의 판단 요약"이 매일 "판단 로그가 없다"로 나오던 버그 (2026-08-13)
+
+사용자가 어제·오늘 일일 리포트 모두 "오늘의 판단 요약"이 "판단 로그가 없다"로
+비어 있다고 알려와서 확인. `decide_buys.py`(08:30 KST cron)가
+`pipeline.run_daily`에 넘기는 `day`를 `datetime.now(timezone.utc)`로 만들고
+있었다 — 08:30 KST는 UTC로는 전날 23:30이라, `run_day`가 `pipeline.jsonl`에
+남기는 `"day"` 필드가 **항상 KST 거래일보다 하루 전** 날짜로 찍혔다.
+`decide_llm_sell.py`가 15:35에 `notion_sync.sync_daily_report`를 호출할 때는
+`today_kst`(정확한 KST 날짜)로 그날 판단을 필터링하므로, 하루씩 어긋나
+`decisions_today`가 항상 빈 리스트였다 — 실제로는 매일 정상적으로 판단이
+돌고 있었는데 리포트만 계속 빈 걸로 나온 것.
+
+`execute_open.py`(09:00)·`check_stop_loss.py`(09:00–15:30)·`decide_llm_sell.py`
+(15:35)는 전부 KST 09:00 이후에 도는 스크립트라 UTC 날짜와 KST 날짜가 우연히
+일치해서 같은 버그가 없었다 — 오직 09:00 이전에 도는 `decide_buys.py`(그리고
+로컬 수동 실행용 `run_daily.py`, 실행 시각에 따라 같은 함정)만 해당됐다.
+고친 값은 `datetime.now(KST)`로 바꿨다 — `day`는 as_of 타임스탬프로도 쓰이는데
+tz-aware KST 인스턴트는 UTC와 마찬가지로 다른 tz-aware 값과 정확히 비교되므로
+분석가 쪽 동작에는 영향이 없다. 재발 방지로
+`tests/test_decide_buys.py::test_run_daily_day_uses_kst_date_not_utc_date_at_0830_cron_time`
+을 추가해 08:30 KST 시각을 고정하고 `day.date()`가 KST 거래일과 같은지 검증한다.
+
+기존에 이미 "판단 로그가 없다"로 잘못 동기화된 날짜는 `logs/notion_daily_report_state.json`에
+synced로 표시돼 있어 재실행해도 다시 안 만들어진다 — 과거 리포트를 바로잡으려면
+그 상태 파일에서 해당 날짜 키를 지우고 수동으로 다시 돌려야 한다.
+
+### 매매일지 총매수금액, 일일 리포트 금액 총정리 추가 (2026-08-13)
+
+사용자 요청 두 가지를 위 버그 수정과 같이 반영:
+
+1. **매매일지 "총매수금액"**: `_buy_row_properties`에 `entry_price * quantity`로
+   계산한 값을 새 숫자 컬럼으로 추가(`create_trade_journal_database`에도 스키마
+   반영). 이미 만들어진 노션 데이터베이스는 코드만 고친다고 컬럼이 안 생기므로
+   실제 워크스페이스에 반영하려면 별도로 속성 추가(마이그레이션)가 필요하다.
+2. **일일 리포트 "총정리"**: 리포트 마지막에 투자한 금액/남아있는 현금/총 금액을
+   원화로 적는다. `PortfolioState`는 비중(weight)만 들고 절대 금액을 모르므로
+   (§ 기술 스택 근처 주석과 동일한 이유 — 브로커가 유일한 절대 금액 출처),
+   `decide_llm_sell.py`가 이미 그 시점에 KIS를 호출하는 김에
+   `kis.fetch_account_balance()`(총평가금액)를 한 번 더 불러 `sync_daily_report`에
+   `total_value`로 넘긴다. 조회 실패(`None`)해도 리포트 자체는 만들어지고 그
+   절만 "조회 실패" 문구로 대체된다 — 노션 동기화는 부가 기능이라는 기존
+   원칙과 동일.

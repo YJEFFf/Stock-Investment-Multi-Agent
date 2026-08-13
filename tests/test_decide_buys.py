@@ -112,3 +112,34 @@ def test_main_writes_empty_decisions_when_nothing_approved(monkeypatch, tmp_path
 
     payload = json.loads(db.PENDING_BUYS_PATH.read_text())
     assert payload["decisions"] == []
+
+
+def test_run_daily_day_uses_kst_date_not_utc_date_at_0830_cron_time(monkeypatch, tmp_path):
+    """08:30 KST cron 시각은 UTC로는 전날 23:30이다 — pipeline.run_daily에 넘기는
+    day가 UTC 기준이면 pipeline.jsonl에 전날 날짜로 기록되고, notion_sync의
+    같은 날 필터링과 하루씩 어긋난다("판단 로그가 없다"로 매일 잘못 표시된 버그,
+    2026-08-13). day.date()가 KST 거래일과 같아야 한다."""
+    import datetime as _dt
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+
+    class _FixedDatetime(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            # 2026-08-13 08:30 KST == 2026-08-12 23:30 UTC
+            return _dt.datetime(2026, 8, 13, 8, 30, tzinfo=tz)
+
+    monkeypatch.setattr(db, "datetime", _FixedDatetime)
+
+    captured = {}
+
+    async def fake_run_daily(day, portfolio, config, analyst_fn, judge_fn, execute_fn, total_expected_analysts):
+        captured["day"] = day
+        return portfolio, []
+
+    monkeypatch.setattr(db.pipeline, "run_daily", fake_run_daily)
+
+    asyncio.run(db.main())
+
+    assert captured["day"].date().isoformat() == "2026-08-13"

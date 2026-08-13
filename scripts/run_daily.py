@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 # 잡히지만, 스크립트 직접 실행은 그 메커니즘을 안 탄다) — 레포 루트를 명시적으로 추가.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import judgment, llm, notify, notion_sync, pipeline, sell  # noqa: E402
+from src import judgment, kis, llm, notify, notion_sync, pipeline, sell  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.portfolio_store import load_portfolio as _load_portfolio  # noqa: E402
 from src.portfolio_store import save_portfolio as _save_portfolio  # noqa: E402
@@ -52,7 +52,10 @@ async def main() -> None:
         logger.info("not_a_trading_day day=%s — skip (주말/공휴일, LLM 호출 없음)", today_kst.isoformat())
         return
 
-    day = datetime.now(timezone.utc)
+    # KST로 만든다(UTC 아님) — scripts/decide_buys.py와 같은 이유(2026-08-13 발견):
+    # 자정 근처 UTC 날짜와 KST 거래일이 어긋나면 pipeline.jsonl의 "day"가
+    # notion_sync의 날짜 필터와 하루씩 안 맞게 된다.
+    day = datetime.now(KST)
     config = RiskGateConfig()
     portfolio = _load_portfolio()
 
@@ -130,7 +133,10 @@ def _sync_notion(today_kst, portfolio: PortfolioState) -> None:
             summary = notion_sync.sync_trade_journal(pipeline.DEFAULT_TRADE_JOURNAL_LOG_PATH, trade_journal_db_id)
             logger.info("notion_sync summary=%s", summary)
         if daily_report_db_id:
-            created = notion_sync.sync_daily_report(today_kst.isoformat(), portfolio, daily_report_db_id)
+            total_value = kis.fetch_account_balance()
+            created = notion_sync.sync_daily_report(
+                today_kst.isoformat(), portfolio, daily_report_db_id, total_value=total_value
+            )
             logger.info("notion_daily_report_synced=%s", created)
     except Exception as exc:
         logger.exception("notion_sync_failed")

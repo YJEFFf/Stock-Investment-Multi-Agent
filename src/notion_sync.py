@@ -349,6 +349,7 @@ def create_trade_journal_database(parent_page_id: str) -> str | None:
             },
             "가격": {"number": {"format": "won"}},
             "수량": {"number": {"format": "number"}},
+            "총매수금액": {"number": {"format": "won"}},
             "실현손익률": {"number": {"format": "percent"}},
             "보유일수": {"number": {"format": "number"}},
         },
@@ -369,6 +370,7 @@ def _buy_row_properties(entry: dict) -> dict:
         "사유": {"select": {"name": "신규매수"}},
         "가격": {"number": entry["entry_price"]},
         "수량": {"number": entry["quantity"]},
+        "총매수금액": {"number": entry["entry_price"] * entry["quantity"]},
     }
 
 
@@ -552,6 +554,7 @@ def _daily_report_children(
     sells: list[dict],
     skips: list[dict],
     portfolio: PortfolioState,
+    total_value: float | None = None,
 ) -> list[dict]:
     blocks = [_heading("오늘의 판단 요약", level=2)]
     if decisions_today:
@@ -605,6 +608,16 @@ def _daily_report_children(
         blocks.append(_paragraph("보유 종목 없음 — 전액 현금."))
     blocks.append(_paragraph(f"현금 비중: {portfolio.cash_weight:.2%}"))
 
+    blocks.append(_heading("총정리", level=2))
+    if total_value is not None:
+        cash_amount = total_value * portfolio.cash_weight
+        invested_amount = total_value - cash_amount
+        blocks.append(_bulleted(f"투자한 금액: {invested_amount:,.0f}원"))
+        blocks.append(_bulleted(f"남아있는 현금: {cash_amount:,.0f}원"))
+        blocks.append(_bulleted(f"총 금액: {total_value:,.0f}원"))
+    else:
+        blocks.append(_paragraph("계좌 총평가금액 조회 실패로 금액 총정리를 작성할 수 없다."))
+
     return blocks
 
 
@@ -637,6 +650,7 @@ def sync_daily_report(
     pipeline_log_path: Path = DEFAULT_PIPELINE_LOG_PATH,
     trade_journal_log_path: Path = DEFAULT_TRADE_JOURNAL_LOG_PATH,
     state_path: Path = DEFAULT_DAILY_REPORT_STATE_PATH,
+    total_value: float | None = None,
 ) -> bool:
     """하루에 한 번, 장 마감 뒤 그날의 판단·매수·매도·최종 보유 종목을 요약해
     노션에 한 페이지로 남긴다. logs/pipeline.jsonl(그날의 모든 판단)과
@@ -644,6 +658,12 @@ def sync_daily_report(
     최종 보유 종목은 그 시점의 PortfolioState 그대로를 스냅샷으로 적는다 —
     매매일지(sync_trade_journal)는 이벤트 이력이고 이건 "그날 하루" 단위
     요약이라 서로 다른 걸 보여준다.
+
+    total_value(계좌 총평가금액)는 호출부가 kis.fetch_account_balance()로 구해
+    넘긴다 — PortfolioState는 비중(weight)만 들고 절대 원화 금액을 모르므로,
+    "총정리"(투자한 금액/남은 현금/총 금액) 절대 원화 표기는 이 값이 있어야만
+    가능하다. None이면(조회 실패) 그 절만 조용히 생략하고 리포트 나머지는 그대로
+    올라간다.
 
     같은 날짜로 이미 만든 적 있으면(로컬 state 파일 기준) 다시 안 만든다 —
     run_daily.py가 같은 날 재실행돼도 중복 리포트가 안 생기게.
@@ -662,7 +682,7 @@ def sync_daily_report(
     body = {
         "parent": {"database_id": database_id},
         "properties": _daily_report_properties(day, buys, sells, portfolio),
-        "children": _daily_report_children(day, decisions_today, buys, sells, skips, portfolio),
+        "children": _daily_report_children(day, decisions_today, buys, sells, skips, portfolio, total_value),
     }
     result = _notion_request("POST", "/pages", body)
     if result is None:

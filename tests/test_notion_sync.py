@@ -275,6 +275,7 @@ def test_buy_row_properties_and_children():
     props = notion_sync._buy_row_properties(entry)
     assert props["가격"] == {"number": 231200.0}
     assert props["수량"] == {"number": 10}
+    assert props["총매수금액"] == {"number": 2312000.0}
 
     children = notion_sync._buy_row_children(entry)
     paragraphs = [b for b in children if b["type"] == "paragraph"]
@@ -474,6 +475,37 @@ def test_daily_report_shows_display_names_and_cash_weight_to_two_decimals(monkey
     assert "삼성전자" in all_text
     assert "네이버" in all_text
     assert "현금 비중: 87.65%" in all_text
+
+
+def test_daily_report_summary_section_uses_total_value_when_given():
+    portfolio = PortfolioState(cash_weight=0.3)
+    blocks = notion_sync._daily_report_children(
+        "2026-08-10",
+        decisions_today=[],
+        buys=[],
+        sells=[],
+        skips=[],
+        portfolio=portfolio,
+        total_value=100_000_000.0,
+    )
+    all_text = json.dumps(blocks, ensure_ascii=False)
+
+    assert "총정리" in all_text
+    assert "투자한 금액: 70,000,000원" in all_text
+    assert "남아있는 현금: 30,000,000원" in all_text
+    assert "총 금액: 100,000,000원" in all_text
+
+
+def test_daily_report_summary_section_omitted_when_total_value_unavailable():
+    portfolio = PortfolioState(cash_weight=0.3)
+    blocks = notion_sync._daily_report_children(
+        "2026-08-10", decisions_today=[], buys=[], sells=[], skips=[], portfolio=portfolio
+    )
+    all_text = json.dumps(blocks, ensure_ascii=False)
+
+    assert "총정리" in all_text
+    assert "조회 실패" in all_text
+    assert "원" not in all_text.split("총정리")[1]
 
 
 def test_sync_daily_report_skips_if_already_synced_for_day(monkeypatch, tmp_path):
