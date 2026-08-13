@@ -17,7 +17,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-from src import collectors
+from src import collectors, translate
 from src.schemas import PortfolioState
 
 load_dotenv()
@@ -374,9 +374,13 @@ def _buy_row_properties(entry: dict) -> dict:
     }
 
 
-def _buy_row_children(entry: dict) -> list[dict]:
+async def _buy_row_children(entry: dict) -> list[dict]:
+    """분석가·토론·매니저는 전부 영어로 판단한다(src/translate.py 참고) — 여기서
+    노션에 실제로 적을 때만 한국어로 옮긴다. 원문은 logs/trade_journal.jsonl에
+    그대로 남아있다."""
     decision = entry["decision"]
-    blocks = [_heading("매니저 최종 판단", level=3), _paragraph(_truncate(decision["reason"]))]
+    reason_ko = await translate.to_korean(decision["reason"], label="translate_buy_reason")
+    blocks = [_heading("매니저 최종 판단", level=3), _paragraph(_truncate(reason_ko))]
 
     if decision.get("inputs"):
         blocks.append(_heading("분석가 의견", level=3))
@@ -386,7 +390,8 @@ def _buy_row_children(entry: dict) -> list[dict]:
     if decision.get("debate"):
         blocks.append(_heading("토론 논거", level=3))
         for d in decision["debate"]:
-            blocks.append(_bulleted(f"[{d['stance']}] (강도 {d['strength']:.2f}) {_truncate(d['argument'], 500)}"))
+            argument_ko = await translate.to_korean(d["argument"], label="translate_debate_argument")
+            blocks.append(_bulleted(f"[{d['stance']}] (강도 {d['strength']:.2f}) {_truncate(argument_ko, 500)}"))
 
     return blocks
 
@@ -407,10 +412,11 @@ def _sell_row_properties(entry: dict) -> dict:
     return properties
 
 
-def _sell_row_children(entry: dict) -> list[dict]:
+async def _sell_row_children(entry: dict) -> list[dict]:
     if not entry.get("reasoning"):
         return []
-    return [_heading("판단 사유", level=3), _paragraph(_truncate(entry["reasoning"]))]
+    reasoning_ko = await translate.to_korean(entry["reasoning"], label="translate_sell_reasoning")
+    return [_heading("판단 사유", level=3), _paragraph(_truncate(reasoning_ko))]
 
 
 def _buy_skipped_row_properties(entry: dict) -> dict:
@@ -454,7 +460,7 @@ def _save_synced_keys(state_path: Path, keys: set[str]) -> None:
     state_path.write_text(json.dumps({"synced_keys": sorted(keys)}, ensure_ascii=False, indent=2))
 
 
-def sync_trade_journal(
+async def sync_trade_journal(
     trade_journal_log_path: Path,
     database_id: str,
     state_path: Path = DEFAULT_SYNC_STATE_PATH,
@@ -488,13 +494,13 @@ def sync_trade_journal(
 
         if entry["event"] == "buy":
             properties = _buy_row_properties(entry)
-            children = _buy_row_children(entry)
+            children = await _buy_row_children(entry)
         elif entry["event"] == "buy_skipped":
             properties = _buy_skipped_row_properties(entry)
             children = _buy_skipped_row_children(entry)
         else:
             properties = _sell_row_properties(entry)
-            children = _sell_row_children(entry)
+            children = await _sell_row_children(entry)
 
         result = _notion_request(
             "POST",
@@ -547,7 +553,7 @@ def _decision_label(entry: dict) -> str:
     return "HOLD"
 
 
-def _daily_report_children(
+async def _daily_report_children(
     day: str,
     decisions_today: list[dict],
     buys: list[dict],
@@ -558,20 +564,29 @@ def _daily_report_children(
 ) -> list[dict]:
     blocks = [_heading("오늘의 판단 요약", level=2)]
     if decisions_today:
-        approved_buys = sum(1 for d in decisions_today if d["action"] == "BUY" and d["approved"])
+        approved_buy_decisions = [d for d in decisions_today if d["action"] == "BUY" and d["approved"]]
         rejected = sum(1 for d in decisions_today if not d["approved"])
         blocks.append(
             _paragraph(
-                f"총 {len(decisions_today)}개 종목 판단 · BUY 승인 {approved_buys}개 · "
+                f"총 {len(decisions_today)}개 종목 판단 · BUY 승인 {len(approved_buy_decisions)}개 · "
                 f"게이트 거부 {rejected}개 · 나머지는 HOLD"
             )
         )
-        for d in decisions_today:
-            avg_score = d.get("avg_score")
-            score_text = f"{avg_score:.2f}" if avg_score is not None else "-"
-            reason = _truncate(d.get("reason"), 300)
-            suffix = f" — {reason}" if reason else ""
-            blocks.append(_bulleted(f"{_display_name(d['ticker'])}: {_decision_label(d)} (avg_score={score_text}){suffix}"))
+        # 상세 내용은 승인된 매수만 — HOLD/거부 종목까지 전부 나열하면 너무 길다
+        # (사용자 요청, 2026-08-13). 위 요약 문장은 여전히 decisions_today 전체
+        # 기준이라 몇 개 중 몇 개가 승인/거부됐는지는 그대로 보인다.
+        if approved_buy_decisions:
+            for d in approved_buy_decisions:
+                avg_score = d.get("avg_score")
+                score_text = f"{avg_score:.2f}" if avg_score is not None else "-"
+                reason_ko = await translate.to_korean(d.get("reason"), label="translate_daily_report_reason")
+                reason = _truncate(reason_ko, 300)
+                suffix = f" — {reason}" if reason else ""
+                blocks.append(
+                    _bulleted(f"{_display_name(d['ticker'])}: {_decision_label(d)} (avg_score={score_text}){suffix}")
+                )
+        else:
+            blocks.append(_paragraph("오늘은 승인된 매수 없음."))
     else:
         blocks.append(_paragraph("오늘은 판단 로그가 없다 — 휴장일이었거나 유니버스 수집에 실패했을 수 있다."))
 
@@ -643,7 +658,7 @@ def _save_synced_days(state_path: Path, days: set[str]) -> None:
     state_path.write_text(json.dumps({"synced_days": sorted(days)}, ensure_ascii=False, indent=2))
 
 
-def sync_daily_report(
+async def sync_daily_report(
     day: str,
     portfolio: PortfolioState,
     database_id: str,
@@ -682,7 +697,7 @@ def sync_daily_report(
     body = {
         "parent": {"database_id": database_id},
         "properties": _daily_report_properties(day, buys, sells, portfolio),
-        "children": _daily_report_children(day, decisions_today, buys, sells, skips, portfolio, total_value),
+        "children": await _daily_report_children(day, decisions_today, buys, sells, skips, portfolio, total_value),
     }
     result = _notion_request("POST", "/pages", body)
     if result is None:

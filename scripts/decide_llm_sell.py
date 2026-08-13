@@ -40,7 +40,7 @@ KST = ZoneInfo("Asia/Seoul")
 PENDING_SELLS_PATH = Path("logs/pending_sells.json")
 
 
-def _sync_daily_report(today_kst, portfolio) -> None:
+async def _sync_daily_report(today_kst, portfolio) -> None:
     """오늘 하루(판단·매수·매도·최종 보유 종목)를 노션 일일 리포트로 남긴다.
     여기서 부르는 이유: check_stop_loss.py가 09:00-15:30 매분 결정론적
     손절/익절로 보유 종목을 바꿀 수 있어서, 이 스크립트(15:35, 장마감 후)가
@@ -64,7 +64,7 @@ def _sync_daily_report(today_kst, portfolio) -> None:
     total_value = kis.fetch_account_balance()
 
     try:
-        created = notion_sync.sync_daily_report(
+        created = await notion_sync.sync_daily_report(
             today_kst.isoformat(), portfolio, daily_report_db_id, total_value=total_value
         )
         logger.info("notion_daily_report_synced=%s", created)
@@ -127,7 +127,7 @@ async def main() -> None:
         [a["ticker"] for a in actions],
     )
 
-    _sync_daily_report(today_kst, portfolio)
+    await _sync_daily_report(today_kst, portfolio)
 
 
 if __name__ == "__main__":

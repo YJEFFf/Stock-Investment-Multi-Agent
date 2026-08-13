@@ -114,10 +114,10 @@ async def main() -> None:
     )
 
     _log_monitoring_summary()
-    _sync_notion(today_kst, portfolio)
+    await _sync_notion(today_kst, portfolio)
 
 
-def _sync_notion(today_kst, portfolio: PortfolioState) -> None:
+async def _sync_notion(today_kst, portfolio: PortfolioState) -> None:
     """logs/trade_journal.jsonl의 새 이벤트를 노션 매매일지로 올리고, 오늘 하루를
     요약한 일일 리포트도 남긴다. 워크스페이스가 아직 설정 안 됐으면
     (scripts/setup_notion_workspace.py 미실행) 해당 부분만 조용히 건너뛴다 —
@@ -130,11 +130,11 @@ def _sync_notion(today_kst, portfolio: PortfolioState) -> None:
 
     try:
         if trade_journal_db_id:
-            summary = notion_sync.sync_trade_journal(pipeline.DEFAULT_TRADE_JOURNAL_LOG_PATH, trade_journal_db_id)
+            summary = await notion_sync.sync_trade_journal(pipeline.DEFAULT_TRADE_JOURNAL_LOG_PATH, trade_journal_db_id)
             logger.info("notion_sync summary=%s", summary)
         if daily_report_db_id:
             total_value = kis.fetch_account_balance()
-            created = notion_sync.sync_daily_report(
+            created = await notion_sync.sync_daily_report(
                 today_kst.isoformat(), portfolio, daily_report_db_id, total_value=total_value
             )
             logger.info("notion_daily_report_synced=%s", created)

@@ -120,7 +120,7 @@ async def _execute_pending_buys(portfolio, today_kst):
     return portfolio
 
 
-def _sync_trade_journal() -> None:
+async def _sync_trade_journal() -> None:
     """logs/trade_journal.jsonl에 방금 쌓인 매도·매수 이벤트를 노션 매매일지로
     올린다. 일일 리포트(장마감 기준 스냅샷)는 여기서 만들지 않는다 — 그날
     보유 종목은 09:00 이후 check_stop_loss.py가 장중에도 계속 바꿀 수 있어서,
@@ -136,7 +136,7 @@ def _sync_trade_journal() -> None:
         return
 
     try:
-        summary = notion_sync.sync_trade_journal(pipeline.DEFAULT_TRADE_JOURNAL_LOG_PATH, trade_journal_db_id)
+        summary = await notion_sync.sync_trade_journal(pipeline.DEFAULT_TRADE_JOURNAL_LOG_PATH, trade_journal_db_id)
         logger.info("notion_sync summary=%s", summary)
     except Exception as exc:
         logger.exception("notion_sync_failed")
@@ -171,7 +171,7 @@ async def main() -> None:
         len(portfolio.positions),
     )
 
-    _sync_trade_journal()
+    await _sync_trade_journal()
 
 
 if __name__ == "__main__":

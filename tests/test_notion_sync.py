@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -13,6 +14,17 @@ def _no_real_ticker_name_lookup(monkeypatch):
     # 타지 않도록 기본적으로 막는다 — None을 반환하면 _display_name이 코드로
     # 폴백하므로, 이걸 쓰지 않는 기존 테스트들은 전과 동일하게 동작한다.
     monkeypatch.setattr(notion_sync.collectors, "fetch_kospi200_ticker_names", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_translation(monkeypatch):
+    # 노션에 쓰기 전 영어 판단 로그를 한국어로 옮기는 단계(src/translate.py)가
+    # 실제 Claude API를 타지 않게 기본적으로 항등 함수로 막는다 — 번역 자체를
+    # 검증하는 테스트는 이 픽스처를 개별적으로 오버라이드한다.
+    async def _identity(text, label="translate"):
+        return text
+
+    monkeypatch.setattr(notion_sync.translate, "to_korean", _identity)
 
 
 class _FakeResponse:
@@ -143,7 +155,7 @@ def test_sync_trade_journal_creates_rows_for_new_entries(monkeypatch, tmp_path):
     monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
 
     state_path = tmp_path / "notion_sync_state.json"
-    summary = notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path)
+    summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path))
 
     assert summary == {"synced": 2, "failed": 0, "skipped": 0}
     assert len(captured_bodies) == 2
@@ -169,7 +181,7 @@ def test_sync_trade_journal_handles_buy_skipped_events(monkeypatch, tmp_path):
 
     monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
 
-    summary = notion_sync.sync_trade_journal(log_path, "db-123", state_path=tmp_path / "state.json")
+    summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-123", state_path=tmp_path / "state.json"))
 
     assert summary == {"synced": 1, "failed": 0, "skipped": 0}
     props = captured_bodies[0]["properties"]
@@ -195,7 +207,7 @@ def test_sync_trade_journal_syncs_both_same_day_same_ticker_sells(monkeypatch, t
     )
 
     state_path = tmp_path / "state.json"
-    summary = notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path)
+    summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path))
 
     assert summary == {"synced": 2, "failed": 0, "skipped": 0}
     prices = {b["properties"]["가격"]["number"] for b in captured_bodies}
@@ -219,7 +231,7 @@ def test_sync_trade_journal_keeps_unsuffixed_key_for_single_occurrence(monkeypat
 
     monkeypatch.setattr(notion_sync, "_notion_request", fail_request)
 
-    summary = notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path)
+    summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path))
 
     assert summary == {"synced": 0, "failed": 0, "skipped": 1}
 
@@ -237,7 +249,7 @@ def test_sync_trade_journal_skips_already_synced_entries(monkeypatch, tmp_path):
 
     monkeypatch.setattr(notion_sync, "_notion_request", fail_request)
 
-    summary = notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path)
+    summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path))
 
     assert summary == {"synced": 0, "failed": 0, "skipped": 1}
 
@@ -249,24 +261,24 @@ def test_sync_trade_journal_does_not_mark_failed_rows_synced(monkeypatch, tmp_pa
     monkeypatch.setattr(notion_sync, "_notion_request", lambda *a, **k: None)
 
     state_path = tmp_path / "notion_sync_state.json"
-    summary = notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path)
+    summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path))
 
     assert summary == {"synced": 0, "failed": 1, "skipped": 0}
     assert json.loads(state_path.read_text())["synced_keys"] == []
 
 
 def test_sync_trade_journal_missing_log_file_returns_zeroes(tmp_path):
-    summary = notion_sync.sync_trade_journal(
-        tmp_path / "does_not_exist.jsonl", "db-123", state_path=tmp_path / "state.json"
+    summary = asyncio.run(
+        notion_sync.sync_trade_journal(tmp_path / "does_not_exist.jsonl", "db-123", state_path=tmp_path / "state.json")
     )
     assert summary == {"synced": 0, "failed": 0, "skipped": 0}
 
 
 def test_sell_row_children_includes_reasoning_only_when_present():
-    with_reasoning = notion_sync._sell_row_children(_sell_entry(reasoning="근거 없어짐"))
+    with_reasoning = asyncio.run(notion_sync._sell_row_children(_sell_entry(reasoning="근거 없어짐")))
     assert len(with_reasoning) == 2
 
-    without_reasoning = notion_sync._sell_row_children(_sell_entry(reasoning=None))
+    without_reasoning = asyncio.run(notion_sync._sell_row_children(_sell_entry(reasoning=None)))
     assert without_reasoning == []
 
 
@@ -277,7 +289,7 @@ def test_buy_row_properties_and_children():
     assert props["수량"] == {"number": 10}
     assert props["총매수금액"] == {"number": 2312000.0}
 
-    children = notion_sync._buy_row_children(entry)
+    children = asyncio.run(notion_sync._buy_row_children(entry))
     paragraphs = [b for b in children if b["type"] == "paragraph"]
     assert any("종합 판단 근거" in b["paragraph"]["rich_text"][0]["text"]["content"] for b in paragraphs)
 
@@ -426,13 +438,15 @@ def test_sync_daily_report_creates_one_page_summarizing_the_day(monkeypatch, tmp
     monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
 
     state_path = tmp_path / "notion_daily_report_state.json"
-    created = notion_sync.sync_daily_report(
-        "2026-08-10",
-        portfolio,
-        "report-db-1",
-        pipeline_log_path=pipeline_log,
-        trade_journal_log_path=trade_journal_log,
-        state_path=state_path,
+    created = asyncio.run(
+        notion_sync.sync_daily_report(
+            "2026-08-10",
+            portfolio,
+            "report-db-1",
+            pipeline_log_path=pipeline_log,
+            trade_journal_log_path=trade_journal_log,
+            state_path=state_path,
+        )
     )
 
     assert created is True
@@ -444,9 +458,13 @@ def test_sync_daily_report_creates_one_page_summarizing_the_day(monkeypatch, tmp
     # 다른 날짜(2026-08-09) 판단은 포함되면 안 된다.
     all_text = json.dumps(body["children"], ensure_ascii=False)
     assert "999999" not in all_text
-    assert "005930" in all_text
-    assert "000660" in all_text  # 거부된 판단도 요약에는 포함
-    assert "이미 종목당 한도를 채워" in all_text  # HOLD/거부 종목도 실제 판단 문장이 노출됨
+    assert "총 2개 종목 판단" in all_text  # 요약 문장은 그날 전체 판단 기준 그대로
+    assert "BUY 승인 1개" in all_text
+    assert "게이트 거부 1개" in all_text
+    assert "005930" in all_text  # 승인된 매수는 상세 내용에 나온다
+    # 상세 내용은 승인된 매수만 — 거부된 판단(000660)은 요약 숫자에만 잡히고 상세 목록엔 안 나온다.
+    assert "000660" not in all_text
+    assert "이미 종목당 한도를 채워" not in all_text
     assert "035420" in all_text  # 게이트 승인됐지만 체결 스킵된 "특별한 일"도 노출됨
     assert "특별한 일" in all_text
 
@@ -462,13 +480,17 @@ def test_daily_report_shows_display_names_and_cash_weight_to_two_decimals(monkey
         positions=[Position(ticker="005930", sector="반도체", weight=0.08, entry_price=231200.0, quantity=10)],
         cash_weight=0.8765,
     )
-    blocks = notion_sync._daily_report_children(
-        "2026-08-10",
-        decisions_today=[{"ticker": "005930", "action": "BUY", "approved": True, "rejected_by": None, "avg_score": 0.9}],
-        buys=[_buy_entry()],
-        sells=[],
-        skips=[_buy_skipped_entry(ticker="035420")],
-        portfolio=portfolio,
+    blocks = asyncio.run(
+        notion_sync._daily_report_children(
+            "2026-08-10",
+            decisions_today=[
+                {"ticker": "005930", "action": "BUY", "approved": True, "rejected_by": None, "avg_score": 0.9}
+            ],
+            buys=[_buy_entry()],
+            sells=[],
+            skips=[_buy_skipped_entry(ticker="035420")],
+            portfolio=portfolio,
+        )
     )
     all_text = json.dumps(blocks, ensure_ascii=False)
 
@@ -479,14 +501,16 @@ def test_daily_report_shows_display_names_and_cash_weight_to_two_decimals(monkey
 
 def test_daily_report_summary_section_uses_total_value_when_given():
     portfolio = PortfolioState(cash_weight=0.3)
-    blocks = notion_sync._daily_report_children(
-        "2026-08-10",
-        decisions_today=[],
-        buys=[],
-        sells=[],
-        skips=[],
-        portfolio=portfolio,
-        total_value=100_000_000.0,
+    blocks = asyncio.run(
+        notion_sync._daily_report_children(
+            "2026-08-10",
+            decisions_today=[],
+            buys=[],
+            sells=[],
+            skips=[],
+            portfolio=portfolio,
+            total_value=100_000_000.0,
+        )
     )
     all_text = json.dumps(blocks, ensure_ascii=False)
 
@@ -498,8 +522,10 @@ def test_daily_report_summary_section_uses_total_value_when_given():
 
 def test_daily_report_summary_section_omitted_when_total_value_unavailable():
     portfolio = PortfolioState(cash_weight=0.3)
-    blocks = notion_sync._daily_report_children(
-        "2026-08-10", decisions_today=[], buys=[], sells=[], skips=[], portfolio=portfolio
+    blocks = asyncio.run(
+        notion_sync._daily_report_children(
+            "2026-08-10", decisions_today=[], buys=[], sells=[], skips=[], portfolio=portfolio
+        )
     )
     all_text = json.dumps(blocks, ensure_ascii=False)
 
@@ -517,8 +543,8 @@ def test_sync_daily_report_skips_if_already_synced_for_day(monkeypatch, tmp_path
 
     monkeypatch.setattr(notion_sync, "_notion_request", fail_request)
 
-    created = notion_sync.sync_daily_report(
-        "2026-08-10", PortfolioState(), "report-db-1", state_path=state_path
+    created = asyncio.run(
+        notion_sync.sync_daily_report("2026-08-10", PortfolioState(), "report-db-1", state_path=state_path)
     )
 
     assert created is False
@@ -527,13 +553,15 @@ def test_sync_daily_report_skips_if_already_synced_for_day(monkeypatch, tmp_path
 def test_sync_daily_report_handles_no_decisions_that_day(tmp_path, monkeypatch):
     monkeypatch.setattr(notion_sync, "_notion_request", lambda *a, **k: {"id": "x"})
 
-    created = notion_sync.sync_daily_report(
-        "2026-08-09",
-        PortfolioState(),
-        "report-db-1",
-        pipeline_log_path=tmp_path / "does_not_exist.jsonl",
-        trade_journal_log_path=tmp_path / "also_missing.jsonl",
-        state_path=tmp_path / "state.json",
+    created = asyncio.run(
+        notion_sync.sync_daily_report(
+            "2026-08-09",
+            PortfolioState(),
+            "report-db-1",
+            pipeline_log_path=tmp_path / "does_not_exist.jsonl",
+            trade_journal_log_path=tmp_path / "also_missing.jsonl",
+            state_path=tmp_path / "state.json",
+        )
     )
 
     assert created is True

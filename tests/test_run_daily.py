@@ -39,12 +39,16 @@ def _decision(ticker="005930", action="BUY", approved=True):
     return d, GateResult(approved=approved, rejected_by=None if approved else "position_limit")
 
 
+async def _noop_sync_notion(today, portfolio):
+    return None
+
+
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(portfolio_store, "PORTFOLIO_STATE_PATH", tmp_path / "portfolio_state.json")
     monkeypatch.setattr(rd, "is_krx_trading_day", lambda day: True)
     monkeypatch.setattr(rd, "_log_monitoring_summary", lambda: None)
-    monkeypatch.setattr(rd, "_sync_notion", lambda today, portfolio: None)
+    monkeypatch.setattr(rd, "_sync_notion", _noop_sync_notion)
     monkeypatch.setattr(rd.notify, "send_telegram_alert", lambda message: True)
 
 
@@ -64,7 +68,11 @@ def test_main_skips_everything_on_non_trading_day(monkeypatch):
     monkeypatch.setattr(rd.pipeline, "evaluate_holdings", fail_evaluate)
     monkeypatch.setattr(rd.pipeline, "run_daily", fail_run_daily)
     monkeypatch.setattr(rd, "_log_monitoring_summary", lambda: calls.__setitem__("monitoring", calls["monitoring"] + 1))
-    monkeypatch.setattr(rd, "_sync_notion", lambda today, portfolio: calls.__setitem__("notion", calls["notion"] + 1))
+
+    async def fake_sync_notion(today, portfolio):
+        calls["notion"] += 1
+
+    monkeypatch.setattr(rd, "_sync_notion", fake_sync_notion)
 
     asyncio.run(rd.main())
 
@@ -95,9 +103,12 @@ def test_main_happy_path_runs_all_stages_in_order(monkeypatch):
     monitoring_calls = []
     notion_calls = []
     monkeypatch.setattr(rd, "_log_monitoring_summary", lambda: (order.append("monitoring"), monitoring_calls.append(True)))
-    monkeypatch.setattr(
-        rd, "_sync_notion", lambda today, portfolio: (order.append("notion"), notion_calls.append((today, portfolio)))
-    )
+
+    async def fake_sync_notion(today, portfolio):
+        order.append("notion")
+        notion_calls.append((today, portfolio))
+
+    monkeypatch.setattr(rd, "_sync_notion", fake_sync_notion)
 
     asyncio.run(rd.main())
 
@@ -165,7 +176,7 @@ def test_sync_notion_skips_when_neither_db_configured(monkeypatch):
     monkeypatch.setattr(rd.notion_sync, "sync_trade_journal", fail)
     monkeypatch.setattr(rd.notion_sync, "sync_daily_report", fail)
 
-    _real_sync_notion(date(2026, 8, 10), PortfolioState())
+    asyncio.run(_real_sync_notion(date(2026, 8, 10), PortfolioState()))
 
 
 def test_sync_notion_calls_both_when_configured(monkeypatch):
@@ -173,20 +184,19 @@ def test_sync_notion_calls_both_when_configured(monkeypatch):
     monkeypatch.setenv("NOTION_DAILY_REPORT_DB_ID", "db-report")
 
     captured = {}
-    monkeypatch.setattr(
-        rd.notion_sync, "sync_trade_journal", lambda log_path, db_id: captured.setdefault("trade_db", db_id)
-    )
-    monkeypatch.setattr(
-        rd.notion_sync,
-        "sync_daily_report",
-        lambda day, portfolio, db_id, total_value=None: captured.setdefault(
-            "report_call", (day, db_id, total_value)
-        ),
-    )
+
+    async def fake_sync_trade_journal(log_path, db_id):
+        captured["trade_db"] = db_id
+
+    async def fake_sync_daily_report(day, portfolio, db_id, total_value=None):
+        captured["report_call"] = (day, db_id, total_value)
+
+    monkeypatch.setattr(rd.notion_sync, "sync_trade_journal", fake_sync_trade_journal)
+    monkeypatch.setattr(rd.notion_sync, "sync_daily_report", fake_sync_daily_report)
     monkeypatch.setattr(rd.kis, "fetch_account_balance", lambda: 100_000_000.0)
 
     portfolio = PortfolioState(cash_weight=0.5)
-    _real_sync_notion(date(2026, 8, 10), portfolio)
+    asyncio.run(_real_sync_notion(date(2026, 8, 10), portfolio))
 
     assert captured["trade_db"] == "db-trade"
     assert captured["report_call"] == ("2026-08-10", "db-report", 100_000_000.0)
@@ -196,7 +206,7 @@ def test_sync_notion_sends_error_alert_on_failure(monkeypatch):
     monkeypatch.setenv("NOTION_TRADE_JOURNAL_DB_ID", "db-trade")
     monkeypatch.delenv("NOTION_DAILY_REPORT_DB_ID", raising=False)
 
-    def failing_sync(*a, **k):
+    async def failing_sync(*a, **k):
         raise RuntimeError("notion boom")
 
     monkeypatch.setattr(rd.notion_sync, "sync_trade_journal", failing_sync)
@@ -204,7 +214,7 @@ def test_sync_notion_sends_error_alert_on_failure(monkeypatch):
     alerts = []
     monkeypatch.setattr(rd.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
 
-    _real_sync_notion(date(2026, 8, 10), PortfolioState())
+    asyncio.run(_real_sync_notion(date(2026, 8, 10), PortfolioState()))
 
     assert len(alerts) == 1
     assert "노션 동기화 실패" in alerts[0]

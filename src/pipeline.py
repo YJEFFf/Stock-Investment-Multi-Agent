@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src import collectors, kis, notify, sell
+from src import collectors, kis, notify, sell, translate
 from src.analysts import chart_analyst, disclosure_analyst, dummy_analyst, news_analyst
 from src.schemas import (
     AnalystOpinion,
@@ -289,7 +289,10 @@ async def execute_buy_order(
             "decision": decision.model_dump(mode="json"),
         },
     )
-    notify.send_telegram_alert(notify.format_buy_alert(display_name(ticker), entry_price, quantity, decision.reason))
+    # decision.reason은 영어 그대로 로그에 남고(위 _append_log), 텔레그램에 보일
+    # 때만 번역한다(src/translate.py, 사용자 요청 2026-08-13).
+    reason_ko = await translate.to_korean(decision.reason, label="translate_buy_reason")
+    notify.send_telegram_alert(notify.format_buy_alert(display_name(ticker), entry_price, quantity, reason_ko))
 
     return PortfolioState(
         positions=positions,
@@ -741,13 +744,16 @@ async def finalize_sell(
             "holding_days": holding_days,
         },
     )
+    # action.reasoning(LLM 재량매도일 때만 있음)도 로그엔 영어 원문 그대로 남고
+    # (위 _append_log), 텔레그램에 보일 때만 번역한다.
+    reasoning_ko = await translate.to_korean(action.reasoning, label="translate_sell_reasoning")
     notify.send_telegram_alert(
         notify.format_sell_alert(
             display_name(position.ticker),
             notify.REASON_LABELS.get(action.reason, action.reason),
             current_price,
             realized_pnl_pct,
-            reasoning=action.reasoning,
+            reasoning=reasoning_ko,
         )
     )
 

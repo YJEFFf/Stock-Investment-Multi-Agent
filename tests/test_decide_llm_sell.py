@@ -119,12 +119,12 @@ def test_skips_position_when_price_unavailable(monkeypatch, tmp_path):
 def test_sync_daily_report_skipped_when_not_configured(monkeypatch):
     monkeypatch.delenv("NOTION_DAILY_REPORT_DB_ID", raising=False)
 
-    def fail(*a, **k):
+    async def fail(*a, **k):
         raise AssertionError("설정 안 됐으면 notion_sync를 호출하면 안 된다")
 
     monkeypatch.setattr(dls.notion_sync, "sync_daily_report", fail)
 
-    dls._sync_daily_report(None, PortfolioState(cash_weight=1.0))
+    asyncio.run(dls._sync_daily_report(None, PortfolioState(cash_weight=1.0)))
 
 
 def test_sync_daily_report_called_when_configured(monkeypatch):
@@ -135,17 +135,15 @@ def test_sync_daily_report_called_when_configured(monkeypatch):
     monkeypatch.setattr(dls.kis, "fetch_account_balance", lambda: 100_000_000.0)
 
     captured = {}
-    monkeypatch.setattr(
-        dls.notion_sync,
-        "sync_daily_report",
-        lambda day, portfolio, db_id, total_value=None: captured.setdefault(
-            "args", (day, db_id, total_value)
-        )
-        or True,
-    )
+
+    async def fake_sync(day, portfolio, db_id, total_value=None):
+        captured["args"] = (day, db_id, total_value)
+        return True
+
+    monkeypatch.setattr(dls.notion_sync, "sync_daily_report", fake_sync)
 
     portfolio = PortfolioState(cash_weight=1.0)
-    dls._sync_daily_report(date(2026, 8, 12), portfolio)
+    asyncio.run(dls._sync_daily_report(date(2026, 8, 12), portfolio))
 
     assert captured["args"] == ("2026-08-12", "db-report", 100_000_000.0)
 
@@ -158,17 +156,15 @@ def test_sync_daily_report_passes_none_total_value_when_balance_unavailable(monk
     monkeypatch.setattr(dls.kis, "fetch_account_balance", lambda: None)
 
     captured = {}
-    monkeypatch.setattr(
-        dls.notion_sync,
-        "sync_daily_report",
-        lambda day, portfolio, db_id, total_value=None: captured.setdefault(
-            "args", (day, db_id, total_value)
-        )
-        or True,
-    )
+
+    async def fake_sync(day, portfolio, db_id, total_value=None):
+        captured["args"] = (day, db_id, total_value)
+        return True
+
+    monkeypatch.setattr(dls.notion_sync, "sync_daily_report", fake_sync)
 
     portfolio = PortfolioState(cash_weight=1.0)
-    dls._sync_daily_report(date(2026, 8, 12), portfolio)
+    asyncio.run(dls._sync_daily_report(date(2026, 8, 12), portfolio))
 
     assert captured["args"] == ("2026-08-12", "db-report", None)
 
@@ -180,7 +176,7 @@ def test_sync_daily_report_sends_error_alert_on_failure(monkeypatch):
 
     monkeypatch.setattr(dls.kis, "fetch_account_balance", lambda: 100_000_000.0)
 
-    def fail(day, portfolio, db_id, total_value=None):
+    async def fail(day, portfolio, db_id, total_value=None):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(dls.notion_sync, "sync_daily_report", fail)
@@ -188,7 +184,7 @@ def test_sync_daily_report_sends_error_alert_on_failure(monkeypatch):
     alerts = []
     monkeypatch.setattr(dls.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
 
-    dls._sync_daily_report(date(2026, 8, 12), PortfolioState(cash_weight=1.0))
+    asyncio.run(dls._sync_daily_report(date(2026, 8, 12), PortfolioState(cash_weight=1.0)))
 
     assert len(alerts) == 1
     assert "노션 일일 리포트 동기화 실패" in alerts[0]

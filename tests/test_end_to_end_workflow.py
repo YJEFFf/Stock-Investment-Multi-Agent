@@ -51,6 +51,10 @@ async def _fake_call_structured(*, system, user, response_model, json_schema, **
         return response_model(argument="분석가 근거가 뚜렷하다", strength=0.75)
     if name == "_ManagerResponse":
         return response_model(action="BUY", reasoning="차트 분석가의 강한 매수 신호를 근거로 매수 승인")
+    if name == "_Translation":
+        # src/translate.py가 텔레그램/노션에 보이기 전 판단 로그를 한국어로 옮기는
+        # 단계 — 이 테스트의 판단 사유는 이미 한국어라 그대로 돌려주면 충분하다.
+        return response_model(translated=user)
     raise AssertionError(f"이 테스트 시나리오에서 예상 못 한 LLM 호출: {name}")
 
 

@@ -70,6 +70,13 @@ def _fixed_today(monkeypatch):
     # 따로 검증하므로, 그 외 테스트에서는 기본적으로 꺼둔다.
     monkeypatch.delenv("NOTION_TRADE_JOURNAL_DB_ID", raising=False)
 
+    # execute_buy_order/finalize_sell이 텔레그램 알림 전 판단 로그를 한국어로
+    # 옮기는 단계(src/translate.py)가 실제 Claude API를 타지 않게 막는다.
+    async def _identity(text, label="translate"):
+        return text
+
+    monkeypatch.setattr(eo.pipeline.translate, "to_korean", _identity)
+
 
 def test_noop_when_neither_pending_file_exists(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
@@ -210,25 +217,26 @@ def test_pending_sell_for_ticker_no_longer_held_is_skipped(monkeypatch, tmp_path
 def test_sync_trade_journal_skipped_when_not_configured(monkeypatch):
     monkeypatch.delenv("NOTION_TRADE_JOURNAL_DB_ID", raising=False)
 
-    def fail(*a, **k):
+    async def fail(*a, **k):
         raise AssertionError("설정 안 됐으면 notion_sync를 호출하면 안 된다")
 
     monkeypatch.setattr(eo.notion_sync, "sync_trade_journal", fail)
 
-    eo._sync_trade_journal()
+    asyncio.run(eo._sync_trade_journal())
 
 
 def test_sync_trade_journal_called_when_configured(monkeypatch):
     monkeypatch.setenv("NOTION_TRADE_JOURNAL_DB_ID", "db-trade")
 
     captured = {}
-    monkeypatch.setattr(
-        eo.notion_sync,
-        "sync_trade_journal",
-        lambda log_path, db_id: captured.setdefault("db_id", db_id) or {"synced": 1, "failed": 0, "skipped": 0},
-    )
 
-    eo._sync_trade_journal()
+    async def fake_sync(log_path, db_id):
+        captured["db_id"] = db_id
+        return {"synced": 1, "failed": 0, "skipped": 0}
+
+    monkeypatch.setattr(eo.notion_sync, "sync_trade_journal", fake_sync)
+
+    asyncio.run(eo._sync_trade_journal())
 
     assert captured["db_id"] == "db-trade"
 
@@ -236,7 +244,7 @@ def test_sync_trade_journal_called_when_configured(monkeypatch):
 def test_sync_trade_journal_sends_error_alert_on_failure(monkeypatch):
     monkeypatch.setenv("NOTION_TRADE_JOURNAL_DB_ID", "db-trade")
 
-    def fail(log_path, db_id):
+    async def fail(log_path, db_id):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(eo.notion_sync, "sync_trade_journal", fail)
@@ -244,7 +252,7 @@ def test_sync_trade_journal_sends_error_alert_on_failure(monkeypatch):
     alerts = []
     monkeypatch.setattr(eo.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
 
-    eo._sync_trade_journal()
+    asyncio.run(eo._sync_trade_journal())
 
     assert len(alerts) == 1
     assert "노션 매매일지 동기화 실패" in alerts[0]

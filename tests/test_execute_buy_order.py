@@ -18,6 +18,13 @@ def _no_real_notify_or_name_lookup(monkeypatch):
     monkeypatch.setattr(pipeline.notify, "send_telegram_alert", lambda message: True)
     monkeypatch.setattr(pipeline, "display_name", lambda ticker: ticker)
 
+    # 텔레그램에 보이기 전 decision.reason을 한국어로 옮기는 단계(src/translate.py)가
+    # 실제 Claude API를 타지 않게 항등 함수로 막는다 — 번역 자체 검증은 tests/test_translate.py.
+    async def _identity(text, label="translate"):
+        return text
+
+    monkeypatch.setattr(pipeline.translate, "to_korean", _identity)
+
 
 def _decision(action="BUY") -> Decision:
     from src.schemas import AnalystOpinion

@@ -983,3 +983,60 @@ synced로 표시돼 있어 재실행해도 다시 안 만들어진다 — 과거
    `total_value`로 넘긴다. 조회 실패(`None`)해도 리포트 자체는 만들어지고 그
    절만 "조회 실패" 문구로 대체된다 — 노션 동기화는 부가 기능이라는 기존
    원칙과 동일.
+
+### 일일 리포트 상세 내용을 승인된 매수만으로 축소, 판단 로그 한국어 번역 (2026-08-13)
+
+같은 날 사용자 요청 두 가지 추가:
+
+1. **일일 리포트 "오늘의 판단 요약" 축약**: 첫 줄 요약 문장(총 N개 판단·BUY
+   승인 M개·게이트 거부 K개·나머지 HOLD)은 그대로 두고, 그 아래 종목별 상세
+   불릿은 승인된 매수만 나열하도록 `_daily_report_children`을 바꿨다 — HOLD·
+   거부 종목까지 전부 나열하면 유니버스 전체(200개 가까이) 판단이 매일 쌓여
+   리포트가 지나치게 길어진다. 요약 문장은 여전히 `decisions_today` 전체
+   기준이라 몇 개 중 몇 개가 승인/거부됐는지는 그대로 드러난다. 승인된 매수가
+   0건인 날은 "오늘은 승인된 매수 없음" 문구로 대체(빈 섹션 방지).
+
+2. **판단 로그 한국어 번역 (표시 계층에서만)**: 분석가·토론·매니저 프롬프트는
+   전부 영어라(prompts/*.md) `decision.reason`, 토론 논거, LLM 재량매도
+   `reasoning`이 전부 영어로 나온다. 사용자 확정: "토의·판단 자체는 영어로
+   해도 상관없지만, 나한테 보여질 때(텔레그램 알림·노션 일지)는 한국어로
+   번역해달라." 그래서 `logs/*.jsonl`에 남는 원문은 손대지 않고(프롬프트
+   버전별 성능 추적의 원재료라 원문이 남아있어야 한다 — CLAUDE.md 핵심 계약의
+   `evidence` 프롬프트 버전 태그와 같은 이유), 사람이 보는 표면을 만드는
+   순간에만 번역한다.
+
+   새 모듈 `src/translate.py`: `llm.call_structured`(기존 재시도·로깅 인프라
+   그대로 재사용)로 짧은 번역 호출 하나(`_Translation{translated: str}`)를
+   추가했다. **번역 실패는 원문을 그대로 반환한다**(예외를 삼킨다) — 번역은
+   투자 판단이 아니라 표시 형식이라, 이것 때문에 텔레그램 알림이나 노션 동기화
+   자체가 막히면 안 된다(노션 동기화 실패를 삼키는 기존 패턴과 동일 정신).
+
+   번역을 호출하는 지점: `pipeline.execute_buy_order`(텔레그램 매수 알림),
+   `pipeline.finalize_sell`(텔레그램 매도 알림, LLM 재량매도 reasoning이 있을
+   때만), `notion_sync._buy_row_children`(매니저 최종 판단 + 토론 논거),
+   `notion_sync._sell_row_children`(판단 사유), `notion_sync._daily_report_children`
+   (승인된 매수 상세 불릿의 reason). 이 중 노션 쪽 함수들은 번역이 비동기
+   호출이라 전부 `async def`로 바뀌었고, `notion_sync.sync_trade_journal`/
+   `sync_daily_report`도 따라서 async가 됐다 — 호출부(`execute_open.py`의
+   `_sync_trade_journal`, `decide_llm_sell.py`의 `_sync_daily_report`,
+   `run_daily.py`의 `_sync_notion`)도 전부 `await`로 바꿨다.
+
+   **함정과 수정**: pydantic의 `BaseModel.model_json_schema()`로 만든 스키마를
+   그대로 `call_structured`에 넘겼더니 API가 400을 냈다(`additionalProperties`를
+   object 타입에 명시적으로 `false`로 안 넣으면 거부됨) — `src/analysts.py`/
+   `src/judgment.py`가 이미 스키마를 손으로 쓰는 이유가 바로 이거였는데
+   놓쳤다. 손으로 쓴 스키마(`_TRANSLATION_RESPONSE_SCHEMA`)로 바꿔서 해결
+   (사용자에게 실제 한 번 호출해 정상 번역되는 것까지 확인, 2026-08-13).
+   이 버그가 있는 동안엔 번역 호출이 매번 조용히 실패해서 원문(영어)이 그대로
+   노출되는 상태였다 — try/except가 실패를 삼키는 설계라 겉으로는 "그냥 항상
+   영어로 나옴"으로만 보이고 에러가 안 드러났다. 앞으로 `call_structured`에
+   새 응답 스키마를 추가할 때는 반드시 `additionalProperties: False`를
+   손으로 넣을 것.
+
+   **테스트 비용 주의**: 초기 구현 때 `tests/test_execute_buy_order.py`/
+   `tests/test_evaluate_holdings.py`/`tests/test_end_to_end_workflow.py`가
+   `translate.to_korean`을 안 막아서 테스트 스위트가 실제 Claude API를
+   호출하고 있었다(스키마 버그로 400 응답이라 토큰 비용은 0이었지만, 목킹
+   없이 네트워크를 타는 것 자체가 문제 — 사용자 방침: 테스트는 항상 목만
+   쓴다). 관련 테스트 파일의 autouse fixture에 `translate.to_korean` 항등
+   함수 목을 추가해서 막았다.
