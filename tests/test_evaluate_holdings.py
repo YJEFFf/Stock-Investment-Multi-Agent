@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 
 from src import kis, pipeline, sell
-from src.schemas import AnalystOpinion, PortfolioState, Position, SellAction
+from src.schemas import AnalystOpinion, ExitPlan, PortfolioState, Position, SellAction
 
 
 def _position(**overrides) -> Position:
@@ -24,6 +24,11 @@ def _no_real_notify_or_name_lookup(monkeypatch):
     # (2026-08-09, execute_buy_order 쪽과 같은 이유로 실수로 한 번 겪음).
     monkeypatch.setattr(pipeline.notify, "send_telegram_alert", lambda message: True)
     monkeypatch.setattr(pipeline, "display_name", lambda ticker: ticker)
+
+    # execute_sell_order가 주문 전후로 누적 체결 집계를 조회한다 — 막지 않으면
+    # 실제 KIS를 때리고 타임아웃까지 기다린다. 기본은 "조회 불가"라 체결 확인
+    # 실패 경로가 돌고 호가로 폴백한다.
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: None)
 
     # 텔레그램에 보이기 전 action.reasoning을 한국어로 옮기는 단계(src/translate.py)가
     # 실제 Claude API를 타지 않게 항등 함수로 막는다.
@@ -335,3 +340,95 @@ def test_llm_layer_analyst_failure_treated_as_no_opinions(monkeypatch, tmp_path)
 
     assert captured["opinions"] == []
     assert result.positions[0].weight == 0.10
+
+
+# --- 매매일지: 줄인 비중과 매도 금액 (사용자 요청 2026-08-15) ---
+
+
+def test_journal_records_weight_reduced_and_sell_amount_on_partial_take_profit(monkeypatch, tmp_path):
+    """부분 익절은 sell_fraction(잔량 대비 비율)만 봐서는 포트폴리오를 얼마나 줄였는지
+    안 보인다 — 전체 대비 줄인 비중과 매도 금액이 일지에 같이 남아야 한다."""
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 120.0)  # +20%, 1차 익절
+    monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
+
+    position = _position(
+        entry_price=100.0, peak_price=100.0, weight=0.12, entry_day=DAY.date(), quantity=30
+    )
+    portfolio = PortfolioState(positions=[position], cash_weight=0.88)
+    trade_journal_log_path = tmp_path / "trade_journal.jsonl"
+
+    asyncio.run(
+        pipeline.evaluate_holdings(
+            portfolio,
+            DAY,
+            sell.execute_sell_order,
+            log_path=tmp_path / "sell.jsonl",
+            trade_journal_log_path=trade_journal_log_path,
+        )
+    )
+
+    entry = json.loads(trade_journal_log_path.read_text().strip())
+    assert entry["reason"] == "take_profit_trail"
+    assert entry["shares_sold"] == 10  # 30주의 1/3
+    assert entry["sell_amount"] == pytest.approx(1200.0)  # 10주 x 120원
+    assert entry["portfolio_weight_before"] == pytest.approx(0.12)
+    assert entry["portfolio_weight_sold"] == pytest.approx(0.04)  # 전체 12% 중 4%p 축소
+    assert entry["portfolio_weight_after"] == pytest.approx(0.08)
+
+
+def test_journal_records_full_position_on_stop_loss(monkeypatch, tmp_path):
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 89.0)  # -11%
+    monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
+
+    position = _position(
+        entry_price=100.0, peak_price=100.0, weight=0.10, entry_day=DAY.date(), quantity=30
+    )
+    portfolio = PortfolioState(positions=[position], cash_weight=0.90)
+    trade_journal_log_path = tmp_path / "trade_journal.jsonl"
+
+    asyncio.run(
+        pipeline.evaluate_holdings(
+            portfolio,
+            DAY,
+            sell.execute_sell_order,
+            log_path=tmp_path / "sell.jsonl",
+            trade_journal_log_path=trade_journal_log_path,
+        )
+    )
+
+    entry = json.loads(trade_journal_log_path.read_text().strip())
+    assert entry["reason"] == "stop_loss"
+    assert entry["shares_sold"] == 30
+    assert entry["sell_amount"] == pytest.approx(2670.0)  # 30주 x 89원
+    assert entry["portfolio_weight_sold"] == pytest.approx(0.10)
+    assert entry["portfolio_weight_after"] == 0.0
+
+
+def test_journal_records_the_exit_plan_that_actually_applied(monkeypatch, tmp_path):
+    """LLM이 정한 계획으로 잘린 건지 고정 기본값으로 잘린 건지 나중에 갈라볼 수 있어야 한다."""
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 94.0)  # -6%
+    monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
+
+    plan = ExitPlan(
+        stop_loss_pct=-0.06, take_profit_pct=0.12, take_profit_fraction=0.25, trail_pct=-0.04
+    )
+    position = _position(
+        entry_price=100.0, peak_price=100.0, weight=0.10, entry_day=DAY.date(), quantity=30,
+        exit_plan=plan,
+    )
+    portfolio = PortfolioState(positions=[position], cash_weight=0.90)
+    trade_journal_log_path = tmp_path / "trade_journal.jsonl"
+
+    asyncio.run(
+        pipeline.evaluate_holdings(
+            portfolio,
+            DAY,
+            sell.execute_sell_order,
+            log_path=tmp_path / "sell.jsonl",
+            trade_journal_log_path=trade_journal_log_path,
+        )
+    )
+
+    entry = json.loads(trade_journal_log_path.read_text().strip())
+    assert entry["reason"] == "stop_loss"  # 고정값 -10%였다면 아직 안 잘렸을 것
+    assert entry["exit_plan"]["stop_loss_pct"] == pytest.approx(-0.06)

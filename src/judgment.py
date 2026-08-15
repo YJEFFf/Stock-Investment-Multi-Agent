@@ -6,7 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from src import llm
-from src.schemas import AnalystOpinion, DebateArgument, Decision, SellAction
+from src.schemas import AnalystOpinion, DebateArgument, Decision, ExitPlan, SellAction
 
 BULL_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "debate_bull.md"
 BEAR_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "debate_bear.md"
@@ -83,9 +83,32 @@ async def debate(ticker: str, opinions: list[AnalystOpinion]) -> tuple[DebateArg
     return bull, bear
 
 
+# 출구 규칙 바운드 (사용자 확정, 2026-08-15). LLM은 고정값(-10%/1-3/-7%)보다 조이는
+# 쪽으로도 느슨한 쪽으로도 갈 수 있다 — 대신 진입 시점에 한 번만 정하고 보유 중에는
+# 재결정하지 않는다(ExitPlan docstring). 이 바운드는 "적정 수준" 판단이 아니라
+# 파싱 사고 방지선이다: 손절 3% 미만은 KOSPI 대형주 일간 노이즈에 그냥 털리고,
+# 15% 초과는 종목당 비중 한도 15%와 곱해도 일일 손실 한도(-5%) 안에 들어야 한다.
+_MIN_STOP_LOSS_PCT = 3.0
+_MAX_STOP_LOSS_PCT = 15.0
+_MIN_TAKE_PROFIT_FRACTION = 0.15
+_MAX_TAKE_PROFIT_FRACTION = 0.60  # 1.0 미만이어야 (1-f)^n으로 항상 잔량이 남는다
+_MIN_TRAIL_PCT = 3.0
+_MAX_TRAIL_PCT = 12.0
+
+# 익절선은 LLM이 내지 않는다 — 손절폭 한 숫자만 받아서 코드가 2배로 계산한다.
+# LLM이 자유롭게 정하는 숫자 개수를 최소화하기 위해서고, 2:1 손익비를 코드가
+# 강제하기 위해서다(사용자 확정).
+_REWARD_RISK_RATIO = 2.0
+
+
 class _ManagerResponse(BaseModel):
     action: Literal["BUY", "HOLD"]
     reasoning: str
+    # 아래 셋은 퍼센트 "크기"(양수)로 받는다 — 부호는 코드가 붙인다. 모델이 음수
+    # 부호를 흘리는 실수를 아예 못 하게 하려는 것.
+    stop_loss_pct: float
+    take_profit_fraction: float
+    trail_pct: float
 
 
 _MANAGER_RESPONSE_SCHEMA = {
@@ -93,10 +116,36 @@ _MANAGER_RESPONSE_SCHEMA = {
     "properties": {
         "action": {"type": "string", "enum": ["BUY", "HOLD"]},
         "reasoning": {"type": "string"},
+        # number에 minimum/maximum을 넣으면 API가 400을 낸다("For 'number' type,
+        # properties maximum, minimum are not supported", 2026-08-15 실호출로 확인).
+        # 범위는 프롬프트 문구로 알려주고, 실제 강제는 _exit_plan_from의 클램핑이
+        # 한다 — 어차피 구조화 출력이 범위를 지킨다고 믿으면 안 되는 자리였다.
+        "stop_loss_pct": {"type": "number"},
+        "take_profit_fraction": {"type": "number"},
+        "trail_pct": {"type": "number"},
     },
-    "required": ["action", "reasoning"],
+    "required": ["action", "reasoning", "stop_loss_pct", "take_profit_fraction", "trail_pct"],
     "additionalProperties": False,
 }
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _exit_plan_from(result: _ManagerResponse) -> ExitPlan:
+    """LLM이 낸 숫자를 ExitPlan으로 만든다. 스키마에 min/max를 이미 넣었지만 여기서
+    한 번 더 자른다 — 구조화 출력이 범위를 안 지키는 경우가 실제로 있고, 범위를
+    벗어난 값이 조용히 통과하면 손절선이 사라지는 쪽으로 틀리기 때문이다."""
+    stop_loss = _clamp(abs(result.stop_loss_pct), _MIN_STOP_LOSS_PCT, _MAX_STOP_LOSS_PCT) / 100.0
+    return ExitPlan(
+        stop_loss_pct=-stop_loss,
+        take_profit_pct=stop_loss * _REWARD_RISK_RATIO,
+        take_profit_fraction=_clamp(
+            result.take_profit_fraction, _MIN_TAKE_PROFIT_FRACTION, _MAX_TAKE_PROFIT_FRACTION
+        ),
+        trail_pct=-_clamp(abs(result.trail_pct), _MIN_TRAIL_PCT, _MAX_TRAIL_PCT) / 100.0,
+    )
 
 
 async def portfolio_manager(
@@ -110,6 +159,10 @@ async def portfolio_manager(
 
     이 판단은 추천일 뿐이다 — 최종 승인권은 리스크 게이트(코드)에 있다 (규칙 6).
     매니저의 BUY는 게이트가 거부할 수 있고, HOLD는 그대로 확정(매수 없음)된다.
+
+    매수 판단과 함께 이 종목의 출구 규칙(ExitPlan)도 같이 받는다 — 별도 호출이
+    아니라 이 응답에 필드를 얹는 방식이라 LLM 호출 수는 그대로다. 진입 시점 한
+    번만 정하고 보유 중에는 다시 묻지 않는다(ExitPlan docstring).
     """
     template = MANAGER_PROMPT_PATH.read_text()
     version = _prompt_version(template)
@@ -131,6 +184,12 @@ async def portfolio_manager(
         label="portfolio_manager_buy",
     )
 
+    # degraded면 LLM이 정한 출구 규칙을 버리고 고정 기본값으로 떨어뜨린다. 분석가가
+    # 일부 빠진 상태에서 나온 판단은 게이트에서 기준을 높인다는 기존 원칙(CLAUDE.md
+    # 기술 스택)과 같은 방향이다 — 절반만 보고 있는 모델에게 손절선을 넓힐 재량까지
+    # 주지는 않는다.
+    exit_plan = None if degraded else _exit_plan_from(result)
+
     return Decision(
         ticker=ticker,
         action=result.action,
@@ -139,6 +198,7 @@ async def portfolio_manager(
         degraded=degraded,
         debate=[bull, bear],
         evidence=[f"prompt:manager@{version}"],
+        exit_plan=exit_plan,
     )
 
 

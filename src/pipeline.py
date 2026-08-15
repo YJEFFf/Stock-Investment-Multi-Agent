@@ -2,8 +2,9 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from src import collectors, kis, notify, sell, translate
 from src.analysts import chart_analyst, disclosure_analyst, dummy_analyst, news_analyst
@@ -11,6 +12,7 @@ from src.schemas import (
     AnalystOpinion,
     Decision,
     DisclosureContext,
+    FillRecord,
     GateResult,
     NewsContext,
     PortfolioState,
@@ -20,6 +22,17 @@ from src.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+KST = ZoneInfo("Asia/Seoul")
+
+
+def _kst_today() -> date:
+    """KRX 주문일자(한국 날짜). 장중(09:00-15:30 KST = 00:00-06:30 UTC)에는 UTC
+    날짜와 같지만, 주문일자는 원래 KST 개념이라 명시적으로 변환한다 — 이 프로젝트는
+    이미 UTC 날짜를 그대로 쓰다가 일일 리포트가 항상 비어 보이는 버그를 한 번 겪었다
+    (커밋 832fb8b)."""
+    return datetime.now(KST).date()
+
 
 # 마일스톤 1 더미 판단 문턱값. 실제 강세/약세 토론 + 포트폴리오 매니저가 들어오면
 # propose_decision()을 통째로 교체한다 (마일스톤 2 이후).
@@ -77,7 +90,12 @@ ExecuteFn = Callable[[Decision, GateResult, PortfolioState, str, float], Awaitab
 
 # SellAction을 포트폴리오에 반영하는 함수. 무비용 시뮬레이션(sell.execute_sell_simulated)
 # 과 실제 KIS 매도 주문(sell.execute_sell_order)이 같은 형태를 공유한다.
-SellExecuteFn = Callable[[PortfolioState, SellAction, float], Awaitable[PortfolioState]]
+# 실제 체결 내역(FillRecord)을 함께 돌려준다 — 매매일지에 적히는 건 판단 시점
+# 호가가 아니라 체결가여야 하고, 그걸 정확히 잴 수 있는 건 주문을 낸 함수뿐이다.
+# 시뮬레이션 경로는 체결 자체가 없으므로 항상 None이다.
+SellExecuteFn = Callable[
+    [PortfolioState, SellAction, float], Awaitable[tuple[PortfolioState, FillRecord | None]]
+]
 
 # 보유 종목 재평가(LLM 재량 매도)용 판단 함수. judgment.judge_sell이 이 형태를 따른다.
 # evaluate_holdings에서 기본값 None이면 이 계층 자체를 건너뛴다 — 결정론적
@@ -240,16 +258,49 @@ async def execute_buy_order(
         _log_buy_skip(log_path, today, ticker, "quantity_zero")
         return portfolio
 
+    # 주문 직전/직후의 누적 체결 집계를 사이에 두고 재면 이 주문 하나의 체결
+    # 수량·금액이 정확히 나온다 — 같은 종목을 같은 날 두 번 매수해도(추가매수)
+    # 섞이지 않는다. 집계 하나만 사후 조회하면 두 건이 합산돼버린다.
+    fills_before = await asyncio.to_thread(kis.fetch_daily_fill_totals, ticker, _kst_today(), "buy")
+
     order_no = await asyncio.to_thread(kis.place_market_buy_order, ticker, quantity)
     if order_no is None:
         logger.error("execute_buy_order_failed ticker=%s reason=order_rejected", ticker)
         _log_buy_skip(log_path, today, ticker, "order_rejected")
         return portfolio
 
-    fill_price = await asyncio.to_thread(kis.fetch_fill_price, ticker, datetime.now(timezone.utc).date())
-    # 체결가 조회가 실패해도 주문 자체는 이미 나갔다 — None보다 현재가 근사치가
-    # 낫다(포지션이 리스크 관리 대상에서 아예 빠지는 걸 막는다).
-    entry_price = fill_price if fill_price is not None else current_price
+    # 진입가는 손절·익절 판정의 유일한 기준점이라 반드시 **실제 체결가**여야 한다.
+    # 주문 직전 호가로 폴백하면 그 오차가 포지션 수명 내내 남는다 — 192820이
+    # 호가 210,000에 주문돼 232,000에 체결됐는데 진입가는 210,000으로 남았고,
+    # 그 결과 실제 +6.6% 지점에서 익절이 +20%로 오판돼 발동했다(2026-08-15 실측).
+    # 그래서 브로커 쪽 출처를 두 개 순서대로 쓰고, 호가는 마지막 수단으로 민다.
+    fills_after = await asyncio.to_thread(kis.fetch_daily_fill_totals, ticker, _kst_today(), "buy")
+    fill = kis.fill_between(fills_before, fills_after)
+    fill_price = fill.price if fill is not None else None
+    entry_price_source = "fill"
+    if fill_price is None:
+        # 전후 집계 차를 못 구한 경우(조회 실패 등) — 그날 매수 집계 평균으로 물러선다.
+        # 같은 날 추가매수가 있으면 섞이지만, 호가보다는 훨씬 낫다.
+        fill_price = await asyncio.to_thread(kis.fetch_fill_price, ticker, _kst_today())
+        entry_price_source = "daily_avg"
+    if fill_price is None:
+        # 체결 직후라 일별체결 집계에 아직 안 잡혔을 수 있다 — 잔고의 매입평균가가
+        # 2차 출처다. 방금 산 종목이라 보유분 평균가 = 이 주문의 체결가다.
+        fill_price = await asyncio.to_thread(kis.fetch_position_avg_price, ticker)
+        entry_price_source = "position_avg"
+    if fill_price is None:
+        # 체결가를 끝내 못 구했다. 그래도 주문은 이미 나갔으므로 포지션을 리스크
+        # 관리 대상에서 빼지는 않는다(entry_price=None이면 매도 평가 자체가 스킵된다).
+        # 대신 호가 근사치임을 로그와 매매일지에 남겨 나중에 구분할 수 있게 한다.
+        fill_price = current_price
+        entry_price_source = "quote_fallback"
+        logger.error(
+            "execute_buy_order_entry_price_unverified ticker=%s reason=fill_and_balance_both_unavailable "
+            "using_quote=%.2f",
+            ticker,
+            current_price,
+        )
+    entry_price = fill_price
 
     positions = [p.model_copy() for p in portfolio.positions]
     existing = next((p for p in positions if p.ticker == ticker), None)
@@ -272,6 +323,11 @@ async def execute_buy_order(
                 entry_price=entry_price,
                 peak_price=entry_price,
                 quantity=quantity,
+                # 진입 시점에 확정된 출구 규칙을 여기서 한 번 박고 끝이다. 추가매수
+                # 경로(existing is not None)에서는 일부러 건드리지 않는다 — 나중에
+                # 다시 정할 수 있게 두면 "물타기하면서 손절선도 같이 넓히는" 경로가
+                # 열린다. 기존 포지션의 규칙이 그대로 이긴다.
+                exit_plan=decision.exit_plan,
             )
         )
 
@@ -284,8 +340,17 @@ async def execute_buy_order(
             "sector": sector,
             "quantity": quantity,
             "entry_price": entry_price,
+            # 진입가를 어디서 얻었는지 — "fill"(일별체결 집계) / "position_avg"(잔고
+            # 매입평균가) / "quote_fallback"(둘 다 실패해 호가로 근사). 마지막 것은
+            # 손절·익절 기준이 실제 원가와 다를 수 있다는 뜻이라 반드시 구분해서
+            # 남긴다(2026-08-15, 192820 오익절 건 이후).
+            "entry_price_source": entry_price_source,
             "order_no": order_no,
             "gap_pct": round(gap_pct, 4),
+            # 이 포지션에 박힌 출구 규칙. None이면 고정 기본값(degraded 판단이거나
+            # 추가매수라 기존 규칙 유지). 나중에 "LLM이 정한 출구가 고정값보다
+            # 나았나"를 가르는 기준이 이 필드다.
+            "exit_plan": decision.exit_plan.model_dump(mode="json") if decision.exit_plan else None,
             "decision": decision.model_dump(mode="json"),
         },
     )
@@ -713,7 +778,15 @@ async def finalize_sell(
     이 함수를 공유한다 — "액션이 이미 정해졌을 때 어떻게 집행하고 남기는가"는
     판단이 언제 내려졌는지와 무관하게 항상 같아야 한다.
     """
-    portfolio = await sell_execute_fn(portfolio, action, current_price)
+    portfolio, fill = await sell_execute_fn(portfolio, action, current_price)
+
+    # 매매일지에 적히는 값은 판단 시점 호가가 아니라 **실제 체결 내역**이다
+    # (사용자 확정 2026-08-15). 시장가 주문이라 둘은 항상 다를 수 있고, 호가를
+    # 적으면 실현손익률·매도금액이 전부 실제와 어긋난다. 체결 조회가 실패했거나
+    # 시뮬레이션 경로라 체결 자체가 없으면 호가로 밀되, 그 사실을 출처로 남긴다.
+    exit_price = fill.price if fill is not None else current_price
+    exit_price_source = "fill" if fill is not None else "quote_fallback"
+
     _append_log(
         log_path,
         {
@@ -721,12 +794,21 @@ async def finalize_sell(
             "ticker": position.ticker,
             "reason": action.reason,
             "sell_fraction": action.sell_fraction,
-            "price": current_price,
+            "price": exit_price,
         },
     )
 
+    # 요청 비율(action.sell_fraction)이 아니라 집행 전후 상태 차이에서 실제로 빠진
+    # 양을 뽑는다 — 주식수 내림 때문에 요청과 실제가 다를 수 있고, 매매일지엔 실제로
+    # 일어난 일이 적혀야 한다. 포지션이 통째로 사라졌으면 전량 매도된 것이다.
+    after = next((p for p in portfolio.positions if p.ticker == action.ticker), None)
+    weight_sold = position.weight - (after.weight if after else 0.0)
+    shares_sold = fill.quantity if fill is not None else None
+    if shares_sold is None and position.quantity is not None:
+        shares_sold = position.quantity - (after.quantity or 0 if after else 0)
+
     realized_pnl_pct = (
-        (current_price - position.entry_price) / position.entry_price if position.entry_price else None
+        (exit_price - position.entry_price) / position.entry_price if position.entry_price else None
     )
     holding_days = (day.date() - position.entry_day).days if position.entry_day else None
     _append_log(
@@ -738,10 +820,31 @@ async def finalize_sell(
             "reason": action.reason,
             "reasoning": action.reasoning,
             "sell_fraction": action.sell_fraction,
-            "exit_price": current_price,
+            "exit_price": exit_price,
+            # "fill"이면 브로커 체결 원본, "quote_fallback"이면 호가 근사치라
+            # 실현손익률·매도금액이 실제와 다를 수 있다는 뜻이다.
+            "exit_price_source": exit_price_source,
+            "decision_price": current_price,  # 판단 시점 호가 — 체결가와의 슬리피지 추적용
             "entry_price": position.entry_price,
             "realized_pnl_pct": realized_pnl_pct,
             "holding_days": holding_days,
+            # 포트폴리오 전체 대비로 이번 매도가 줄인 비중, 그리고 남은 비중
+            # (사용자 요청 2026-08-15 — 익절이 부분 매도라 "얼마나 줄였나"가
+            # sell_fraction만 봐서는 안 보인다).
+            "portfolio_weight_sold": weight_sold,
+            "portfolio_weight_before": position.weight,
+            "portfolio_weight_after": after.weight if after else 0.0,
+            "shares_sold": shares_sold,
+            # 체결 총액도 브로커 원본을 그대로 쓴다 — 수량 x 단가로 되계산하면
+            # 부분 체결이 여러 단가로 나뉘었을 때 어긋난다.
+            "sell_amount": (
+                fill.amount
+                if fill is not None
+                else (shares_sold * current_price if shares_sold else None)
+            ),
+            # 이 포지션에 실제로 적용된 출구 규칙 — LLM이 정한 값인지 고정 기본값인지
+            # 나중에 성과를 갈라볼 때 필요하다.
+            "exit_plan": position.exit_plan.model_dump(mode="json") if position.exit_plan else None,
         },
     )
     # action.reasoning(LLM 재량매도일 때만 있음)도 로그엔 영어 원문 그대로 남고
@@ -751,7 +854,7 @@ async def finalize_sell(
         notify.format_sell_alert(
             display_name(position.ticker),
             notify.REASON_LABELS.get(action.reason, action.reason),
-            current_price,
+            exit_price,  # 알림에도 호가가 아니라 체결가를 보여준다
             realized_pnl_pct,
             reasoning=reasoning_ko,
         )

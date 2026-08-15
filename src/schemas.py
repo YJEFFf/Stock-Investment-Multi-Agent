@@ -83,6 +83,48 @@ class DebateArgument(BaseModel):
     evidence: list[str]  # 프롬프트 버전 추적 (AnalystOpinion과 동일한 관례)
 
 
+class FillRecord(BaseModel):
+    """브로커에 실제로 체결된 내역. 매매일지에 적히는 사실은 이것이지 판단 시점
+    호가가 아니다 (사용자 확정, 2026-08-15).
+
+    시장가로 주문하므로 판단 시점 호가와 실제 체결가는 항상 다를 수 있다. 실제로
+    192820이 호가 210,000에 주문돼 232,000에 체결됐고, 일지가 호가를 적는 바람에
+    실제 +6.6% 지점에서 익절이 +20%로 오판돼 발동했다(docs/PLAN.md).
+
+    `price`를 따로 두지 않고 amount/quantity로 계산하는 이유: 부분 체결이 여러 번
+    나뉘어도 가중평균이 자동으로 맞기 때문이다.
+    """
+
+    quantity: int = Field(gt=0)
+    amount: float = Field(gt=0)  # 실제 체결 총액(원)
+
+    @property
+    def price(self) -> float:
+        return self.amount / self.quantity
+
+
+class ExitPlan(BaseModel):
+    """이 포지션의 손절/익절 규칙. 진입 시점에 한 번 정해지고 청산까지 얼어붙는다
+    (사용자 확정, 2026-08-15).
+
+    왜 얼리는가: 보유 중에 LLM에게 손절선을 다시 물으면, 이미 -8%인 포지션 앞에서
+    묻게 된다. 그러면 "지지선이 조금 아래라 여유를 둘 필요" 같은 논거가 반드시
+    나온다 — 모델이 나빠서가 아니라 물어보면 답을 만들어내기 때문이고, 재시도가
+    문턱을 대신 낮췄던 실패(CLAUDE.md 서두)와 정확히 같은 모양이다. 아직 이해관계가
+    없는 진입 시점에 규칙을 정하게 하고, 그 뒤로는 코드가 그대로 집행한다.
+
+    범위(schemas의 Field 제약)는 정책이 아니라 파싱 사고 방지용 절대 바운드다 —
+    LLM이 이 밖의 값을 내면 judgment 단에서 잘라낸다.
+    """
+
+    stop_loss_pct: float = Field(ge=-0.15, le=-0.03)  # 진입가 대비, 음수. 도달 시 전량 매도
+    take_profit_pct: float = Field(ge=0.06, le=0.30)  # 진입가 대비, 양수. 항상 2 x |stop_loss_pct|
+    # (2:1 고정 — LLM은 손절폭 한 숫자만 내고 익절선은 코드가 계산한다. 사용자 확정)
+    take_profit_fraction: float = Field(gt=0.0, lt=1.0)  # 트리거마다 "현재" 잔량 대비 매도 비율.
+    # 1.0 미만이라 (1-f)^n으로 항상 일부가 남는다 — 익절만으로는 전량 청산되지 않는다.
+    trail_pct: float = Field(ge=-0.12, le=-0.03)  # 첫 익절 이후 고점 대비, 음수
+
+
 class Decision(BaseModel):
     ticker: str
     action: Literal["BUY", "HOLD"]  # 매도는 별도 경로
@@ -91,6 +133,9 @@ class Decision(BaseModel):
     degraded: bool  # 분석가 일부가 실패한 상태에서 나온 결정인가
     debate: list[DebateArgument] = Field(default_factory=list)  # 감사 추적용 강세/약세 논거
     evidence: list[str] = Field(default_factory=list)  # 이 결정 자체를 만든 프롬프트 버전 (매니저)
+    exit_plan: ExitPlan | None = None  # 매수 시 이 포지션에 박을 출구 규칙. None이면
+    # sell.DEFAULT_EXIT_PLAN(고정 -10%/+20%/1-3/-7%)로 떨어진다 — degraded 판단이거나
+    # LLM 응답이 깨졌을 때의 안전한 기본값.
 
 
 class GateResult(BaseModel):
@@ -119,6 +164,9 @@ class Position(BaseModel):
     peak_price: float | None = None  # 진입(또는 마지막 부분 익절) 이후 관측된 최고가 —
     # 트레일링 익절의 기준점.
     take_profit_stage: int = 0  # 부분 익절이 몇 번 실행됐는지
+    exit_plan: ExitPlan | None = None  # 진입 시 확정된 손절/익절 규칙. 보유 중에는 절대
+    # 갱신하지 않는다(ExitPlan docstring 참고). None인 포지션(이 기능 이전에 열렸거나
+    # 시뮬레이션 경로로 열린 것)은 sell.DEFAULT_EXIT_PLAN을 그대로 쓴다.
     quantity: int | None = None  # 실제 보유 주수. pipeline.execute_buy_order가 실제
     # KIS 주문을 넣을 때만 채운다 — 브로커에 실주문을 낸 적 없는(순수 시뮬레이션
     # execute()로 연 포지션은 None으로 남는다. 실제 매도 주문 수량 계산에 쓴다

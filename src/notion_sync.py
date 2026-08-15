@@ -251,8 +251,17 @@ def _intro_page_blocks() -> list[dict]:
         _bulleted("섹터 집중도 한도 40%"),
         _bulleted("일일 손실 한도 -5% (도달 시 그날 신규 매수 중단)"),
         _bulleted("총 노출 한도 100% (개별 한도로만 통제, 별도 상한 없음)"),
-        _heading("매도 로직 (2026-08-09 확정)", level=2),
-        _bulleted("결정론적 안전장치(항상 실행): 손절 -10% 전량 매도, 익절 +20%부터 1/3씩 트레일링 매도"),
+        _heading("매도 로직 (2026-08-09 확정, 2026-08-15 종목별 조정)", level=2),
+        _bulleted(
+            "결정론적 안전장치(항상 실행): 손절 도달 시 전량 매도, 익절 트리거부터 잔량의 일정 비율씩 "
+            "트레일링 매도. 문턱은 종목마다 다르다 — 진입 시점에 포트폴리오 매니저가 그 종목의 변동성에 "
+            "맞춰 정하고(손절 3~15%, 익절은 항상 그 2배), 청산까지 바뀌지 않는다"
+        ),
+        _bulleted(
+            "보유 중에는 문턱을 재조정하지 않는다 — 손실 종목 앞에서 손절선을 다시 물으면 넓히는 쪽 "
+            "논거가 반드시 나오기 때문이다. 분석가가 일부 빠진 판단(degraded)은 고정 기본값(-10%/+20%/"
+            "1-3씩/-7%)으로 떨어진다"
+        ),
         _bulleted(
             "LLM 재량 매도(보유 종목 재평가, 옵션): 매수용 강세/약세 토론+매니저와 대칭 구조이지만 "
             "게이트를 거치지 않고 그대로 실행된다 — 대신 프롬프트 자체를 보수적으로 설계해 상쇄한다"
@@ -350,12 +359,35 @@ def create_trade_journal_database(parent_page_id: str) -> str | None:
             "가격": {"number": {"format": "won"}},
             "수량": {"number": {"format": "number"}},
             "총매수금액": {"number": {"format": "won"}},
+            "매도금액": {"number": {"format": "won"}},
+            "줄인비중": {"number": {"format": "percent"}},
+            "잔여비중": {"number": {"format": "percent"}},
             "실현손익률": {"number": {"format": "percent"}},
             "보유일수": {"number": {"format": "number"}},
         },
     }
     result = _notion_request("POST", "/databases", body)
     return result["id"] if result else None
+
+
+# 이미 만들어진 매매일지 DB에 나중에 추가된 속성들. create_trade_journal_database는
+# DB가 없을 때 한 번만 도는데(setup_notion_workspace.py가 .env에 ID가 있으면 건너뜀),
+# 노션은 존재하지 않는 속성에 값을 쓰면 400을 낸다 — 스키마만 고치면 그날부터 매도
+# 동기화가 통째로 실패한다. 새 속성을 추가할 때는 위 create 함수와 여기 둘 다 넣을 것.
+_TRADE_JOURNAL_ADDED_PROPERTIES = {
+    "매도금액": {"number": {"format": "won"}},
+    "줄인비중": {"number": {"format": "percent"}},
+    "잔여비중": {"number": {"format": "percent"}},
+}
+
+
+def ensure_trade_journal_properties(database_id: str) -> bool:
+    """매매일지 DB에 나중에 추가된 속성들을 채워 넣는다. 이미 있으면 노션이 그대로
+    두므로 몇 번 돌려도 안전하다."""
+    result = _notion_request(
+        "PATCH", f"/databases/{database_id}", {"properties": _TRADE_JOURNAL_ADDED_PROPERTIES}
+    )
+    return result is not None
 
 
 # --- 매매일지 동기화 ---
@@ -409,6 +441,15 @@ def _sell_row_properties(entry: dict) -> dict:
         properties["실현손익률"] = {"number": round(entry["realized_pnl_pct"], 4)}
     if entry.get("holding_days") is not None:
         properties["보유일수"] = {"number": entry["holding_days"]}
+    # 아래 넷은 이 기능(2026-08-15) 이전에 쌓인 매도 로그엔 없다 — 없으면 그냥 비운다.
+    if entry.get("shares_sold") is not None:
+        properties["수량"] = {"number": entry["shares_sold"]}
+    if entry.get("sell_amount") is not None:
+        properties["매도금액"] = {"number": round(entry["sell_amount"])}
+    if entry.get("portfolio_weight_sold") is not None:
+        properties["줄인비중"] = {"number": round(entry["portfolio_weight_sold"], 4)}
+    if entry.get("portfolio_weight_after") is not None:
+        properties["잔여비중"] = {"number": round(entry["portfolio_weight_after"], 4)}
     return properties
 
 
@@ -602,7 +643,14 @@ async def _daily_report_children(
         for s in sells:
             reason_label = REASON_LABELS.get(s["reason"], s["reason"])
             pnl = f", 실현손익 {s['realized_pnl_pct']:+.2%}" if s.get("realized_pnl_pct") is not None else ""
-            blocks.append(_bulleted(f"{_display_name(s['ticker'])}: {reason_label}{pnl}"))
+            amount = f", 매도금액 {s['sell_amount']:,.0f}원" if s.get("sell_amount") is not None else ""
+            weight = ""
+            if s.get("portfolio_weight_sold") is not None:
+                weight = (
+                    f", 비중 {s['portfolio_weight_sold']:.2%} 축소"
+                    f" (잔여 {s.get('portfolio_weight_after', 0.0):.2%})"
+                )
+            blocks.append(_bulleted(f"{_display_name(s['ticker'])}: {reason_label}{pnl}{amount}{weight}"))
     else:
         blocks.append(_paragraph("오늘 매도 없음."))
 

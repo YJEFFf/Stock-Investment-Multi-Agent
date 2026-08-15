@@ -17,6 +17,8 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import scripts.run_daily as rd
@@ -50,7 +52,14 @@ async def _fake_call_structured(*, system, user, response_model, json_schema, **
     if name == "_DebateResponse":
         return response_model(argument="분석가 근거가 뚜렷하다", strength=0.75)
     if name == "_ManagerResponse":
-        return response_model(action="BUY", reasoning="차트 분석가의 강한 매수 신호를 근거로 매수 승인")
+        return response_model(
+            action="BUY",
+            reasoning="차트 분석가의 강한 매수 신호를 근거로 매수 승인",
+            # 매니저는 매수 판단과 함께 이 종목의 출구 규칙도 같이 낸다 (ExitPlan).
+            stop_loss_pct=7.0,
+            take_profit_fraction=0.3,
+            trail_pct=5.0,
+        )
     if name == "_Translation":
         # src/translate.py가 텔레그램/노션에 보이기 전 판단 로그를 한국어로 옮기는
         # 단계 — 이 테스트의 판단 사유는 이미 한국어라 그대로 돌려주면 충분하다.
@@ -96,6 +105,22 @@ def test_full_daily_workflow_sell_then_buy_end_to_end(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: "BUYORDER1")
     monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, order_date: 70000.0)
     monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "SELLORDER1")
+    # 주문 전후 누적 체결 집계. 시장가라 호가와 체결가가 다른 상황을 일부러 만든다:
+    # 매수는 호가 70,000인데 70,500에 체결, 매도는 호가 89.0인데 88.0에 체결.
+    # 매매일지에 호가가 아니라 이 체결가가 적혀야 한다(사용자 확정 2026-08-15).
+    # 매수 수량은 int(100,000,000 * 0.08 / 70,000) = 114주.
+    _fill_totals = {
+        ("buy", 0): (0, 0.0), ("buy", 1): (114, 114 * 70_500.0),
+        ("sell", 0): (0, 0.0), ("sell", 1): (10, 10 * 88.0),
+    }
+    _fill_calls = {"buy": 0, "sell": 0}
+
+    def fake_fill_totals(ticker, day, side):
+        n = _fill_calls[side]
+        _fill_calls[side] = n + 1
+        return _fill_totals.get((side, min(n, 1)))
+
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", fake_fill_totals)
 
     # --- 네트워크 경계 목킹: llm (analysts.py가 차트/뉴스/공시, judgment.py가 토론/매니저) ---
     monkeypatch.setattr(analysts.llm, "call_structured", _fake_call_structured)
@@ -127,6 +152,21 @@ def test_full_daily_workflow_sell_then_buy_end_to_end(monkeypatch, tmp_path):
     assert events["sell"]["reason"] == "stop_loss"
     assert events["buy"]["ticker"] == NEW_BUY_TICKER
     assert events["buy"]["decision"]["reason"] == "차트 분석가의 강한 매수 신호를 근거로 매수 승인"
+
+    # --- 결과 검증: 일지에 적힌 값이 판단 시점 호가가 아니라 실제 체결가인가 ---
+    # 시장가 주문이라 둘은 다르게 목킹돼 있다. 호가가 새면 여기서 걸린다.
+    assert events["buy"]["entry_price"] == 70_500.0  # 호가는 70,000이었다
+    assert events["buy"]["entry_price_source"] == "fill"
+    assert events["sell"]["exit_price"] == 88.0  # 호가는 89.0이었다
+    assert events["sell"]["exit_price_source"] == "fill"
+    assert events["sell"]["decision_price"] == 89.0  # 호가도 슬리피지 추적용으로 남는다
+    assert events["sell"]["shares_sold"] == 10
+    assert events["sell"]["sell_amount"] == 880.0
+    # 실현손익률도 체결가 기준이어야 한다 — 진입가 100원, 체결 88원 -> -12%
+    assert events["sell"]["realized_pnl_pct"] == pytest.approx(-0.12)
+    # 진입가가 체결가로 박혔으니 포지션의 손절 기준선도 그 값 기준이다.
+    bought = next(p for p in final_portfolio.positions if p.ticker == NEW_BUY_TICKER)
+    assert bought.entry_price == 70_500.0
 
     # --- 결과 검증: 판단 로그(pipeline.jsonl)에도 남았는지 ---
     pipeline_path = tmp_path / "logs" / "pipeline.jsonl"

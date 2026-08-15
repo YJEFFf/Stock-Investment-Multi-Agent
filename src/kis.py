@@ -38,7 +38,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-from src.schemas import OHLCVBar
+from src.schemas import FillRecord, OHLCVBar
 
 load_dotenv()
 
@@ -352,6 +352,125 @@ def place_market_sell_order(ticker: str, quantity: int) -> str | None:
     return (data.get("output") or {}).get("ODNO")
 
 
+SIDE_CODES = {"buy": "02", "sell": "01"}
+
+
+def fetch_daily_fill_totals(ticker: str, order_date: date, side: str) -> tuple[int, float] | None:
+    """그날 그 종목의 **누적** 체결 수량·금액 (side: "buy" | "sell").
+
+    주문 직전·직후로 두 번 불러 차를 내면 그 주문 하나의 정확한 체결 수량·금액이
+    나온다(`fill_between`). 집계값만 보면 안 되는 이유: output2는 그날 전체를
+    합산하므로 같은 종목을 같은 날 두 번 매도하면 두 건이 섞인다 — 실제로
+    192820이 2026-08-12에 12주·8주로 두 번 익절돼 20주/4,946,000원으로 합산
+    보고됐고, 건별 금액을 사후에 분리할 수 없었다(docs/PLAN.md).
+
+    output1(주문별 명세)은 모의투자 계좌가 빈 배열로 돌려줘서 쓸 수 없다(2026-08-15 실측).
+    """
+    if side not in SIDE_CODES:
+        raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
+
+    date_str = order_date.strftime("%Y%m%d")
+    params = {
+        "CANO": os.getenv("KIS_ACCOUNT_NO", ""),
+        "ACNT_PRDT_CD": ACCOUNT_PRODUCT_CODE,
+        "INQR_STRT_DT": date_str,
+        "INQR_END_DT": date_str,
+        "SLL_BUY_DVSN_CD": SIDE_CODES[side],
+        "INQR_DVSN": "00",
+        "PDNO": ticker,
+        "CCLD_DVSN": "01",  # 체결분만
+        "ORD_GNO_BRNO": "",
+        "ODNO": "",
+        "INQR_DVSN_3": "00",
+        "INQR_DVSN_1": "",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+    data = _kis_get(DAILY_CCLD_PATH, DAILY_CCLD_TR_ID, params)
+    if data is None:
+        return None
+
+    output2 = data.get("output2") or {}
+    qty_str, amount_str = output2.get("tot_ccld_qty"), output2.get("tot_ccld_amt")
+    if qty_str is None or amount_str is None:
+        return None
+    try:
+        return int(qty_str), float(amount_str)
+    except ValueError:
+        logger.warning("kis_fill_totals_unparseable ticker=%s qty=%r amt=%r", ticker, qty_str, amount_str)
+        return None
+
+
+def fill_between(
+    before: tuple[int, float] | None, after: tuple[int, float] | None
+) -> FillRecord | None:
+    """주문 전후 누적 체결 집계의 차 = 그 주문 하나의 체결 내역.
+
+    어느 쪽이든 조회에 실패했거나(None) 수량이 안 늘었으면 None이다 — 후자는
+    "주문이 체결되지 않았다"와 "애초에 실주문을 안 냈다(시뮬레이션 경로)"를 모두
+    포함하며, 둘 다 체결 사실을 지어내면 안 되는 상황이라 같게 다룬다.
+    """
+    if before is None or after is None:
+        return None
+    qty = after[0] - before[0]
+    amount = after[1] - before[1]
+    if qty <= 0 or amount <= 0:
+        return None
+    return FillRecord(quantity=qty, amount=amount)
+
+
+def fetch_holdings() -> dict[str, tuple[int, float]] | None:
+    """브로커가 보고하는 보유 종목 전체: {종목코드: (보유수량, 매입평균가)}.
+
+    **브로커가 사실의 출처다.** 자체 상태 파일(logs/portfolio_state.json)의 값과
+    다르면 항상 이쪽이 맞다 — 실제로 192820이 호가 210,000에 주문돼 232,000에
+    체결됐는데 상태 파일엔 210,000이 남아, 실제 +6.6% 지점에서 익절이 +20%로
+    오판돼 발동했다(2026-08-15, docs/PLAN.md). scripts/reconcile_portfolio.py가
+    이 함수로 그 어긋남을 잡는다.
+
+    보유 수량이 0인 종목(전량 매도 등)은 애초에 행이 없어 결과에도 안 들어간다.
+    """
+    params = {
+        "CANO": os.getenv("KIS_ACCOUNT_NO", ""),
+        "ACNT_PRDT_CD": ACCOUNT_PRODUCT_CODE,
+        "AFHR_FLPR_YN": "N",
+        "OFL_YN": "",
+        "INQR_DVSN": "02",
+        "UNPR_DVSN": "01",
+        "FUND_STTL_ICLD_YN": "N",
+        "FNCG_AMT_AUTO_RDPT_YN": "N",
+        "PRCS_DVSN": "01",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+    data = _kis_get(BALANCE_PATH, BALANCE_TR_ID, params)
+    if data is None:
+        return None
+
+    holdings: dict[str, tuple[int, float]] = {}
+    for row in data.get("output1") or []:
+        ticker = row.get("pdno")
+        qty_str, price_str = row.get("hldg_qty"), row.get("pchs_avg_pric")
+        if not ticker or not qty_str or not price_str:
+            continue
+        try:
+            quantity, price = int(qty_str), float(price_str)
+        except ValueError:
+            logger.warning("kis_holdings_unparseable ticker=%s qty=%r price=%r", ticker, qty_str, price_str)
+            continue
+        if quantity > 0 and price > 0:
+            holdings[ticker] = (quantity, price)
+    return holdings
+
+
+def fetch_position_avg_price(ticker: str) -> float | None:
+    """그 종목 보유분의 매입평균가. 체결가 조회가 실패했을 때 진입가의 2차 출처다."""
+    holdings = fetch_holdings()
+    if not holdings or ticker not in holdings:
+        return None
+    return holdings[ticker][1]
+
+
 def fetch_fill_price(ticker: str, order_date: date) -> float | None:
     """그날 그 종목의 매수 평균 체결가. inquire-daily-ccld의 output2(집계)에서
     구매평균가격(pchs_avg_pric)을 쓴다 — 종목·날짜를 좁혀서 조회하므로 이 주문
@@ -359,6 +478,12 @@ def fetch_fill_price(ticker: str, order_date: date) -> float | None:
 
     output1(주문별 체결 내역)의 필드명은 아직 실측으로 확인 못 했다(2026-08-09,
     실제 체결 건이 없어서) — 그래서 필드명이 이미 확인된 output2 집계 쪽을 쓴다.
+
+    `SLL_BUY_DVSN_CD="02"`(매수만)인 게 중요하다. 원래 "00"(전체)이었는데, 그러면
+    같은 날 같은 종목을 매수한 뒤 부분 익절까지 나간 경우 output2가 **매수와 매도를
+    한데 섞어** 평균을 낸다 — 실제로 192820이 2026-08-12에 매수 38주 + 매도 20주라
+    "00"으로는 237,711원(= 전체 체결금액 / 전체 체결수량)이 나온다. 진입가로 쓰면
+    안 되는 값이다 (2026-08-15 실측).
     """
     date_str = order_date.strftime("%Y%m%d")
     params = {
@@ -366,7 +491,7 @@ def fetch_fill_price(ticker: str, order_date: date) -> float | None:
         "ACNT_PRDT_CD": ACCOUNT_PRODUCT_CODE,
         "INQR_STRT_DT": date_str,
         "INQR_END_DT": date_str,
-        "SLL_BUY_DVSN_CD": "00",
+        "SLL_BUY_DVSN_CD": "02",  # 매수만 — "00"(전체)이면 같은 날 매도와 섞인다(위 docstring)
         "INQR_DVSN": "00",
         "PDNO": ticker,
         "CCLD_DVSN": "00",

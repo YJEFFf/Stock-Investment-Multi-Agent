@@ -565,3 +565,65 @@ def test_sync_daily_report_handles_no_decisions_that_day(tmp_path, monkeypatch):
     )
 
     assert created is True
+
+
+# --- 매도 행의 비중/금액 속성 (사용자 요청 2026-08-15) ---
+
+
+def test_sell_row_includes_weight_reduced_and_sell_amount():
+    entry = _sell_entry(reason="take_profit_trail")
+    entry.update(
+        shares_sold=10,
+        sell_amount=2_000_000.0,
+        portfolio_weight_sold=0.04,
+        portfolio_weight_before=0.12,
+        portfolio_weight_after=0.08,
+    )
+
+    properties = notion_sync._sell_row_properties(entry)
+
+    assert properties["수량"]["number"] == 10
+    assert properties["매도금액"]["number"] == 2_000_000
+    assert properties["줄인비중"]["number"] == pytest.approx(0.04)
+    assert properties["잔여비중"]["number"] == pytest.approx(0.08)
+
+
+def test_sell_row_omits_new_fields_for_older_log_entries():
+    """이 기능 이전에 쌓인 매도 로그엔 이 필드들이 없다 — 없으면 그냥 비운다."""
+    properties = notion_sync._sell_row_properties(_sell_entry())
+
+    assert "매도금액" not in properties
+    assert "줄인비중" not in properties
+    assert "잔여비중" not in properties
+
+
+def test_ensure_trade_journal_properties_patches_the_existing_db(monkeypatch):
+    """DB 생성은 .env에 ID가 있으면 건너뛰므로, 나중에 추가된 속성은 PATCH로 채워야
+    한다 — 없는 속성에 값을 쓰면 노션이 400을 내고 매도 동기화가 통째로 실패한다."""
+    captured = {}
+
+    def fake_request(method, path, body=None):
+        captured.update(method=method, path=path, body=body)
+        return {"id": "db-1"}
+
+    monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
+
+    assert notion_sync.ensure_trade_journal_properties("db-1") is True
+    assert captured["method"] == "PATCH"
+    assert captured["path"] == "/databases/db-1"
+    assert set(captured["body"]["properties"]) == {"매도금액", "줄인비중", "잔여비중"}
+
+
+def test_ensure_trade_journal_properties_reports_failure(monkeypatch):
+    monkeypatch.setattr(notion_sync, "_notion_request", lambda *a, **k: None)
+    assert notion_sync.ensure_trade_journal_properties("db-1") is False
+
+
+def test_added_properties_are_all_declared_in_the_create_schema():
+    """create 함수와 마이그레이션 목록이 갈라지면, 새로 만든 워크스페이스와 기존
+    워크스페이스의 DB 스키마가 달라진다."""
+    import inspect
+
+    source = inspect.getsource(notion_sync.create_trade_journal_database)
+    for name in notion_sync._TRADE_JOURNAL_ADDED_PROPERTIES:
+        assert f'"{name}"' in source

@@ -38,8 +38,16 @@ def main() -> None:
         print(".env에 NOTION_API_KEY / NOTION_PARENT_PAGE_ID를 먼저 채워주세요.")
         return
 
-    if os.environ.get("NOTION_TRADE_JOURNAL_DB_ID"):
+    existing_journal_db_id = os.environ.get("NOTION_TRADE_JOURNAL_DB_ID")
+    if existing_journal_db_id:
         print("랜딩/소개/매매일지는 이미 설정됨 — 건너뜀.")
+        # DB 생성은 건너뛰지만 나중에 추가된 속성은 채워 넣어야 한다 — 없는 속성에
+        # 값을 쓰면 노션이 400을 내서 매도 동기화가 통째로 실패한다.
+        print("매매일지 속성 최신화 중 (매도금액/줄인비중/잔여비중)...")
+        if notion_sync.ensure_trade_journal_properties(existing_journal_db_id):
+            print("완료.")
+        else:
+            print("실패 — 노션에서 매매일지 DB가 integration과 연결됐는지 확인하세요.")
     else:
         print("랜딩 페이지에 소개 + GitHub 링크 추가 중...")
         if not notion_sync.add_landing_page_content(parent_page_id):

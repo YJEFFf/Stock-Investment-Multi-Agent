@@ -5,7 +5,7 @@ from datetime import date
 import pytest
 
 from src import kis, pipeline
-from src.schemas import Decision, GateResult, PortfolioState, Position
+from src.schemas import Decision, ExitPlan, GateResult, PortfolioState, Position
 
 TICKER = "005930"
 
@@ -24,6 +24,11 @@ def _no_real_notify_or_name_lookup(monkeypatch):
         return text
 
     monkeypatch.setattr(pipeline.translate, "to_korean", _identity)
+
+    # execute_buy_order가 주문 전후로 누적 체결 집계를 조회한다 — 막지 않으면 테스트가
+    # 실제 KIS를 때리고 타임아웃까지 기다린다. 체결 브래킷을 실제로 검증하는
+    # 테스트는 _wire_buy_with_prices로 이 목을 다시 덮어쓴다.
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: None)
 
 
 def _decision(action="BUY") -> Decision:
@@ -250,3 +255,205 @@ def test_adds_to_existing_position_with_weighted_average_entry_price(monkeypatch
     assert pos.entry_price == pytest.approx(150.0)
     assert pos.peak_price == 200.0  # 새 체결가가 기존 고점보다 높음
     assert pos.entry_day == date(2026, 1, 5)  # 추가매수해도 최초 진입일 유지
+
+
+# --- ExitPlan이 진입 시점에 포지션에 박히는가 (사용자 확정 2026-08-15) ---
+
+
+def _plan(stop_loss_pct=-0.06) -> ExitPlan:
+    return ExitPlan(
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=abs(stop_loss_pct) * 2,
+        take_profit_fraction=0.25,
+        trail_pct=-0.04,
+    )
+
+
+def _wire_successful_buy(monkeypatch):
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)
+    monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
+    monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: "order-1")
+    monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, day: 101.0)
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: None)
+
+
+def test_new_position_carries_the_decisions_exit_plan(monkeypatch, tmp_path):
+    _wire_successful_buy(monkeypatch)
+    plan = _plan()
+    decision = _decision()
+    decision.exit_plan = plan
+    portfolio = PortfolioState(positions=[], cash_weight=1.0)
+
+    updated = asyncio.run(
+        pipeline.execute_buy_order(
+            decision,
+            GateResult(approved=True, rejected_by=None),
+            portfolio,
+            "반도체",
+            0.08,
+            log_path=tmp_path / "journal.jsonl",
+        )
+    )
+
+    assert updated.positions[0].exit_plan == plan
+
+
+def test_new_position_without_exit_plan_stays_none(monkeypatch, tmp_path):
+    """degraded 판단은 exit_plan이 None이고, sell.plan_for가 고정 기본값으로 떨어뜨린다."""
+    _wire_successful_buy(monkeypatch)
+    portfolio = PortfolioState(positions=[], cash_weight=1.0)
+
+    updated = asyncio.run(
+        pipeline.execute_buy_order(
+            _decision(),
+            GateResult(approved=True, rejected_by=None),
+            portfolio,
+            "반도체",
+            0.08,
+            log_path=tmp_path / "journal.jsonl",
+        )
+    )
+
+    assert updated.positions[0].exit_plan is None
+
+
+def test_adding_to_existing_position_keeps_the_original_exit_plan(monkeypatch, tmp_path):
+    """물타기하면서 손절선도 같이 넓히는 경로를 열지 않는다 — 기존 규칙이 이긴다."""
+    _wire_successful_buy(monkeypatch)
+    original = _plan(stop_loss_pct=-0.05)
+    existing = Position(
+        ticker=TICKER, sector="반도체", weight=0.05, entry_price=90.0, peak_price=90.0, quantity=10,
+        exit_plan=original,
+    )
+    decision = _decision()
+    decision.exit_plan = _plan(stop_loss_pct=-0.14)  # 훨씬 느슨한 새 계획
+    portfolio = PortfolioState(positions=[existing], cash_weight=0.95)
+
+    updated = asyncio.run(
+        pipeline.execute_buy_order(
+            decision,
+            GateResult(approved=True, rejected_by=None),
+            portfolio,
+            "반도체",
+            0.08,
+            log_path=tmp_path / "journal.jsonl",
+        )
+    )
+
+    assert updated.positions[0].exit_plan == original
+
+
+def test_buy_journal_records_the_exit_plan(monkeypatch, tmp_path):
+    _wire_successful_buy(monkeypatch)
+    log_path = tmp_path / "journal.jsonl"
+    decision = _decision()
+    decision.exit_plan = _plan()
+
+    asyncio.run(
+        pipeline.execute_buy_order(
+            decision, GateResult(approved=True, rejected_by=None),
+            PortfolioState(positions=[], cash_weight=1.0), "반도체", 0.08, log_path=log_path,
+        )
+    )
+
+    entry = json.loads(log_path.read_text().strip())
+    assert entry["exit_plan"]["stop_loss_pct"] == pytest.approx(-0.06)
+    assert entry["exit_plan"]["take_profit_pct"] == pytest.approx(0.12)
+
+
+# --- 진입가 출처 체인 (2026-08-15, 192820 오익절 건 이후) ---
+
+
+def _wire_buy_with_prices(monkeypatch, fill_price, position_avg, bracket=None):
+    """진입가 폴백 체인을 단계별로 확인한다.
+
+    체인: 전후 집계 브래킷 -> 그날 매수 집계 평균 -> 잔고 매입평균가 -> 호가.
+    `bracket`은 (주문전, 주문후) 누적 체결 집계 튜플이며 None이면 조회 불가로 둔다.
+    """
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)  # 주문 직전 호가
+    monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
+    monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: "order-1")
+    monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, day: fill_price)
+    monkeypatch.setattr(kis, "fetch_position_avg_price", lambda ticker: position_avg)
+
+    totals = iter(bracket if bracket is not None else [None, None])
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: next(totals))
+
+
+def _run_buy(tmp_path):
+    log_path = tmp_path / "journal.jsonl"
+    portfolio = asyncio.run(
+        pipeline.execute_buy_order(
+            _decision(), GateResult(approved=True, rejected_by=None),
+            PortfolioState(positions=[], cash_weight=1.0), "반도체", 0.08, log_path=log_path,
+        )
+    )
+    return portfolio, json.loads(log_path.read_text().strip())
+
+
+def test_entry_price_prefers_this_orders_own_fill(monkeypatch, tmp_path):
+    """주문 전후 누적 체결 집계의 차 = 이 주문 하나의 체결가. 같은 날 이미 다른
+    체결(100주/9,000원)이 있어도 섞이지 않고 이번 20주분(2,240원 -> 주당 112원)만
+    잡혀야 한다."""
+    _wire_buy_with_prices(
+        monkeypatch,
+        fill_price=999.0,  # 그날 집계 평균 — 섞인 값이라 쓰면 안 된다
+        position_avg=888.0,
+        bracket=[(100, 9_000.0), (120, 11_240.0)],
+    )
+
+    portfolio, entry = _run_buy(tmp_path)
+
+    assert portfolio.positions[0].entry_price == pytest.approx(112.0)
+    assert entry["entry_price_source"] == "fill"
+
+
+def test_entry_price_falls_back_to_daily_average_when_bracket_unavailable(monkeypatch, tmp_path):
+    _wire_buy_with_prices(monkeypatch, fill_price=112.0, position_avg=999.0)
+
+    portfolio, entry = _run_buy(tmp_path)
+
+    assert portfolio.positions[0].entry_price == 112.0
+    assert entry["entry_price_source"] == "daily_avg"
+
+
+def test_entry_price_falls_back_to_broker_position_average(monkeypatch, tmp_path):
+    """체결 직후라 일별체결 집계에 아직 안 잡힌 경우 — 호가(101)가 아니라 브로커가
+    보고하는 매입평균가(112)를 써야 한다."""
+    _wire_buy_with_prices(monkeypatch, fill_price=None, position_avg=112.0)
+
+    portfolio, entry = _run_buy(tmp_path)
+
+    assert portfolio.positions[0].entry_price == 112.0
+    assert entry["entry_price_source"] == "position_avg"
+
+
+def test_entry_price_last_resort_is_quote_and_is_flagged(monkeypatch, tmp_path, caplog):
+    """둘 다 실패하면 호가로 밀되, 손절·익절 기준이 실제 원가와 다를 수 있다는 걸
+    로그와 매매일지 양쪽에 남긴다 — 조용히 넘어가면 192820처럼 오익절이 난다."""
+    _wire_buy_with_prices(monkeypatch, fill_price=None, position_avg=None)
+
+    with caplog.at_level("ERROR"):
+        portfolio, entry = _run_buy(tmp_path)
+
+    assert portfolio.positions[0].entry_price == 101.0  # 호가
+    assert entry["entry_price_source"] == "quote_fallback"
+    assert "entry_price_unverified" in caplog.text
+
+
+def test_later_sources_are_not_queried_once_a_price_is_found(monkeypatch, tmp_path):
+    """체인이 앞단에서 끝나면 뒤쪽 조회는 아예 안 나가야 한다 — 불필요한 KIS 호출은
+    초당 거래건수 제한을 갉아먹는다."""
+    _wire_buy_with_prices(
+        monkeypatch, fill_price=112.0, position_avg=None, bracket=[(0, 0.0), (20, 2_240_000.0)]
+    )
+    daily_calls, balance_calls = [], []
+    monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, day: daily_calls.append(ticker))
+    monkeypatch.setattr(kis, "fetch_position_avg_price", lambda ticker: balance_calls.append(ticker))
+
+    _run_buy(tmp_path)
+
+    assert daily_calls == []
+    assert balance_calls == []
