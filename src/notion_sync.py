@@ -360,8 +360,12 @@ def create_trade_journal_database(parent_page_id: str) -> str | None:
             "수량": {"number": {"format": "number"}},
             "총매수금액": {"number": {"format": "won"}},
             "매도금액": {"number": {"format": "won"}},
-            "줄인비중": {"number": {"format": "percent"}},
+            # 아래 둘은 **이 종목 보유분을 100%로 놓은** 비율이다(합이 항상 100%).
+            # 포트폴리오 전체 대비로 적으면 "1.19% 축소" 같은 값이 되어 읽는 사람이
+            # 해석할 수 없다 — 일지는 사람이 읽으라고 쓰는 것이다(사용자 요청).
+            "매도비중": {"number": {"format": "percent"}},
             "잔여비중": {"number": {"format": "percent"}},
+            "잔여수량": {"number": {"format": "number"}},
             "실현손익률": {"number": {"format": "percent"}},
             "보유일수": {"number": {"format": "number"}},
         },
@@ -376,8 +380,9 @@ def create_trade_journal_database(parent_page_id: str) -> str | None:
 # 동기화가 통째로 실패한다. 새 속성을 추가할 때는 위 create 함수와 여기 둘 다 넣을 것.
 _TRADE_JOURNAL_ADDED_PROPERTIES = {
     "매도금액": {"number": {"format": "won"}},
-    "줄인비중": {"number": {"format": "percent"}},
+    "매도비중": {"number": {"format": "percent"}},
     "잔여비중": {"number": {"format": "percent"}},
+    "잔여수량": {"number": {"format": "number"}},
 }
 
 
@@ -441,15 +446,19 @@ def _sell_row_properties(entry: dict) -> dict:
         properties["실현손익률"] = {"number": round(entry["realized_pnl_pct"], 4)}
     if entry.get("holding_days") is not None:
         properties["보유일수"] = {"number": entry["holding_days"]}
-    # 아래 넷은 이 기능(2026-08-15) 이전에 쌓인 매도 로그엔 없다 — 없으면 그냥 비운다.
+    # 아래 값들은 이 기능(2026-08-15) 이전에 쌓인 매도 로그엔 없다 — 없으면 그냥 비운다.
     if entry.get("shares_sold") is not None:
         properties["수량"] = {"number": entry["shares_sold"]}
+    if entry.get("shares_after") is not None:
+        properties["잔여수량"] = {"number": entry["shares_after"]}
     if entry.get("sell_amount") is not None:
         properties["매도금액"] = {"number": round(entry["sell_amount"])}
-    if entry.get("portfolio_weight_sold") is not None:
-        properties["줄인비중"] = {"number": round(entry["portfolio_weight_sold"], 4)}
-    if entry.get("portfolio_weight_after") is not None:
-        properties["잔여비중"] = {"number": round(entry["portfolio_weight_after"], 4)}
+    # 이 종목 보유분 대비 비율(합 100%). 포트폴리오 전체 대비 값(portfolio_weight_*)은
+    # 로그엔 남지만 노션엔 안 띄운다 — 읽는 사람에게 의미가 없다.
+    if entry.get("position_fraction_sold") is not None:
+        properties["매도비중"] = {"number": round(entry["position_fraction_sold"], 4)}
+    if entry.get("position_fraction_remaining") is not None:
+        properties["잔여비중"] = {"number": round(entry["position_fraction_remaining"], 4)}
     return properties
 
 
@@ -644,13 +653,18 @@ async def _daily_report_children(
             reason_label = REASON_LABELS.get(s["reason"], s["reason"])
             pnl = f", 실현손익 {s['realized_pnl_pct']:+.2%}" if s.get("realized_pnl_pct") is not None else ""
             amount = f", 매도금액 {s['sell_amount']:,.0f}원" if s.get("sell_amount") is not None else ""
-            weight = ""
-            if s.get("portfolio_weight_sold") is not None:
-                weight = (
-                    f", 비중 {s['portfolio_weight_sold']:.2%} 축소"
-                    f" (잔여 {s.get('portfolio_weight_after', 0.0):.2%})"
+            # "보유분의 몇 %를 팔았고 몇 %가 남았나" — 주식수까지 같이 적어 해석의
+            # 여지를 없앤다.
+            portion = ""
+            if s.get("position_fraction_sold") is not None:
+                shares = ""
+                if s.get("shares_sold") is not None and s.get("shares_after") is not None:
+                    shares = f" [{s['shares_sold']}주 매도, {s['shares_after']}주 잔여]"
+                portion = (
+                    f", 보유분의 {s['position_fraction_sold']:.1%} 매도"
+                    f" (잔여 {s.get('position_fraction_remaining', 0.0):.1%}){shares}"
                 )
-            blocks.append(_bulleted(f"{_display_name(s['ticker'])}: {reason_label}{pnl}{amount}{weight}"))
+            blocks.append(_bulleted(f"{_display_name(s['ticker'])}: {reason_label}{pnl}{amount}{portion}"))
     else:
         blocks.append(_paragraph("오늘 매도 없음."))
 

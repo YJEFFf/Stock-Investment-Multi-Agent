@@ -371,9 +371,14 @@ def test_journal_records_weight_reduced_and_sell_amount_on_partial_take_profit(m
     assert entry["reason"] == "take_profit_trail"
     assert entry["shares_sold"] == 10  # 30주의 1/3
     assert entry["sell_amount"] == pytest.approx(1200.0)  # 10주 x 120원
+    # 사람이 읽는 값은 이 종목 보유분 기준이다(합 100%).
+    assert entry["shares_before"] == 30
+    assert entry["shares_after"] == 20
+    assert entry["position_fraction_sold"] == pytest.approx(1 / 3)
+    assert entry["position_fraction_remaining"] == pytest.approx(2 / 3)
+    # 포트폴리오 대비 비중은 분석용으로 계속 남는다.
     assert entry["portfolio_weight_before"] == pytest.approx(0.12)
-    assert entry["portfolio_weight_sold"] == pytest.approx(0.04)  # 전체 12% 중 4%p 축소
-    assert entry["portfolio_weight_after"] == pytest.approx(0.08)
+    assert entry["portfolio_weight_sold"] == pytest.approx(0.04)
 
 
 def test_journal_records_full_position_on_stop_loss(monkeypatch, tmp_path):
@@ -400,8 +405,10 @@ def test_journal_records_full_position_on_stop_loss(monkeypatch, tmp_path):
     assert entry["reason"] == "stop_loss"
     assert entry["shares_sold"] == 30
     assert entry["sell_amount"] == pytest.approx(2670.0)  # 30주 x 89원
+    assert entry["shares_after"] == 0
+    assert entry["position_fraction_sold"] == pytest.approx(1.0)  # 전량
+    assert entry["position_fraction_remaining"] == pytest.approx(0.0)
     assert entry["portfolio_weight_sold"] == pytest.approx(0.10)
-    assert entry["portfolio_weight_after"] == 0.0
 
 
 def test_journal_records_the_exit_plan_that_actually_applied(monkeypatch, tmp_path):
@@ -432,3 +439,30 @@ def test_journal_records_the_exit_plan_that_actually_applied(monkeypatch, tmp_pa
     entry = json.loads(trade_journal_log_path.read_text().strip())
     assert entry["reason"] == "stop_loss"  # 고정값 -10%였다면 아직 안 잘렸을 것
     assert entry["exit_plan"]["stop_loss_pct"] == pytest.approx(-0.06)
+
+
+def test_position_fractions_always_sum_to_one(monkeypatch, tmp_path):
+    """한 행만 보고 해석되려면 두 값의 합이 100%여야 한다 — 이게 깨지면 '보유분의
+    몇 %'라는 말 자체가 성립하지 않는다. 주식수 내림으로 33.3%를 정확히 못 파는
+    경우(30주가 아닌 31주)에도 성립해야 한다."""
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 120.0)
+    monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
+
+    position = _position(entry_price=100.0, peak_price=100.0, weight=0.12, entry_day=DAY.date(), quantity=31)
+    portfolio = PortfolioState(positions=[position], cash_weight=0.88)
+    trade_journal_log_path = tmp_path / "trade_journal.jsonl"
+
+    asyncio.run(
+        pipeline.evaluate_holdings(
+            portfolio, DAY, sell.execute_sell_order,
+            log_path=tmp_path / "sell.jsonl", trade_journal_log_path=trade_journal_log_path,
+        )
+    )
+
+    entry = json.loads(trade_journal_log_path.read_text().strip())
+    assert entry["shares_sold"] == 10  # int(31/3)
+    assert entry["shares_after"] == 21
+    assert entry["position_fraction_sold"] == pytest.approx(10 / 31)
+    assert (
+        entry["position_fraction_sold"] + entry["position_fraction_remaining"] == pytest.approx(1.0)
+    )

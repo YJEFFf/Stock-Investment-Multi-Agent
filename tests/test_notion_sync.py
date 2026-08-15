@@ -570,22 +570,31 @@ def test_sync_daily_report_handles_no_decisions_that_day(tmp_path, monkeypatch):
 # --- 매도 행의 비중/금액 속성 (사용자 요청 2026-08-15) ---
 
 
-def test_sell_row_includes_weight_reduced_and_sell_amount():
+def test_sell_row_uses_position_relative_fractions_not_portfolio_weight():
+    """노션에 보이는 비중은 **이 종목 보유분 기준**이다(합 100%). 포트폴리오 전체
+    대비 값(portfolio_weight_*)은 로그엔 남지만 화면엔 안 나온다 — 사용자가 그걸로는
+    해석이 안 된다고 했다."""
     entry = _sell_entry(reason="take_profit_trail")
     entry.update(
         shares_sold=10,
+        shares_before=30,
+        shares_after=20,
         sell_amount=2_000_000.0,
-        portfolio_weight_sold=0.04,
-        portfolio_weight_before=0.12,
+        position_fraction_sold=1 / 3,
+        position_fraction_remaining=2 / 3,
+        portfolio_weight_sold=0.04,  # 이 값이 화면에 새면 안 된다
         portfolio_weight_after=0.08,
     )
 
     properties = notion_sync._sell_row_properties(entry)
 
     assert properties["수량"]["number"] == 10
+    assert properties["잔여수량"]["number"] == 20
     assert properties["매도금액"]["number"] == 2_000_000
-    assert properties["줄인비중"]["number"] == pytest.approx(0.04)
-    assert properties["잔여비중"]["number"] == pytest.approx(0.08)
+    assert properties["매도비중"]["number"] == pytest.approx(0.3333, abs=1e-4)
+    assert properties["잔여비중"]["number"] == pytest.approx(0.6667, abs=1e-4)
+    # 두 값의 합이 100%여야 한 행만 보고 해석된다.
+    assert properties["매도비중"]["number"] + properties["잔여비중"]["number"] == pytest.approx(1.0)
 
 
 def test_sell_row_omits_new_fields_for_older_log_entries():
@@ -593,8 +602,9 @@ def test_sell_row_omits_new_fields_for_older_log_entries():
     properties = notion_sync._sell_row_properties(_sell_entry())
 
     assert "매도금액" not in properties
-    assert "줄인비중" not in properties
+    assert "매도비중" not in properties
     assert "잔여비중" not in properties
+    assert "잔여수량" not in properties
 
 
 def test_ensure_trade_journal_properties_patches_the_existing_db(monkeypatch):
@@ -611,7 +621,7 @@ def test_ensure_trade_journal_properties_patches_the_existing_db(monkeypatch):
     assert notion_sync.ensure_trade_journal_properties("db-1") is True
     assert captured["method"] == "PATCH"
     assert captured["path"] == "/databases/db-1"
-    assert set(captured["body"]["properties"]) == {"매도금액", "줄인비중", "잔여비중"}
+    assert set(captured["body"]["properties"]) == {"매도금액", "매도비중", "잔여비중", "잔여수량"}
 
 
 def test_ensure_trade_journal_properties_reports_failure(monkeypatch):

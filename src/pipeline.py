@@ -807,6 +807,21 @@ async def finalize_sell(
     if shares_sold is None and position.quantity is not None:
         shares_sold = position.quantity - (after.quantity or 0 if after else 0)
 
+    # **이 종목 보유분을 100%로 놓고** 이번에 몇 %를 팔았고 몇 %가 남았는지
+    # (사용자 요청 2026-08-15). 포트폴리오 전체 대비 비중으로 적으면 "1.19% 축소"
+    # 같은 값이 되는데, 그건 읽는 사람에게 아무 의미가 없다 — 일지는 사람이 읽으라고
+    # 쓰는 것이다. 두 값의 합은 항상 1.0이라 한 행만 보고도 해석된다.
+    # 실제 주식수 기준이 가장 명확하지만, 주식수를 추적 안 하는 시뮬레이션 경로에서는
+    # 비중 비율로 떨어진다.
+    shares_before = position.quantity
+    shares_after = (after.quantity if after else 0) or 0
+    if shares_before:
+        position_fraction_sold = (shares_sold or 0) / shares_before
+    elif position.weight:
+        position_fraction_sold = weight_sold / position.weight
+    else:
+        position_fraction_sold = None
+
     realized_pnl_pct = (
         (exit_price - position.entry_price) / position.entry_price if position.entry_price else None
     )
@@ -828,9 +843,15 @@ async def finalize_sell(
             "entry_price": position.entry_price,
             "realized_pnl_pct": realized_pnl_pct,
             "holding_days": holding_days,
-            # 포트폴리오 전체 대비로 이번 매도가 줄인 비중, 그리고 남은 비중
-            # (사용자 요청 2026-08-15 — 익절이 부분 매도라 "얼마나 줄였나"가
-            # sell_fraction만 봐서는 안 보인다).
+            # 이 종목 보유분을 100%로 놓은 비율 — 매매일지에 보이는 건 이 값이다.
+            "position_fraction_sold": position_fraction_sold,
+            "position_fraction_remaining": (
+                1.0 - position_fraction_sold if position_fraction_sold is not None else None
+            ),
+            "shares_before": shares_before,
+            "shares_after": shares_after,
+            # 포트폴리오 전체 대비 비중. 사람이 읽는 값은 위쪽이고 이건 나중에
+            # 포트폴리오 단위로 분석할 때 쓰려고 남겨둔다.
             "portfolio_weight_sold": weight_sold,
             "portfolio_weight_before": position.weight,
             "portfolio_weight_after": after.weight if after else 0.0,
