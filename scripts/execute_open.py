@@ -24,7 +24,6 @@ logs/portfolio_state.json은 이 스크립트 실행 동안 계속 락을 쥐고
 import asyncio
 import json
 import logging
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -121,26 +120,14 @@ async def _execute_pending_buys(portfolio, today_kst):
 
 
 async def _sync_trade_journal() -> None:
-    """logs/trade_journal.jsonl에 방금 쌓인 매도·매수 이벤트를 노션 매매일지로
-    올린다. 일일 리포트(장마감 기준 스냅샷)는 여기서 만들지 않는다 — 그날
-    보유 종목은 09:00 이후 check_stop_loss.py가 장중에도 계속 바꿀 수 있어서,
-    이 시점 스냅샷을 "장마감 기준"이라고 부르면 틀린 라벨이 된다. 일일
-    리포트는 decide_llm_sell.py(15:35, 장마감 후)에서 만든다.
+    """방금 쌓인 매수·매도 이벤트를 노션 매매일지로 올린다.
 
-    워크스페이스가 아직 설정 안 됐으면(scripts/setup_notion_workspace.py
-    미실행) 조용히 건너뛴다 — 노션 연동은 부가 기능이라 이것 때문에
-    execute_open 자체가 실패하면 안 된다."""
-    trade_journal_db_id = os.environ.get("NOTION_TRADE_JOURNAL_DB_ID")
-    if not trade_journal_db_id:
-        logger.info("notion_sync_skipped reason=not_configured")
-        return
-
-    try:
-        summary = await notion_sync.sync_trade_journal(pipeline.DEFAULT_TRADE_JOURNAL_LOG_PATH, trade_journal_db_id)
-        logger.info("notion_sync summary=%s", summary)
-    except Exception as exc:
-        logger.exception("notion_sync_failed")
-        notify.send_telegram_alert(notify.format_error_alert("노션 매매일지 동기화 실패 (매매 자체엔 영향 없음)", repr(exc)))
+    일일 리포트(장마감 기준 스냅샷)는 여기서 만들지 않는다 — 그날 보유 종목은
+    09:00 이후 check_stop_loss.py가 장중에도 계속 바꿀 수 있어서, 이 시점
+    스냅샷을 "장마감 기준"이라고 부르면 틀린 라벨이 된다. 일일 리포트는
+    decide_llm_sell.py(15:35, 장마감 후)에서 만든다.
+    """
+    await notion_sync.sync_trade_journal_if_configured(pipeline.DEFAULT_TRADE_JOURNAL_LOG_PATH)
 
 
 async def main() -> None:

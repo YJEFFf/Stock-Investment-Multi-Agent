@@ -274,12 +274,20 @@ def test_sync_trade_journal_missing_log_file_returns_zeroes(tmp_path):
     assert summary == {"synced": 0, "failed": 0, "skipped": 0}
 
 
-def test_sell_row_children_includes_reasoning_only_when_present():
-    with_reasoning = asyncio.run(notion_sync._sell_row_children(_sell_entry(reasoning="근거 없어짐")))
-    assert len(with_reasoning) == 2
+def test_sell_row_children_includes_reasoning_section_only_when_present():
+    """LLM 재량 매도의 '판단 사유' 절은 reasoning이 있을 때만 붙는다. 다만 본문
+    자체는 이제 reasoning이 없어도 비지 않는다 — 결정론적 매도는 발동 산식이
+    대신 들어간다(_trigger_explanation)."""
+    with_reasoning = json.dumps(
+        asyncio.run(notion_sync._sell_row_children(_sell_entry(reasoning="근거 없어짐"))), ensure_ascii=False
+    )
+    assert "판단 사유" in with_reasoning
+    assert "근거 없어짐" in with_reasoning
 
-    without_reasoning = asyncio.run(notion_sync._sell_row_children(_sell_entry(reasoning=None)))
-    assert without_reasoning == []
+    without_reasoning = json.dumps(
+        asyncio.run(notion_sync._sell_row_children(_sell_entry(reasoning=None))), ensure_ascii=False
+    )
+    assert "판단 사유" not in without_reasoning
 
 
 def test_buy_row_properties_and_children():
@@ -669,3 +677,91 @@ def test_summary_does_not_count_holds_as_gate_rejections(monkeypatch, tmp_path):
     assert "BUY 승인 0개" in all_text
     assert "게이트 거부 1개" in all_text  # position_limit 하나뿐. HOLD 2건은 아니다
     assert "HOLD 2개" in all_text
+
+
+# --- 매도 페이지 본문 (발동 산식) + 사유 라벨 ---
+
+
+def _sell_journal_entry(**overrides) -> dict:
+    entry = {
+        "event": "sell", "day": "2026-08-18", "ticker": "192820",
+        "reason": "take_profit_trail", "reasoning": None,
+        "exit_price": 232000.0, "exit_price_source": "fill", "entry_price": 232000.0,
+        "realized_pnl_pct": 0.0, "holding_days": 6, "peak_price": 250500.0,
+        "take_profit_stage": 3, "position_fraction_sold": 1 / 3,
+        "position_fraction_remaining": 2 / 3, "shares_before": 12, "shares_sold": 4,
+        "shares_after": 8, "sell_amount": 928000.0, "exit_plan": None,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_deterministic_sell_page_explains_what_triggered_it(monkeypatch):
+    """결정론적 매도는 reasoning이 없어서 본문이 늘 비어 있었다 — 왜 팔렸는지가
+    사람이 읽는 자리에 아무것도 안 남았다. 발동 산식을 대신 적어준다."""
+    blocks = asyncio.run(notion_sync._sell_row_children(_sell_journal_entry()))
+    text = json.dumps(blocks, ensure_ascii=False)
+
+    assert "판단 근거" in text
+    assert "250,500" in text  # 트레일링 기준이 된 고점
+    assert "-7.39%" in text or "-7.3" in text  # 고점 대비 하락률
+    assert "232,000" in text  # 진입가
+    assert "12주 → 8주" in text
+
+
+def test_first_take_profit_explains_against_entry_not_peak(monkeypatch):
+    """1회차 익절은 고점이 아니라 진입가 대비 익절선으로 발동한다 — 기준이 다르다."""
+    blocks = asyncio.run(
+        notion_sync._sell_row_children(
+            _sell_journal_entry(take_profit_stage=0, exit_price=278400.0, realized_pnl_pct=0.20)
+        )
+    )
+    text = json.dumps(blocks, ensure_ascii=False)
+
+    assert "익절선" in text
+    assert "고점" not in text
+
+
+def test_stop_loss_page_explains_the_threshold(monkeypatch):
+    blocks = asyncio.run(
+        notion_sync._sell_row_children(
+            _sell_journal_entry(
+                reason="stop_loss", entry_price=255500.0, exit_price=229709.68,
+                realized_pnl_pct=-0.1009, position_fraction_sold=1.0, shares_before=31,
+                shares_sold=31, shares_after=0,
+            )
+        )
+    )
+    text = json.dumps(blocks, ensure_ascii=False)
+
+    assert "손절선" in text
+    assert "전량 매도" in text
+
+
+def test_partial_fill_note_is_carried_into_the_page(monkeypatch):
+    blocks = asyncio.run(
+        notion_sync._sell_row_children(_sell_journal_entry(exit_price_source="fill_partial"))
+    )
+    text = json.dumps(blocks, ensure_ascii=False)
+    assert "되세웠다" in text
+
+
+def test_correction_note_survives_into_the_page(monkeypatch):
+    blocks = asyncio.run(
+        notion_sync._sell_row_children(_sell_journal_entry(correction_note="※ 테스트 교정 기록"))
+    )
+    assert "※ 테스트 교정 기록" in json.dumps(blocks, ensure_ascii=False)
+
+
+def test_breakeven_trailing_exit_is_not_labelled_take_profit():
+    """실현 +0.00%인데 '익절'로 적히면 나중에 익절 건만 모아 성과를 볼 때 오염된다."""
+    assert notion_sync.sell_reason_label(_sell_journal_entry(realized_pnl_pct=0.0)) == "트레일링청산"
+    assert notion_sync.sell_reason_label(_sell_journal_entry(realized_pnl_pct=-0.03)) == "트레일링청산"
+
+
+def test_profitable_trailing_exit_is_still_take_profit():
+    assert notion_sync.sell_reason_label(_sell_journal_entry(realized_pnl_pct=0.0427)) == "익절"
+
+
+def test_stop_loss_label_is_unaffected():
+    assert notion_sync.sell_reason_label(_sell_journal_entry(reason="stop_loss", realized_pnl_pct=-0.10)) == "손절"

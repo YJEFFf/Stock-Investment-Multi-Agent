@@ -888,6 +888,11 @@ async def finalize_sell(
             "entry_price": position.entry_price,
             "realized_pnl_pct": realized_pnl_pct,
             "holding_days": holding_days,
+            # 매도를 발동시킨 값 자체. 이게 없으면 "왜 지금 팔렸나"를 사후에 되짚을 수
+            # 없다 — 트레일링은 진입가가 아니라 고점 대비로 발동하는데, 고점은 부분
+            # 익절마다 리셋돼서 나중에는 어디에도 안 남는다. 매도 시점의 값을 그대로 박는다.
+            "peak_price": position.peak_price,
+            "take_profit_stage": position.take_profit_stage,
             # 이 종목 보유분을 100%로 놓은 비율 — 매매일지에 보이는 건 이 값이다.
             "position_fraction_sold": position_fraction_sold,
             "position_fraction_remaining": position_fraction_remaining,

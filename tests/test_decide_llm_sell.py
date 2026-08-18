@@ -35,6 +35,9 @@ def _no_real_notify_or_name_lookup(monkeypatch):
     # API를 호출해버린다. 노션 동기화 자체는 test_sync_daily_report_* 테스트에서
     # 따로 검증하므로, 그 외 테스트에서는 기본적으로 꺼둔다.
     monkeypatch.delenv("NOTION_DAILY_REPORT_DB_ID", raising=False)
+    # main()이 매매일지 동기화도 부른다(장중 매도를 그날 안에 올리려고) — 같은 이유로
+    # 끈다. 이 키가 살아있으면 테스트가 실제 노션 매매일지에 행을 쓴다.
+    monkeypatch.delenv("NOTION_TRADE_JOURNAL_DB_ID", raising=False)
 
 
 def test_noop_when_not_trading_day(monkeypatch, tmp_path):
@@ -211,3 +214,28 @@ def test_hold_when_judge_sell_returns_none(monkeypatch, tmp_path):
 
     payload = json.loads(dls.PENDING_SELLS_PATH.read_text())
     assert payload["actions"] == []
+
+
+def test_main_syncs_the_trade_journal_before_the_daily_report(monkeypatch, tmp_path):
+    """장중 매도(check_stop_loss, 1분 주기)는 09:00 동기화 이후에 난다. 15:35에도
+    한 번 올려야 그날 안에 매매일지에서 보인다 — 2026-08-18에 13:22 매도 2건이
+    그날 매매일지에 없었던 게 이 때문이다."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
+    portfolio_store.save_portfolio(PortfolioState(cash_weight=1.0))
+
+    calls = []
+
+    async def fake_journal_sync(log_path):
+        calls.append("journal")
+        return {"synced": 1, "failed": 0, "skipped": 0}
+
+    async def fake_report(today_kst, portfolio):
+        calls.append("report")
+
+    monkeypatch.setattr(dls.notion_sync, "sync_trade_journal_if_configured", fake_journal_sync)
+    monkeypatch.setattr(dls, "_sync_daily_report", fake_report)
+
+    asyncio.run(dls.main())
+
+    assert calls == ["journal", "report"]

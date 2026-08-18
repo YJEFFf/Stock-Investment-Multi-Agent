@@ -17,7 +17,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-from src import collectors, translate
+from src import collectors, notify, translate
 from src.schemas import PortfolioState
 
 load_dotenv()
@@ -343,6 +343,7 @@ def create_trade_journal_database(parent_page_id: str) -> str | None:
                     "options": [
                         {"name": "매수", "color": "green"},
                         {"name": "매도", "color": "red"},
+                        {"name": "매수스킵", "color": "gray"},
                     ]
                 }
             },
@@ -352,6 +353,9 @@ def create_trade_journal_database(parent_page_id: str) -> str | None:
                         {"name": "신규매수", "color": "green"},
                         {"name": "손절", "color": "red"},
                         {"name": "익절", "color": "orange"},
+                        # 트레일링이 진입가 아래에서 발동한 청산 — 익절과 섞으면
+                        # 익절 성과만 모아 볼 때 표본이 오염된다(sell_reason_label).
+                        {"name": "트레일링청산", "color": "brown"},
                         {"name": "LLM재량매도", "color": "yellow"},
                     ]
                 }
@@ -433,13 +437,33 @@ async def _buy_row_children(entry: dict) -> list[dict]:
     return blocks
 
 
+def sell_reason_label(entry: dict) -> str:
+    """매도 사유 표시 이름. take_profit_trail은 실현손익 부호에 따라 갈린다.
+
+    트레일링은 1회차 부분 익절 이후 **고점 대비**로 발동하므로 진입가 아래에서도
+    팔린다. 그런데 라벨이 늘 "익절"이라 2026-08-18 코스맥스가 실현 +0.00%인데
+    익절로 기록됐다. 규칙은 의도대로 동작한 것이고(고점에서 밀리면 남은 걸 줄인다)
+    잘못된 건 이름이다 — 수익이 안 난 청산을 익절이라 부르면 나중에 익절 건들만
+    모아 성과를 볼 때 표본이 오염된다.
+
+    매도 규칙 자체는 건드리지 않는다. "수익 중일 때만 익절"로 조건을 걸면 +20%까지
+    갔다가 되돌아온 포지션을 손절선까지 그냥 타고 내려가게 된다.
+    """
+    reason = entry.get("reason")
+    if reason == "take_profit_trail":
+        pnl = entry.get("realized_pnl_pct")
+        if pnl is not None and pnl <= 0:
+            return "트레일링청산"
+    return REASON_LABELS.get(reason, reason)
+
+
 def _sell_row_properties(entry: dict) -> dict:
     properties = {
         "이름": {"title": _rich_text(f"{_display_name(entry['ticker'])} 매도")},
         "날짜": {"date": {"start": entry["day"]}},
         "티커": {"rich_text": _rich_text(entry["ticker"])},
         "구분": {"select": {"name": "매도"}},
-        "사유": {"select": {"name": REASON_LABELS.get(entry["reason"], entry["reason"])}},
+        "사유": {"select": {"name": sell_reason_label(entry)}},
         "가격": {"number": entry["exit_price"]},
     }
     if entry.get("realized_pnl_pct") is not None:
@@ -462,11 +486,83 @@ def _sell_row_properties(entry: dict) -> dict:
     return properties
 
 
+def _trigger_explanation(entry: dict) -> str | None:
+    """이 매도를 발동시킨 산식을 한 문장으로. 못 만들면 None.
+
+    결정론적 매도(손절·트레일링)는 reasoning이 없다 — 코드가 숫자로 판정하니
+    설명할 문장이 애초에 안 만들어진다. 그래서 노션 매도 페이지 본문이 늘 비어
+    있었고, "왜 팔렸나"는 속성의 숫자들로 독자가 직접 역산해야 했다. 매매일지는
+    사람이 읽으라고 쓰는 것이므로 그 역산을 여기서 대신 해준다.
+    """
+    entry_price, exit_price = entry.get("entry_price"), entry.get("exit_price")
+    plan = entry.get("exit_plan") or {}
+    reason = entry.get("reason")
+
+    if reason == "stop_loss" and entry_price and exit_price is not None:
+        threshold = plan.get("stop_loss_pct", -0.10)
+        return (
+            f"진입가 {entry_price:,.0f}원 대비 {(exit_price - entry_price) / entry_price:+.2%}로 "
+            f"손절선({threshold:.2%})에 도달해 전량 매도했다."
+        )
+
+    if reason == "take_profit_trail" and entry_price and exit_price is not None:
+        stage = entry.get("take_profit_stage")
+        peak = entry.get("peak_price")
+        fraction = entry.get("position_fraction_sold")
+        sold = f"보유분의 {fraction:.1%}를 매도했다" if fraction is not None else "일부를 매도했다"
+        # 1회차는 진입가 대비 익절선, 2회차부터는 고점 대비 트레일링이다 — 기준이
+        # 완전히 다른데 사유 라벨은 둘 다 같아서 구분이 안 됐다.
+        if stage and peak:
+            return (
+                f"고점 {peak:,.0f}원 대비 {(exit_price - peak) / peak:+.2%}로 "
+                f"트레일링 문턱({plan.get('trail_pct', -0.07):.2%})에 도달해 {sold}. "
+                f"진입가 {entry_price:,.0f}원 대비 실현손익은 "
+                f"{(exit_price - entry_price) / entry_price:+.2%}다."
+            )
+        return (
+            f"진입가 {entry_price:,.0f}원 대비 {(exit_price - entry_price) / entry_price:+.2%}로 "
+            f"익절선({plan.get('take_profit_pct', 0.20):+.2%})에 도달해 {sold}."
+        )
+
+    return None
+
+
+def _fill_source_note(entry: dict) -> str | None:
+    """체결가·매도금액이 어디서 온 값인지. 브로커 원본이면 굳이 안 적는다."""
+    notes = {
+        "quote_fallback": "체결 조회에 실패해 판단 시점 호가를 청산가로 기록했다 — 실제 체결가와 다를 수 있다.",
+        "fill_partial": "체결 조회가 주문 수량을 다 따라잡지 못해, 관측된 평균 체결가에 실제 매도 수량을 곱해 매도금액을 되세웠다.",
+    }
+    return notes.get(entry.get("exit_price_source"))
+
+
 async def _sell_row_children(entry: dict) -> list[dict]:
-    if not entry.get("reasoning"):
-        return []
-    reasoning_ko = await translate.to_korean(entry["reasoning"], label="translate_sell_reasoning")
-    return [_heading("판단 사유", level=3), _paragraph(_truncate(reasoning_ko))]
+    blocks: list[dict] = []
+
+    explanation = _trigger_explanation(entry)
+    if explanation:
+        blocks.append(_heading("판단 근거", level=3))
+        blocks.append(_paragraph(explanation))
+        if entry.get("shares_before") is not None and entry.get("shares_after") is not None:
+            blocks.append(
+                _paragraph(f"{entry['shares_before']}주 → {entry['shares_after']}주 (이번에 {entry.get('shares_sold', 0)}주)")
+            )
+
+    if entry.get("reasoning"):
+        reasoning_ko = await translate.to_korean(entry["reasoning"], label="translate_sell_reasoning")
+        blocks.append(_heading("판단 사유", level=3))
+        blocks.append(_paragraph(_truncate(reasoning_ko)))
+
+    note = _fill_source_note(entry)
+    if note:
+        blocks.append(_paragraph(note))
+
+    # 소급 교정된 행은 그 사실이 본문에 남아야 한다 — 숫자만 조용히 바뀌면 나중에
+    # 원본과 대조할 수 없다.
+    if entry.get("correction_note"):
+        blocks.append(_paragraph(entry["correction_note"]))
+
+    return blocks
 
 
 def _buy_skipped_row_properties(entry: dict) -> dict:
@@ -570,6 +666,34 @@ async def sync_trade_journal(
     return {"synced": synced, "failed": failed, "skipped": skipped}
 
 
+async def sync_trade_journal_if_configured(log_path: Path) -> dict | None:
+    """매매일지 동기화를 돌리되, 실패해도 호출한 크론 단계를 죽이지 않는다.
+
+    execute_open(09:00)과 decide_llm_sell(15:35)이 둘 다 부른다. 09:00에만
+    돌던 시절엔 장중에 난 매도가 다음 날 아침에야 노션에 나타났다 — 손절은
+    1분마다 발동할 수 있는데 기록은 하루 늦게 보이는 구조였다(2026-08-18,
+    13:22 매도 2건이 그날 매매일지에 없었다).
+
+    워크스페이스가 아직 설정 안 됐으면 조용히 건너뛴다 — 노션 연동은 부가
+    기능이라 이것 때문에 매매 자체가 실패하면 안 된다.
+    """
+    trade_journal_db_id = os.environ.get("NOTION_TRADE_JOURNAL_DB_ID")
+    if not trade_journal_db_id:
+        logger.info("notion_sync_skipped reason=not_configured")
+        return None
+
+    try:
+        summary = await sync_trade_journal(log_path, trade_journal_db_id)
+        logger.info("notion_sync summary=%s", summary)
+        return summary
+    except Exception as exc:  # noqa: BLE001 - 노션이 죽어도 매매 파이프라인은 계속돼야 한다
+        logger.exception("notion_sync_failed")
+        notify.send_telegram_alert(
+            notify.format_error_alert("노션 매매일지 동기화 실패 (매매 자체엔 영향 없음)", repr(exc))
+        )
+        return None
+
+
 # --- 일일 리포트 (장마감 후 그날 하루 요약) ---
 
 
@@ -656,7 +780,7 @@ async def _daily_report_children(
     blocks.append(_heading(f"매도 ({len(sells)}건)", level=2))
     if sells:
         for s in sells:
-            reason_label = REASON_LABELS.get(s["reason"], s["reason"])
+            reason_label = sell_reason_label(s)  # 일일 리포트도 매매일지와 같은 이름을 쓴다
             pnl = f", 실현손익 {s['realized_pnl_pct']:+.2%}" if s.get("realized_pnl_pct") is not None else ""
             amount = f", 매도금액 {s['sell_amount']:,.0f}원" if s.get("sell_amount") is not None else ""
             # "보유분의 몇 %를 팔았고 몇 %가 남았나" — 주식수까지 같이 적어 해석의

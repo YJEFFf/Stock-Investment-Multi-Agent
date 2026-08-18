@@ -127,6 +127,10 @@ async def main() -> None:
         [a["ticker"] for a in actions],
     )
 
+    # 매매일지를 일일 리포트보다 먼저 올린다. 장중 매도(check_stop_loss는 1분마다
+    # 돈다)는 09:00 동기화 이후에 나므로, 여기서 한 번 더 돌려야 그날 안에 보인다.
+    # 안 그러면 오늘 판 종목이 내일 아침에야 매매일지에 나타난다(2026-08-18 실측).
+    await notion_sync.sync_trade_journal_if_configured(pipeline.DEFAULT_TRADE_JOURNAL_LOG_PATH)
     await _sync_daily_report(today_kst, portfolio)
 
 
