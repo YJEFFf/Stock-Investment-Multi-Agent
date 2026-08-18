@@ -637,3 +637,35 @@ def test_added_properties_are_all_declared_in_the_create_schema():
     source = inspect.getsource(notion_sync.create_trade_journal_database)
     for name in notion_sync._TRADE_JOURNAL_ADDED_PROPERTIES:
         assert f'"{name}"' in source
+
+
+def test_summary_does_not_count_holds_as_gate_rejections(monkeypatch, tmp_path):
+    """HOLD는 게이트까지 가지도 않는다 — 거부로 세면 안 된다.
+
+    2026-08-18 리포트가 HOLD 82건을 "게이트 거부 82개"로 적었다. approved=False를
+    거부로 셌기 때문인데, 그러면 어떤 룰도 발동한 적 없는 날과 실제로 룰이 82번
+    걸린 날이 같은 숫자로 보인다. CLAUDE.md 감시 지표가 정확히 그 구분을 요구한다.
+    """
+    monkeypatch.setattr(notion_sync.collectors, "fetch_kospi200_ticker_names", lambda: {})
+
+    portfolio = PortfolioState(positions=[], cash_weight=1.0)
+    blocks = asyncio.run(
+        notion_sync._daily_report_children(
+            "2026-08-18",
+            decisions_today=[
+                {"ticker": "005930", "action": "HOLD", "approved": False, "rejected_by": None, "avg_score": 0.1},
+                {"ticker": "000660", "action": "HOLD", "approved": False, "rejected_by": None, "avg_score": 0.2},
+                {"ticker": "035420", "action": "BUY", "approved": False, "rejected_by": "position_limit", "avg_score": 0.9},
+            ],
+            buys=[],
+            sells=[],
+            skips=[],
+            portfolio=portfolio,
+        )
+    )
+    all_text = json.dumps(blocks, ensure_ascii=False)
+
+    assert "총 3개 종목 판단" in all_text
+    assert "BUY 승인 0개" in all_text
+    assert "게이트 거부 1개" in all_text  # position_limit 하나뿐. HOLD 2건은 아니다
+    assert "HOLD 2개" in all_text

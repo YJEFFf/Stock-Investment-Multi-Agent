@@ -615,11 +615,17 @@ async def _daily_report_children(
     blocks = [_heading("오늘의 판단 요약", level=2)]
     if decisions_today:
         approved_buy_decisions = [d for d in decisions_today if d["action"] == "BUY" and d["approved"]]
-        rejected = sum(1 for d in decisions_today if not d["approved"])
+        # 게이트 거부는 rejected_by가 있는 것만이다. approved=False로 세면 HOLD가
+        # 전부 거부로 잡힌다 — HOLD는 게이트까지 가지도 않는데. 2026-08-18 리포트가
+        # HOLD 82건을 "게이트 거부 82개"로 적었다. 이러면 CLAUDE.md 감시 지표
+        # ("거부 사유별 건수 — 특정 룰만 계속 발동하면 그 룰이 과하다는 뜻")가
+        # 통째로 무의미해진다. 어떤 룰도 발동한 적 없는 날과 구분이 안 되기 때문이다.
+        gate_rejected = sum(1 for d in decisions_today if d.get("rejected_by"))
+        held = sum(1 for d in decisions_today if d["action"] == "HOLD")
         blocks.append(
             _paragraph(
                 f"총 {len(decisions_today)}개 종목 판단 · BUY 승인 {len(approved_buy_decisions)}개 · "
-                f"게이트 거부 {rejected}개 · 나머지는 HOLD"
+                f"게이트 거부 {gate_rejected}개 · HOLD {held}개"
             )
         )
         # 상세 내용은 승인된 매수만 — HOLD/거부 종목까지 전부 나열하면 너무 길다
