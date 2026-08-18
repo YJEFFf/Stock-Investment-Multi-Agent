@@ -681,6 +681,12 @@ async def run_day(
                 "avg_score": avg_score,
                 "avg_confidence": avg_confidence,
                 "reason": decision.reason,
+                # HOLD에도 남긴다. 매니저는 매수 여부와 무관하게 출구 계획을 내는데
+                # (prompts/portfolio_manager.md), 지금까지 그 값은 매수가 성사된
+                # 종목에서만 기록됐다. 그래서 "LLM이 종목마다 손절폭을 실제로 다르게
+                # 잡는가, 아니면 늘 같은 숫자를 뱉는가"를 확인할 방법이 없었다 —
+                # 매수 없는 날이 정상인 시스템에서는 표본이 거의 안 쌓인다.
+                "exit_plan": decision.exit_plan.model_dump(mode="json") if decision.exit_plan else None,
             },
         )
 
