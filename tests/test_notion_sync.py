@@ -157,7 +157,7 @@ def test_sync_trade_journal_creates_rows_for_new_entries(monkeypatch, tmp_path):
     state_path = tmp_path / "notion_sync_state.json"
     summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path))
 
-    assert summary == {"synced": 2, "failed": 0, "skipped": 0}
+    assert summary == {"synced": 2, "updated": 0, "failed": 0, "skipped": 0}
     assert len(captured_bodies) == 2
     assert captured_bodies[0]["parent"] == {"database_id": "db-123"}
     assert captured_bodies[0]["properties"]["구분"] == {"select": {"name": "매수"}}
@@ -183,7 +183,7 @@ def test_sync_trade_journal_handles_buy_skipped_events(monkeypatch, tmp_path):
 
     summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-123", state_path=tmp_path / "state.json"))
 
-    assert summary == {"synced": 1, "failed": 0, "skipped": 0}
+    assert summary == {"synced": 1, "updated": 0, "failed": 0, "skipped": 0}
     props = captured_bodies[0]["properties"]
     assert props["구분"] == {"select": {"name": "매수스킵"}}
     assert props["사유"] == {"select": {"name": "갭초과"}}
@@ -209,7 +209,7 @@ def test_sync_trade_journal_syncs_both_same_day_same_ticker_sells(monkeypatch, t
     state_path = tmp_path / "state.json"
     summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path))
 
-    assert summary == {"synced": 2, "failed": 0, "skipped": 0}
+    assert summary == {"synced": 2, "updated": 0, "failed": 0, "skipped": 0}
     prices = {b["properties"]["가격"]["number"] for b in captured_bodies}
     assert prices == {252000.0, 240500.0}
     assert json.loads(state_path.read_text())["synced_keys"] == sorted(
@@ -233,7 +233,7 @@ def test_sync_trade_journal_keeps_unsuffixed_key_for_single_occurrence(monkeypat
 
     summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path))
 
-    assert summary == {"synced": 0, "failed": 0, "skipped": 1}
+    assert summary == {"synced": 0, "updated": 0, "failed": 0, "skipped": 1}
 
 
 def test_sync_trade_journal_skips_already_synced_entries(monkeypatch, tmp_path):
@@ -251,7 +251,7 @@ def test_sync_trade_journal_skips_already_synced_entries(monkeypatch, tmp_path):
 
     summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path))
 
-    assert summary == {"synced": 0, "failed": 0, "skipped": 1}
+    assert summary == {"synced": 0, "updated": 0, "failed": 0, "skipped": 1}
 
 
 def test_sync_trade_journal_does_not_mark_failed_rows_synced(monkeypatch, tmp_path):
@@ -263,7 +263,7 @@ def test_sync_trade_journal_does_not_mark_failed_rows_synced(monkeypatch, tmp_pa
     state_path = tmp_path / "notion_sync_state.json"
     summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-123", state_path=state_path))
 
-    assert summary == {"synced": 0, "failed": 1, "skipped": 0}
+    assert summary == {"synced": 0, "updated": 0, "failed": 1, "skipped": 0}
     assert json.loads(state_path.read_text())["synced_keys"] == []
 
 
@@ -271,7 +271,7 @@ def test_sync_trade_journal_missing_log_file_returns_zeroes(tmp_path):
     summary = asyncio.run(
         notion_sync.sync_trade_journal(tmp_path / "does_not_exist.jsonl", "db-123", state_path=tmp_path / "state.json")
     )
-    assert summary == {"synced": 0, "failed": 0, "skipped": 0}
+    assert summary == {"synced": 0, "updated": 0, "failed": 0, "skipped": 0}
 
 
 def test_sell_row_children_includes_reasoning_section_only_when_present():
@@ -805,3 +805,137 @@ def test_stop_loss_explanation_says_whether_the_threshold_was_per_ticker():
     )
     assert "종목별 손절선" in per_ticker
     assert "-6.00%" in per_ticker
+
+
+# --- 교정된 항목의 갱신 (일지가 바뀌면 노션도 따라간다) ---
+
+
+def test_corrected_entry_updates_the_existing_page_instead_of_duplicating(monkeypatch, tmp_path):
+    """일지는 소급 교정이 실제로 일어나는 파일이다(체결 원본 복원, 비중 기준 변경).
+    한 번 올리고 끝내면 노션이 조용히 틀린 값을 들고 있게 되고, 그때마다 일회용
+    스크립트로 페이지를 찾아 고치게 된다 — 2026-08까지 그걸 세 번 했다."""
+    log_path = tmp_path / "trade_journal.jsonl"
+    state_path = tmp_path / "state.json"
+    entry = _sell_entry(ticker="036570", day="2026-08-18")
+    _write_jsonl(log_path, [entry])
+
+    requests_made = []
+
+    def fake_request(method, path, body=None):
+        requests_made.append((method, path))
+        if method == "POST" and path == "/pages":
+            return {"id": "page-1"}
+        if method == "GET":
+            return {"results": []}
+        return {"ok": True}
+
+    monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
+
+    first = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-1", state_path=state_path))
+    assert first == {"synced": 1, "updated": 0, "failed": 0, "skipped": 0}
+    assert json.loads(state_path.read_text())["entries"]["sell:036570:2026-08-18"]["page_id"] == "page-1"
+
+    # 바뀐 게 없으면 아무 요청도 안 나간다.
+    requests_made.clear()
+    second = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-1", state_path=state_path))
+    assert second == {"synced": 0, "updated": 0, "failed": 0, "skipped": 1}
+    assert requests_made == []
+
+    # 일지를 교정하면 같은 페이지가 갱신된다 — 새 행이 생기면 안 된다.
+    entry["exit_price"] = 229709.68
+    entry["realized_pnl_pct"] = -0.1009
+    _write_jsonl(log_path, [entry])
+
+    requests_made.clear()
+    third = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-1", state_path=state_path))
+
+    assert third == {"synced": 0, "updated": 1, "failed": 0, "skipped": 0}
+    assert ("POST", "/pages") not in requests_made  # 중복 생성 금지
+    assert ("PATCH", "/pages/page-1") in requests_made
+
+
+def test_legacy_key_without_fingerprint_is_adopted_without_touching_notion(monkeypatch, tmp_path):
+    """page_id·지문을 안 남기던 시절의 상태 파일이 있어도, 안 바뀐 항목 때문에
+    노션을 훑지 않는다. 지문만 심어두고 다음 변경부터 잡는다."""
+    log_path = tmp_path / "trade_journal.jsonl"
+    state_path = tmp_path / "state.json"
+    _write_jsonl(log_path, [_sell_entry(ticker="192820", day="2026-08-14")])
+    state_path.write_text(json.dumps({"synced_keys": ["sell:192820:2026-08-14"]}))
+
+    def fail(*a, **k):
+        raise AssertionError("안 바뀐 항목 때문에 노션을 부르면 안 된다")
+
+    monkeypatch.setattr(notion_sync, "_notion_request", fail)
+
+    summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-1", state_path=state_path))
+
+    assert summary == {"synced": 0, "updated": 0, "failed": 0, "skipped": 1}
+    assert json.loads(state_path.read_text())["entries"]["sell:192820:2026-08-14"]["fingerprint"]
+
+
+def test_legacy_row_is_found_in_notion_when_it_actually_needs_updating(monkeypatch, tmp_path):
+    """page_id가 없는 옛 행이라도, 실제로 교정되면 노션에서 짝을 찾아 갱신한다."""
+    log_path = tmp_path / "trade_journal.jsonl"
+    state_path = tmp_path / "state.json"
+    entry = _sell_entry(ticker="192820", day="2026-08-14")
+    _write_jsonl(log_path, [entry])
+    state_path.write_text(
+        json.dumps({"entries": {"sell:192820:2026-08-14": {"fingerprint": "stale00000000000"}}})
+    )
+
+    requests_made = []
+
+    def fake_request(method, path, body=None):
+        requests_made.append((method, path))
+        if method == "POST" and path.endswith("/query"):
+            return {
+                "results": [
+                    {
+                        "id": "legacy-page",
+                        "properties": {
+                            "구분": {"select": {"name": "매도"}},
+                            "티커": {"rich_text": [{"plain_text": "192820"}]},
+                            "날짜": {"date": {"start": "2026-08-14"}},
+                            "가격": {"number": 200000.0},
+                        },
+                    }
+                ],
+                "has_more": False,
+            }
+        if method == "GET":
+            return {"results": []}
+        return {"ok": True}
+
+    monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
+
+    summary = asyncio.run(notion_sync.sync_trade_journal(log_path, "db-1", state_path=state_path))
+
+    assert summary == {"synced": 0, "updated": 1, "failed": 0, "skipped": 0}
+    assert ("PATCH", "/pages/legacy-page") in requests_made
+    assert json.loads(state_path.read_text())["entries"]["sell:192820:2026-08-14"]["page_id"] == "legacy-page"
+
+
+def test_update_replaces_the_body_instead_of_appending_to_it(monkeypatch, tmp_path):
+    """숫자가 교정된 경우 옛 문장과 새 문장이 나란히 남으면 어느 쪽이 맞는지 알 수 없다."""
+    log_path = tmp_path / "trade_journal.jsonl"
+    state_path = tmp_path / "state.json"
+    entry = _sell_entry(ticker="036570", day="2026-08-18")
+    _write_jsonl(log_path, [entry])
+    state_path.write_text(
+        json.dumps({"entries": {"sell:036570:2026-08-18": {"page_id": "p1", "fingerprint": "stale"}}})
+    )
+
+    deleted = []
+
+    def fake_request(method, path, body=None):
+        if method == "GET":
+            return {"results": [{"id": "old-block-1"}, {"id": "old-block-2"}]}
+        if method == "DELETE":
+            deleted.append(path)
+        return {"ok": True}
+
+    monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
+
+    asyncio.run(notion_sync.sync_trade_journal(log_path, "db-1", state_path=state_path))
+
+    assert deleted == ["/blocks/old-block-1", "/blocks/old-block-2"]

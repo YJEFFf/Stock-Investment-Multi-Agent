@@ -8,6 +8,7 @@ kis.py와 같은 관례: 네트워크·429(rate limit)만 재시도하고, 그 �
 오류, 권한 없음 등)는 재시도해도 같은 응답이 나오므로 즉시 실패로 처리한다.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -608,15 +609,107 @@ def _entry_key(entry: dict, occurrence: int = 0) -> str:
     return base if occurrence == 0 else f"{base}:{occurrence}"
 
 
-def _load_synced_keys(state_path: Path) -> set[str]:
+def _load_sync_state(state_path: Path) -> dict[str, dict]:
+    """키 -> {"page_id", "fingerprint"}.
+
+    이전 형식은 키 목록(synced_keys)만 들고 있어서 "올렸다"는 사실만 알고 그 행이
+    노션 어디에 있는지는 몰랐다. 그래서 일지를 나중에 고쳐도 노션에 반영할 방법이
+    없었고, 교정할 때마다 일회용 스크립트로 페이지를 직접 찾아 고쳤다(2026-08-15
+    비중 재작성, 2026-08-18 체결 재작성, 같은 날 매도 본문 소급 입력 — 세 번).
+    페이지 id를 같이 들고 있으면 그걸 갱신으로 대신할 수 있다.
+
+    옛 키는 page_id 없이 남는다. _resolve_legacy_page_ids가 노션을 한 번 훑어
+    채워준다.
+    """
     if not state_path.exists():
-        return set()
-    return set(json.loads(state_path.read_text()).get("synced_keys", []))
+        return {}
+    raw = json.loads(state_path.read_text())
+    state = {k: dict(v) for k, v in (raw.get("entries") or {}).items()}
+    for key in raw.get("synced_keys", []):
+        state.setdefault(key, {})
+    return state
 
 
-def _save_synced_keys(state_path: Path, keys: set[str]) -> None:
+def _save_sync_state(state_path: Path, state: dict[str, dict]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps({"synced_keys": sorted(keys)}, ensure_ascii=False, indent=2))
+    state_path.write_text(
+        json.dumps(
+            # synced_keys도 계속 쓴다 — 이 버전으로 못 돌아가는 상황(롤백)에서도
+            # 이미 올린 행을 중복 생성하지 않게 한다.
+            {"synced_keys": sorted(state), "entries": {k: v for k, v in sorted(state.items()) if v}},
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def _entry_fingerprint(entry: dict) -> str:
+    """이 항목이 마지막으로 올라간 뒤 내용이 바뀌었는지 판정하는 값.
+
+    렌더링 결과가 아니라 원본 항목 전체를 해싱한다 — 안 쓰는 필드가 바뀌어서
+    불필요한 갱신이 한 번 더 도는 건 싸지만, 렌더링에 쓰는 필드를 나중에 늘렸을 때
+    지문이 안 바뀌어 갱신을 놓치는 건 조용히 틀린다.
+    """
+    return hashlib.sha256(json.dumps(entry, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+
+
+def _page_match_key(entry: dict) -> tuple:
+    """노션에 이미 있는 행을 항목과 짝지을 때 쓰는 값.
+
+    같은 종목을 같은 날 두 번 매도하는 일이 있어서(트레일링) 종목·날짜만으로는
+    안 되고 청산가까지 봐야 구분된다.
+    """
+    return (entry["ticker"], entry["day"], entry["event"], round(entry.get("exit_price") or 0, 2))
+
+
+def _fetch_page_ids_by_match(database_id: str) -> dict[tuple, str]:
+    """노션에 이미 있는 행 전체를 _page_match_key로 색인한다.
+
+    page_id를 안 들고 있던 시절에 올라간 행을 갱신해야 할 때만 부른다 — 매 실행마다
+    돌면 아무것도 안 바뀐 날에도 노션을 통째로 훑게 된다.
+    """
+    by_match: dict[tuple, str] = {}
+    cursor = None
+    while True:
+        body = {"page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        page = _notion_request("POST", f"/databases/{database_id}/query", body)
+        if page is None:
+            logger.warning("notion_page_index_query_failed")
+            return by_match
+        for p in page.get("results", []):
+            props = p["properties"]
+            kind = (props.get("구분", {}).get("select") or {}).get("name")
+            event = {"매수": "buy", "매도": "sell", "매수스킵": "buy_skipped"}.get(kind)
+            if event is None:
+                continue
+            ticker = "".join(x["plain_text"] for x in props.get("티커", {}).get("rich_text", []))
+            day = (props.get("날짜", {}).get("date") or {}).get("start")
+            price = props.get("가격", {}).get("number") if event == "sell" else None
+            by_match[(ticker, day, event, round(price or 0, 2))] = p["id"]
+        if not page.get("has_more"):
+            break
+        cursor = page.get("next_cursor")
+
+    return by_match
+
+
+def _replace_children(page_id: str, children: list[dict]) -> bool:
+    """페이지 본문을 통째로 새로 쓴다.
+
+    없는 것만 덧붙이지 않고 지우고 다시 쓰는 이유: 문장이 **바뀐** 경우(숫자 교정)
+    덧붙이기만 하면 옛 문장과 새 문장이 나란히 남아 어느 쪽이 맞는지 알 수 없다.
+    이 페이지들은 전부 기계가 쓴 것이라 사람이 손으로 덧붙인 내용을 지울 걱정은 없다.
+    """
+    existing = _notion_request("GET", f"/blocks/{page_id}/children?page_size=100", None)
+    if existing is None:
+        return False
+    for block in existing.get("results", []):
+        _notion_request("DELETE", f"/blocks/{block['id']}", None)
+    if children:
+        return _notion_request("PATCH", f"/blocks/{page_id}/children", {"children": children}) is not None
+    return True
 
 
 async def sync_trade_journal(
@@ -630,24 +723,48 @@ async def sync_trade_journal(
     노션에 매번 쿼리해서 중복을 확인하는 대신 로컬 상태를 신뢰한다
     (portfolio_state.json과 같은 패턴). 실패한 이벤트는 키를 안 남기므로
     다음 실행 때 자동으로 재시도된다.
+
+    **내용이 바뀐 항목은 갱신한다.** 일지는 소급 교정이 실제로 일어나는 파일이라
+    (체결 원본으로 되돌리기, 비중 기준 변경) 한 번 올리고 끝내면 노션이 조용히
+    틀린 값을 들고 있게 된다. 그때마다 일회용 스크립트로 페이지를 찾아 고치는 걸
+    세 번 반복한 뒤 여기로 들여왔다.
     """
     if not trade_journal_log_path.exists():
-        return {"synced": 0, "failed": 0, "skipped": 0}
+        return {"synced": 0, "updated": 0, "failed": 0, "skipped": 0}
 
-    synced_keys = _load_synced_keys(state_path)
+    state = _load_sync_state(state_path)
     lines = [line for line in trade_journal_log_path.read_text().splitlines() if line.strip()]
 
+    # 키 -> 항목을 먼저 만들어 둔다. 옛 키의 page_id를 노션에서 찾아 채울 때 필요하다.
     occurrence_counts: dict[tuple[str, str, str], int] = {}
-    synced = 0
-    failed = 0
-    skipped = 0
+    entries: dict[str, dict] = {}
     for line in lines:
         entry = json.loads(line)
         group = (entry["event"], entry["ticker"], entry["day"])
         occurrence = occurrence_counts.get(group, 0)
         occurrence_counts[group] = occurrence + 1
-        key = _entry_key(entry, occurrence)
-        if key in synced_keys:
+        entries[_entry_key(entry, occurrence)] = entry
+
+    # page_id를 안 들고 있던 시절의 행을 찾아야 할 때만 채운다(지연 조회).
+    page_index: dict[tuple, str] | None = None
+
+    synced = 0
+    failed = 0
+    skipped = 0
+    updated = 0
+    for key, entry in entries.items():
+        record = state.get(key)
+        fingerprint = _entry_fingerprint(entry)
+
+        # 지문이 없는 옛 키는 "그때 올린 내용이 지금과 같다"고 보고 지문만 채운다.
+        # 노션을 뒤져 실제로 대조할 수도 있지만, 아무것도 안 바뀐 날에도 매번 전체를
+        # 훑게 된다. 여기서 지문을 심어두면 **이 다음** 변경부터는 정확히 잡힌다.
+        if record is not None and not record.get("fingerprint"):
+            state[key] = {**record, "fingerprint": fingerprint}
+            skipped += 1
+            continue
+
+        if record is not None and record.get("fingerprint") == fingerprint:
             skipped += 1
             continue
 
@@ -661,22 +778,47 @@ async def sync_trade_journal(
             properties = _sell_row_properties(entry)
             children = await _sell_row_children(entry)
 
-        result = _notion_request(
-            "POST",
-            "/pages",
-            {"parent": {"database_id": database_id}, "properties": properties, "children": children},
-        )
-        if result is None:
-            logger.warning("notion_sync_row_failed key=%s", key)
-            failed += 1
+        if record is None:
+            result = _notion_request(
+                "POST",
+                "/pages",
+                {"parent": {"database_id": database_id}, "properties": properties, "children": children},
+            )
+            if result is None:
+                logger.warning("notion_sync_row_failed key=%s", key)
+                failed += 1
+                continue
+            state[key] = {"page_id": result["id"], "fingerprint": fingerprint}
+            synced += 1
             continue
 
-        synced_keys.add(key)
-        synced += 1
+        page_id = record.get("page_id")
+        if not page_id:
+            if page_index is None:
+                page_index = _fetch_page_ids_by_match(database_id)
+            page_id = page_index.get(_page_match_key(entry))
+        if not page_id:
+            # 노션에서 짝을 못 찾았다. 새로 만들면 중복 행이 되므로 손대지 않는다 —
+            # 조용히 넘어가되 로그로는 보이게 한다.
+            logger.warning("notion_sync_update_skipped key=%s reason=page_id_unknown", key)
+            skipped += 1
+            continue
 
-    _save_synced_keys(state_path, synced_keys)
-    logger.info("notion_sync_done synced=%d failed=%d skipped=%d", synced, failed, skipped)
-    return {"synced": synced, "failed": failed, "skipped": skipped}
+        ok = _notion_request("PATCH", f"/pages/{page_id}", {"properties": properties}) is not None
+        ok = _replace_children(page_id, children) and ok
+        if not ok:
+            logger.warning("notion_sync_row_update_failed key=%s page_id=%s", key, page_id)
+            failed += 1
+            continue
+        state[key] = {"page_id": page_id, "fingerprint": fingerprint}
+        updated += 1
+        logger.info("notion_sync_row_updated key=%s", key)
+
+    _save_sync_state(state_path, state)
+    logger.info(
+        "notion_sync_done synced=%d updated=%d failed=%d skipped=%d", synced, updated, failed, skipped
+    )
+    return {"synced": synced, "updated": updated, "failed": failed, "skipped": skipped}
 
 
 async def sync_trade_journal_if_configured(log_path: Path) -> dict | None:
