@@ -765,3 +765,43 @@ def test_profitable_trailing_exit_is_still_take_profit():
 
 def test_stop_loss_label_is_unaffected():
     assert notion_sync.sell_reason_label(_sell_journal_entry(reason="stop_loss", realized_pnl_pct=-0.10)) == "손절"
+
+
+def test_legacy_sell_without_trigger_values_does_not_invent_a_threshold():
+    """peak_price/take_profit_stage를 남기기 전(2026-08-18 이전)에 쌓인 매도 기록은
+    어느 문턱이 발동했는지 알 수 없다. 그때 '익절선 +20%에 도달'이라고 쓰면
+    실제로는 +0.00%에 팔린 건이 +20%에 팔린 것처럼 읽힌다 — 지어내지 않는다."""
+    entry = _sell_journal_entry()
+    del entry["peak_price"]
+    del entry["take_profit_stage"]
+
+    text = json.dumps(asyncio.run(notion_sync._sell_row_children(entry)), ensure_ascii=False)
+
+    assert "+0.00%" in text
+    assert "익절선" not in text
+    assert "트레일링 문턱" not in text
+    assert "남아 있지 않다" in text
+
+
+def test_stop_loss_explanation_says_whether_the_threshold_was_per_ticker():
+    """LLM이 정한 문턱으로 잘린 건지 고정 기본값으로 잘린 건지 구분돼야 한다."""
+    fixed = json.dumps(
+        asyncio.run(notion_sync._sell_row_children(_sell_journal_entry(reason="stop_loss", exit_plan=None))),
+        ensure_ascii=False,
+    )
+    assert "고정 기본 손절선" in fixed
+
+    per_ticker = json.dumps(
+        asyncio.run(
+            notion_sync._sell_row_children(
+                _sell_journal_entry(
+                    reason="stop_loss",
+                    exit_plan={"stop_loss_pct": -0.06, "take_profit_pct": 0.12,
+                               "take_profit_fraction": 0.25, "trail_pct": -0.04},
+                )
+            )
+        ),
+        ensure_ascii=False,
+    )
+    assert "종목별 손절선" in per_ticker
+    assert "-6.00%" in per_ticker

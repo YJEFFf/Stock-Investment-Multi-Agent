@@ -499,28 +499,41 @@ def _trigger_explanation(entry: dict) -> str | None:
     reason = entry.get("reason")
 
     if reason == "stop_loss" and entry_price and exit_price is not None:
+        # exit_plan이 없는 포지션은 sell.DEFAULT_EXIT_PLAN으로 잘린 것이다(plan_for).
+        # 추정이 아니라 실제로 적용된 값이지만, LLM이 정한 문턱인지 고정 기본값인지는
+        # 나중에 성과를 갈라볼 때 필요하므로 문장에 드러낸다.
         threshold = plan.get("stop_loss_pct", -0.10)
+        origin = "종목별 손절선" if plan else "고정 기본 손절선"
         return (
             f"진입가 {entry_price:,.0f}원 대비 {(exit_price - entry_price) / entry_price:+.2%}로 "
-            f"손절선({threshold:.2%})에 도달해 전량 매도했다."
+            f"{origin}({threshold:.2%})에 도달해 전량 매도했다."
         )
 
     if reason == "take_profit_trail" and entry_price and exit_price is not None:
         stage = entry.get("take_profit_stage")
         peak = entry.get("peak_price")
+        pnl = (exit_price - entry_price) / entry_price
         fraction = entry.get("position_fraction_sold")
         sold = f"보유분의 {fraction:.1%}를 매도했다" if fraction is not None else "일부를 매도했다"
+
         # 1회차는 진입가 대비 익절선, 2회차부터는 고점 대비 트레일링이다 — 기준이
-        # 완전히 다른데 사유 라벨은 둘 다 같아서 구분이 안 됐다.
-        if stage and peak:
+        # 완전히 다르다. 어느 쪽이었는지 모르면 문턱을 지어내지 않는다: 이 두 필드가
+        # 없는 옛 기록에 "익절선 +20%에 도달"이라고 쓰면 실제로는 +0.00%에 팔린
+        # 건이 +20%에 팔린 것처럼 읽힌다.
+        if stage is None or (stage and not peak):
+            return (
+                f"진입가 {entry_price:,.0f}원 대비 {pnl:+.2%}에 청산됐다. "
+                "이 기록에는 발동 기준값(고점·익절 단계)이 남아 있지 않다 — 그 값을 "
+                "매매일지에 남기기 시작한 2026-08-18 이전 매도다."
+            )
+        if stage:
             return (
                 f"고점 {peak:,.0f}원 대비 {(exit_price - peak) / peak:+.2%}로 "
                 f"트레일링 문턱({plan.get('trail_pct', -0.07):.2%})에 도달해 {sold}. "
-                f"진입가 {entry_price:,.0f}원 대비 실현손익은 "
-                f"{(exit_price - entry_price) / entry_price:+.2%}다."
+                f"진입가 {entry_price:,.0f}원 대비 실현손익은 {pnl:+.2%}다."
             )
         return (
-            f"진입가 {entry_price:,.0f}원 대비 {(exit_price - entry_price) / entry_price:+.2%}로 "
+            f"진입가 {entry_price:,.0f}원 대비 {pnl:+.2%}로 "
             f"익절선({plan.get('take_profit_pct', 0.20):+.2%})에 도달해 {sold}."
         )
 
