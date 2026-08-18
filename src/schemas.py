@@ -97,6 +97,9 @@ class FillRecord(BaseModel):
 
     quantity: int = Field(gt=0)
     amount: float = Field(gt=0)  # 실제 체결 총액(원)
+    complete: bool = True  # 주문 수량만큼 다 잡혔는가. False면 체결이 더 있었는데
+    # 조회가 못 따라잡은 것이라 quantity·amount가 실제보다 **작다** (kis.fill_after_order).
+    # 이 값으로 판단하는 쪽은 수량을 상태 차이에서 다시 뽑아야 한다.
 
     @property
     def price(self) -> float:

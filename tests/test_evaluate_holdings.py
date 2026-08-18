@@ -466,3 +466,46 @@ def test_position_fractions_always_sum_to_one(monkeypatch, tmp_path):
     assert (
         entry["position_fraction_sold"] + entry["position_fraction_remaining"] == pytest.approx(1.0)
     )
+
+
+def test_journal_does_not_trust_a_fill_that_missed_part_of_the_order(monkeypatch, tmp_path):
+    """2026-08-18 036570 재현. 31주 손절이 다 나갔는데 체결 조회가 19주만 잡았고,
+    그 값을 그대로 믿는 바람에 일지에 "61.3% 매도 / 38.7% 잔여"와 "잔여 0주"가
+    같은 행에 실렸다. 잔여를 1-매도로 되계산한 탓에 합만 1.0으로 맞아떨어져
+    한 행만 봐서는 틀린 걸 알 수 없었다.
+
+    덜 잡힌 체결(complete=False)이면 수량은 집행 전후 상태 차이에서 다시 뽑고,
+    총액은 관측된 평균 단가로 되세운다."""
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 229_500.0)  # 판단 시점 호가
+    monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
+
+    # 주문 직전 0주 -> 조회 시점엔 19주만 잡힘(실제로는 31주가 다 체결됐다).
+    totals = iter([(0, 0.0), (19, 4_364_500.0)])
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: next(totals))
+
+    position = _position(
+        ticker="036570", entry_price=255_500.0, peak_price=255_500.0, weight=0.08,
+        entry_day=DAY.date(), quantity=31,
+    )
+    portfolio = PortfolioState(positions=[position], cash_weight=0.92)
+    trade_journal_log_path = tmp_path / "trade_journal.jsonl"
+
+    asyncio.run(
+        pipeline.evaluate_holdings(
+            portfolio, DAY, sell.execute_sell_order,
+            log_path=tmp_path / "sell.jsonl", trade_journal_log_path=trade_journal_log_path,
+        )
+    )
+
+    entry = json.loads(trade_journal_log_path.read_text().strip())
+    assert entry["reason"] == "stop_loss"
+    # 체결 조회가 19주만 잡았어도 실제로 나간 건 31주다.
+    assert entry["shares_before"] == 31
+    assert entry["shares_sold"] == 31
+    assert entry["shares_after"] == 0
+    assert entry["position_fraction_sold"] == pytest.approx(1.0)
+    assert entry["position_fraction_remaining"] == pytest.approx(0.0)  # "38.7% 잔여"가 아니다
+    # 총액은 19주분 4,364,500원이 아니라 단가 x 실제 수량으로 되세운 값.
+    assert entry["sell_amount"] == pytest.approx(31 * (4_364_500 / 19))
+    assert entry["sell_amount_source"] == "estimated"
+    assert entry["exit_price_source"] == "fill_partial"

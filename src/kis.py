@@ -419,6 +419,68 @@ def fill_between(
     return FillRecord(quantity=qty, amount=amount)
 
 
+FILL_POLL_TIMEOUT_S = 12.0
+FILL_POLL_INTERVAL_S = 1.5
+
+
+def fill_after_order(
+    ticker: str,
+    order_date: date,
+    side: str,
+    before: tuple[int, float] | None,
+    expected_quantity: int,
+    timeout_s: float | None = None,
+    poll_interval_s: float | None = None,
+) -> FillRecord | None:
+    """주문 직후, 주문 수량이 다 체결될 때까지 기다렸다가 그 주문의 체결 내역을 낸다.
+
+    주문 직후 **한 번만** 조회하면 안 되는 이유 (2026-08-18 실측): 036570 손절
+    31주가 여러 번에 나뉘어 체결되는 사이에 스냅샷이 찍혀 19주/4,364,500원만
+    잡혔다. 브로커 실제 체결은 31주/7,121,000원이었고, 매매일지에서 12주·
+    2,756,500원이 통째로 빠졌다. 같은 날 4주짜리 익절은 한 번에 체결돼 멀쩡했다 —
+    주문이 클수록 걸리고, 작은 주문만 보고 있으면 안 드러난다.
+
+    expected_quantity에 도달하면 즉시 반환한다(대부분 첫 조회에서 끝난다).
+    타임아웃까지 못 채우면 그때까지 잡힌 만큼을 complete=False로 반환한다 —
+    체결량을 지어내지 않되, "덜 잡혔다"는 사실은 남겨야 호출부가 상태 차이로
+    되짚을 수 있다.
+    """
+    if before is None:
+        return None
+
+    # 기본값을 인자 기본값으로 박지 않고 여기서 읽는다 — 그래야 테스트가 모듈 상수만
+    # 바꿔서 대기 시간을 줄일 수 있다(안 그러면 목킹된 테스트가 매번 실제로 기다린다).
+    timeout_s = FILL_POLL_TIMEOUT_S if timeout_s is None else timeout_s
+    poll_interval_s = FILL_POLL_INTERVAL_S if poll_interval_s is None else poll_interval_s
+
+    deadline = time.monotonic() + timeout_s
+    best: FillRecord | None = None
+    while True:
+        after = fetch_daily_fill_totals(ticker, order_date, side)
+        fill = fill_between(before, after)
+        if fill is not None:
+            best = fill
+            if fill.quantity >= expected_quantity:
+                return fill
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval_s, remaining))
+
+    if best is None:
+        return None
+    logger.warning(
+        "kis_fill_incomplete ticker=%s side=%s expected=%d observed=%d timeout_s=%.1f",
+        ticker,
+        side,
+        expected_quantity,
+        best.quantity,
+        timeout_s,
+    )
+    return best.model_copy(update={"complete": False})
+
+
 def fetch_holdings() -> dict[str, tuple[int, float]] | None:
     """브로커가 보고하는 보유 종목 전체: {종목코드: (보유수량, 매입평균가)}.
 

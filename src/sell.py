@@ -195,8 +195,11 @@ async def execute_sell_order(
         logger.error("execute_sell_order_failed ticker=%s reason=order_rejected", action.ticker)
         return portfolio, None
 
-    after = await asyncio.to_thread(kis.fetch_daily_fill_totals, action.ticker, today, "sell")
-    fill = kis.fill_between(before, after)
+    # 주문 수량이 다 잡힐 때까지 기다린다 — 시장가는 여러 번에 나뉘어 체결되고,
+    # 곧바로 조회하면 그 중 일부만 잡힌다(kis.fill_after_order docstring, 2026-08-18).
+    fill = await asyncio.to_thread(
+        kis.fill_after_order, action.ticker, today, "sell", before, shares_to_sell
+    )
     if fill is None:
         logger.warning(
             "execute_sell_order_fill_unverified ticker=%s order_no=%s reason=fill_totals_unavailable_or_unchanged",

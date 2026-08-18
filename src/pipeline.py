@@ -274,8 +274,12 @@ async def execute_buy_order(
     # 호가 210,000에 주문돼 232,000에 체결됐는데 진입가는 210,000으로 남았고,
     # 그 결과 실제 +6.6% 지점에서 익절이 +20%로 오판돼 발동했다(2026-08-15 실측).
     # 그래서 브로커 쪽 출처를 두 개 순서대로 쓰고, 호가는 마지막 수단으로 민다.
-    fills_after = await asyncio.to_thread(kis.fetch_daily_fill_totals, ticker, _kst_today(), "buy")
-    fill = kis.fill_between(fills_before, fills_after)
+    # 주문 수량이 다 잡힐 때까지 기다렸다가 잰다(kis.fill_after_order, 2026-08-18).
+    # 매수는 체결가만 쓰므로 부분 체결이어도 평균가는 크게 안 틀리지만, 여러 단가로
+    # 나뉘어 체결된 주문의 앞부분만 보면 그 오차가 포지션 수명 내내 진입가에 남는다.
+    fill = await asyncio.to_thread(
+        kis.fill_after_order, ticker, _kst_today(), "buy", fills_before, quantity
+    )
     fill_price = fill.price if fill is not None else None
     entry_price_source = "fill"
     if fill_price is None:
@@ -761,6 +765,23 @@ async def evaluate_holdings(
     return portfolio
 
 
+def _sell_amount(fill: FillRecord | None, shares_sold: int | None, current_price: float) -> float | None:
+    """매매일지에 적을 매도 총액. 출처 우선순위는 체결 원본 > 체결 단가 x 수량 > 호가.
+
+    가운데 단계가 필요한 이유: 체결 조회가 주문 수량을 다 못 따라잡으면 브로커
+    총액도 그만큼 작다. 2026-08-18 036570은 31주가 다 나갔는데 19주분
+    4,364,500원만 잡혀 2,756,500원이 일지에서 빠졌다. 관측된 평균 단가
+    (229,710원)는 실제 평균(229,710원)과 거의 같았으므로, 단가에 실제 수량을
+    곱하는 쪽이 훨씬 정확하다.
+    """
+    if fill is not None and fill.complete:
+        return fill.amount
+    if shares_sold:
+        unit_price = fill.price if fill is not None else current_price
+        return shares_sold * unit_price
+    return None
+
+
 async def finalize_sell(
     portfolio: PortfolioState,
     action: SellAction,
@@ -785,7 +806,14 @@ async def finalize_sell(
     # 적으면 실현손익률·매도금액이 전부 실제와 어긋난다. 체결 조회가 실패했거나
     # 시뮬레이션 경로라 체결 자체가 없으면 호가로 밀되, 그 사실을 출처로 남긴다.
     exit_price = fill.price if fill is not None else current_price
-    exit_price_source = "fill" if fill is not None else "quote_fallback"
+    if fill is None:
+        exit_price_source = "quote_fallback"
+    elif fill.complete:
+        exit_price_source = "fill"
+    else:
+        # 덜 잡힌 체결이라도 가중평균 단가 자체는 실제 체결의 일부라 호가보다 훨씬
+        # 낫다. 다만 총액은 못 쓴다 — 아래 sell_amount에서 단가 x 수량으로 되세운다.
+        exit_price_source = "fill_partial"
 
     _append_log(
         log_path,
@@ -803,7 +831,11 @@ async def finalize_sell(
     # 일어난 일이 적혀야 한다. 포지션이 통째로 사라졌으면 전량 매도된 것이다.
     after = next((p for p in portfolio.positions if p.ticker == action.ticker), None)
     weight_sold = position.weight - (after.weight if after else 0.0)
-    shares_sold = fill.quantity if fill is not None else None
+    # 체결 조회가 주문 수량을 다 못 따라잡았으면(complete=False) fill.quantity는 실제보다
+    # 작다 — 그 값을 쓰면 일지가 "31주 중 19주 매도, 잔여 0주" 같은 모순이 된다
+    # (2026-08-18 036570 실측). 그럴 땐 집행 전후 상태 차이가 더 믿을 만한 출처다.
+    fill_covers_order = fill is not None and fill.complete
+    shares_sold = fill.quantity if fill_covers_order else None
     if shares_sold is None and position.quantity is not None:
         shares_sold = position.quantity - (after.quantity or 0 if after else 0)
 
@@ -817,10 +849,17 @@ async def finalize_sell(
     shares_after = (after.quantity if after else 0) or 0
     if shares_before:
         position_fraction_sold = (shares_sold or 0) / shares_before
+        # 잔여는 1 - 매도로 되계산하지 않고 **잔여 주식수에서 직접** 뽑는다. 되계산하면
+        # 매도 수량이 어떤 이유로든 틀렸을 때 잔여까지 같이 틀리면서 합만 1.0으로
+        # 맞아떨어져, 한 행만 봐서는 틀린 걸 알 수 없다 — 실제로 "38.7% 잔여"와
+        # "잔여 0주"가 같은 행에 실렸다(2026-08-18 036570).
+        position_fraction_remaining = shares_after / shares_before
     elif position.weight:
         position_fraction_sold = weight_sold / position.weight
+        position_fraction_remaining = 1.0 - position_fraction_sold
     else:
         position_fraction_sold = None
+        position_fraction_remaining = None
 
     realized_pnl_pct = (
         (exit_price - position.entry_price) / position.entry_price if position.entry_price else None
@@ -845,9 +884,7 @@ async def finalize_sell(
             "holding_days": holding_days,
             # 이 종목 보유분을 100%로 놓은 비율 — 매매일지에 보이는 건 이 값이다.
             "position_fraction_sold": position_fraction_sold,
-            "position_fraction_remaining": (
-                1.0 - position_fraction_sold if position_fraction_sold is not None else None
-            ),
+            "position_fraction_remaining": position_fraction_remaining,
             "shares_before": shares_before,
             "shares_after": shares_after,
             # 포트폴리오 전체 대비 비중. 사람이 읽는 값은 위쪽이고 이건 나중에
@@ -856,12 +893,13 @@ async def finalize_sell(
             "portfolio_weight_before": position.weight,
             "portfolio_weight_after": after.weight if after else 0.0,
             "shares_sold": shares_sold,
-            # 체결 총액도 브로커 원본을 그대로 쓴다 — 수량 x 단가로 되계산하면
-            # 부분 체결이 여러 단가로 나뉘었을 때 어긋난다.
-            "sell_amount": (
-                fill.amount
-                if fill is not None
-                else (shares_sold * current_price if shares_sold else None)
+            # 체결 총액은 브로커 원본을 그대로 쓴다 — 수량 x 단가로 되계산하면
+            # 부분 체결이 여러 단가로 나뉘었을 때 어긋난다. 단, 조회가 주문 수량을
+            # 다 못 따라잡았으면 그 총액은 실제보다 작으므로 쓰지 않고, 관측된
+            # 평균 단가에 실제 매도 수량을 곱해 되세운다.
+            "sell_amount": _sell_amount(fill, shares_sold, current_price),
+            "sell_amount_source": (
+                "fill" if fill_covers_order else ("estimated" if fill is not None else "quote_fallback")
             ),
             # 이 포지션에 실제로 적용된 출구 규칙 — LLM이 정한 값인지 고정 기본값인지
             # 나중에 성과를 갈라볼 때 필요하다.
