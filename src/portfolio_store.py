@@ -43,18 +43,30 @@ def save_portfolio(portfolio: PortfolioState, path: Path | None = None) -> None:
     os.replace(tmp_path, path)
 
 
+class PortfolioLockBusy(Exception):
+    """blocking=False로 락을 요청했는데 다른 프로세스가 이미 쥐고 있다."""
+
+
 @contextmanager
-def portfolio_lock(lock_path: Path | None = None):
+def portfolio_lock(lock_path: Path | None = None, *, blocking: bool = True):
     """logs/portfolio_state.json의 읽고-고치고-쓰는 구간을 감싸는 락.
 
     하루 여러 스크립트(장 시작 집행이 하루 한 번, 손절 체크가 1분마다)가 같은
     상태 파일을 건드리게 되면서 필요해졌다 — 락 없이 두 프로세스가 동시에
     읽고-고치고-쓰면 나중에 쓴 쪽이 먼저 쓴 쪽의 변경을 덮어써 버릴 수 있다.
-    fcntl.flock은 블로킹이라 락을 못 잡으면 그냥 기다린다(재시도 로직 불필요)."""
+
+    blocking=False면 락이 잡혀 있을 때 기다리지 않고 PortfolioLockBusy를 올린다.
+    1분마다 도는 잡(check_stop_loss)에 필요하다: KIS가 죽어서 한 번 도는 데
+    1분이 넘게 걸리면(최악 25.5초/요청 × 보유 종목수, kis.RETRY_BACKOFF_SECONDS)
+    블로킹 락으로는 매분 새 프로세스가 줄줄이 쌓인다. 이미 도는 회차가 어차피
+    같은 일을 하므로 이번 분은 건너뛰는 게 맞다."""
     lock_path = lock_path or PORTFOLIO_LOCK_PATH
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise PortfolioLockBusy(str(lock_path)) from exc
         try:
             yield
         finally:

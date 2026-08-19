@@ -7,6 +7,7 @@
 
 import multiprocessing
 import time
+from pathlib import Path
 
 import pytest
 
@@ -77,3 +78,48 @@ def test_portfolio_lock_serializes_concurrent_writers(tmp_path):
     p2.join(timeout=5)
 
     assert int(counter_path.read_text()) == 2
+
+
+# --- 논블로킹 락 (2026-08-19) ---
+
+
+def _hold_lock(lock_path, acquired, release):
+    """다른 프로세스에서 락을 잡고 신호를 준 뒤 버틴다 (모듈 레벨이어야 pickle 된다)."""
+    from src.portfolio_store import portfolio_lock
+
+    with portfolio_lock(Path(lock_path)):
+        acquired.set()
+        release.wait(timeout=10)
+
+
+def test_portfolio_lock_non_blocking_raises_when_held(tmp_path):
+    """1분 잡이 앞 회차와 겹치면 기다리지 않고 즉시 포기해야 한다.
+
+    블로킹으로 두면 KIS 장애 때(최악 25.5초/요청 × 보유 종목수) 매분 새
+    프로세스가 락 앞에 줄줄이 쌓인다.
+    """
+    from src.portfolio_store import PortfolioLockBusy, portfolio_lock
+
+    lock_path = tmp_path / "portfolio.lock"
+    acquired = multiprocessing.Event()
+    release = multiprocessing.Event()
+    proc = multiprocessing.Process(target=_hold_lock, args=(str(lock_path), acquired, release))
+    proc.start()
+    try:
+        assert acquired.wait(timeout=15), "상대 프로세스가 락을 못 잡았다"
+
+        started = time.monotonic()
+        with pytest.raises(PortfolioLockBusy):
+            with portfolio_lock(lock_path, blocking=False):
+                pass
+        assert time.monotonic() - started < 0.5  # 기다리지 않았다
+    finally:
+        release.set()
+        proc.join(timeout=15)
+
+
+def test_portfolio_lock_non_blocking_succeeds_when_free(tmp_path):
+    from src.portfolio_store import portfolio_lock
+
+    with portfolio_lock(tmp_path / "portfolio.lock", blocking=False):
+        pass  # 아무도 안 쥐고 있으면 그냥 잡힌다

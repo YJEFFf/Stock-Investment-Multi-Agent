@@ -24,7 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import notify, pipeline, sell  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
-from src.portfolio_store import load_portfolio, portfolio_lock, save_portfolio  # noqa: E402
+from src.portfolio_store import (  # noqa: E402
+    PortfolioLockBusy,
+    load_portfolio,
+    portfolio_lock,
+    save_portfolio,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("check_stop_loss")
@@ -51,13 +56,19 @@ async def main() -> None:
 
     day = datetime.now(timezone.utc)
 
-    with portfolio_lock():
-        portfolio = load_portfolio()
-        if not portfolio.positions:
-            return
+    # 앞 회차가 아직 돌고 있으면 이번 분은 건너뛴다 — 기다리면 KIS 장애 때
+    # 매분 새 프로세스가 쌓인다(portfolio_lock docstring). 도는 회차가 같은
+    # 평가를 하므로 건너뛰어도 놓치는 게 없다.
+    try:
+        with portfolio_lock(blocking=False):
+            portfolio = load_portfolio()
+            if not portfolio.positions:
+                return
 
-        portfolio = await pipeline.evaluate_holdings(portfolio, day, sell.execute_sell_order)
-        save_portfolio(portfolio)
+            portfolio = await pipeline.evaluate_holdings(portfolio, day, sell.execute_sell_order)
+            save_portfolio(portfolio)
+    except PortfolioLockBusy:
+        logger.info("check_stop_loss_skipped reason=previous_run_still_holding_lock")
 
 
 if __name__ == "__main__":
