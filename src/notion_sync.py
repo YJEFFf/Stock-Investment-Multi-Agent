@@ -54,6 +54,7 @@ REASON_LABELS = {
     "balance_unavailable": "잔고조회실패",
     "quantity_zero": "수량0",
     "order_rejected": "주문거부",
+    "order_response_lost": "주문응답유실",
 }
 
 

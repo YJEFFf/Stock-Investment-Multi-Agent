@@ -518,3 +518,58 @@ def test_execute_sell_simulated_never_reports_a_fill():
     _updated, fill = asyncio.run(sell.execute_sell_simulated(portfolio, action, current_price=90.0))
 
     assert fill is None
+
+
+# --- 매도 주문 응답 유실 (2026-08-19) ---
+
+
+def test_execute_sell_order_records_sell_when_response_lost_but_fill_appears(monkeypatch):
+    """응답만 유실되고 매도는 체결된 경우 — 판 것으로 기록해야 한다.
+
+    안 팔린 걸로 두면 실제로는 없는 주식을 계속 보유로 들고 있게 되고,
+    다음 손절 평가가 존재하지 않는 포지션을 상대로 돈다.
+    """
+    import asyncio
+
+    from src.schemas import SellAction
+
+    order_calls = {"n": 0}
+
+    def lost(ticker, qty):
+        order_calls["n"] += 1
+        raise kis.OrderResponseLost("read timeout")
+
+    monkeypatch.setattr(kis, "place_market_sell_order", lost)
+    totals = iter([(0, 0.0), (30, 2700.0)])
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: next(totals, (30, 2700.0)))
+
+    position = _position(weight=0.10, entry_price=100.0, quantity=30)
+    portfolio = PortfolioState(positions=[position], cash_weight=0.90)
+    action = SellAction(ticker="005930", reason="stop_loss", sell_fraction=1.0)
+
+    updated, fill = asyncio.run(sell.execute_sell_order(portfolio, action, current_price=90.0))
+
+    assert order_calls["n"] == 1  # 재전송 금지
+    assert updated.positions == []
+    assert fill is not None and fill.quantity == 30
+
+
+def test_execute_sell_order_keeps_position_when_response_lost_and_no_fill(monkeypatch):
+    """응답 유실 + 체결 흔적 없음 = 주문이 안 나갔다. 포지션을 그대로 둔다."""
+    import asyncio
+
+    from src.schemas import SellAction
+
+    monkeypatch.setattr(kis, "place_market_sell_order", lambda t, q: (_ for _ in ()).throw(
+        kis.OrderResponseLost("read timeout")
+    ))
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: (0, 0.0))
+
+    position = _position(weight=0.10, entry_price=100.0, quantity=30)
+    portfolio = PortfolioState(positions=[position], cash_weight=0.90)
+    action = SellAction(ticker="005930", reason="stop_loss", sell_fraction=1.0)
+
+    updated, fill = asyncio.run(sell.execute_sell_order(portfolio, action, current_price=90.0))
+
+    assert updated == portfolio
+    assert fill is None

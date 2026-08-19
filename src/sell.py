@@ -190,16 +190,34 @@ async def execute_sell_order(
     today = datetime.now(KST).date()
     before = await asyncio.to_thread(kis.fetch_daily_fill_totals, action.ticker, today, "sell")
 
-    order_no = await asyncio.to_thread(kis.place_market_sell_order, action.ticker, shares_to_sell)
-    if order_no is None:
-        logger.error("execute_sell_order_failed ticker=%s reason=order_rejected", action.ticker)
-        return portfolio, None
+    try:
+        order_no = await asyncio.to_thread(kis.place_market_sell_order, action.ticker, shares_to_sell)
+    except kis.OrderResponseLost:
+        # 매도 주문을 보냈는데 응답을 못 받았다. 재전송하면 두 번 팔리므로 하지
+        # 않는다 — 아래 체결 조회로 실제 접수 여부를 가른다. 매수(pipeline)와
+        # 대칭이되 방향이 더 위험하다: 팔렸는데 안 팔린 걸로 두면 없는 주식을
+        # 계속 리스크 관리 대상으로 들고 있게 된다.
+        logger.error(
+            "execute_sell_order_response_lost ticker=%s shares=%d", action.ticker, shares_to_sell
+        )
+        order_no = None
+    else:
+        if order_no is None:
+            logger.error("execute_sell_order_failed ticker=%s reason=order_rejected", action.ticker)
+            return portfolio, None
 
     # 주문 수량이 다 잡힐 때까지 기다린다 — 시장가는 여러 번에 나뉘어 체결되고,
     # 곧바로 조회하면 그 중 일부만 잡힌다(kis.fill_after_order docstring, 2026-08-18).
     fill = await asyncio.to_thread(
         kis.fill_after_order, action.ticker, today, "sell", before, shares_to_sell
     )
+    if order_no is None and fill is None:
+        # 응답 유실 + 원장에 체결 흔적 없음 = 주문이 접수되지 않았다고 본다.
+        # 포지션을 그대로 두는 쪽이 안전하다 — 안 팔렸는데 판 걸로 기록하면
+        # 실제로는 남아 있는 주식이 리스크 관리에서 사라진다.
+        logger.error("execute_sell_order_failed ticker=%s reason=order_response_lost", action.ticker)
+        return portfolio, None
+
     if fill is None:
         logger.warning(
             "execute_sell_order_fill_unverified ticker=%s order_no=%s reason=fill_totals_unavailable_or_unchanged",

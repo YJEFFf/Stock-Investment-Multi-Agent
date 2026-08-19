@@ -10,7 +10,7 @@ CLAUDE.md 규칙 7: 모의투자 도메인(openapivts)만 호출한다. 실전�
 실측으로 확인한 것 (2026-08-08, 모의투자 계좌):
 - 토큰 발급은 1분당 1회로 제한된다 (EGW00133) — 그래서 파일 캐시가 필요하다.
 - 시세 조회는 초당 거래건수 제한이 있고, 걸리면 HTTP 500 + rt_cd="1" +
-  msg_cd="EGW00201"로 응답한다 (msg1 텍스트가 아니라 msg_cd로 판별하는 게 안전).
+  msg_cd="EGW00201"로 응답한다.
 - inquire-daily-itemchartprice는 조회 기간을 얼마나 넓게 잡아도 최근 100
   거래일로 캡핑된다.
 
@@ -25,6 +25,18 @@ CLAUDE.md 규칙 7: 모의투자 도메인(openapivts)만 호출한다. 실전�
   봤다. 체결가 조회(inquire-daily-ccld)의 output1(주문별 체결 내역) 필드명은
   실제 체결 건이 없어 확인 못 했고, 대신 output2(집계, pchs_avg_pric 등 필드명
   확인됨)로 우회한다. 장중에 실제 매수가 한 번 나가면 이 부분을 재검증할 것.
+
+실측으로 확인한 것 (2026-08-19, 유량 제한):
+- 모의투자 유량 한도는 **초당 2건**이다. 잔고조회를 간격 없이 5연타하면 1·2번은
+  정상, 3번부터 EGW00201이 온다.
+- 용량 거부에는 **층이 둘 있다.** 같은 잔고조회 엔드포인트인데 게이트웨이 한도는
+  msg_cd="EGW00201" + "초당 거래건수를 초과하였습니다"이고, 원장 쪽은 "원장에서
+  허용 가능한 초당 거래건수를 초과하였습니다"라는 다른 문구로 온다(msg_cd는 당시
+  로그에 안 남아 미상 — 그래서 kis_api_error가 이제 msg_cd를 찍는다).
+- 원장 거부는 **우리 호출 속도와 무관하다.** 09:00:07에 초당 1건으로, 그 시점
+  원장을 건드린 유일한 호출이 거부됐다 — 호출 한 건이 "초당 건수 초과"로 막혔다는
+  건 그 카운터가 계좌 단위일 수 없다는 뜻이다(전체 모의투자 이용자 공유). 장 마감
+  후 20여 회를 일부러 한도 넘겨가며 때려도 이 문구는 재현되지 않았다.
 """
 
 import json
@@ -62,11 +74,33 @@ ACCOUNT_PRODUCT_CODE = "01"  # 실측으로 확인됨 — 계좌번호 뒤 2자�
 TOKEN_CACHE_PATH = Path(__file__).resolve().parent.parent / ".kis_token_cache.json"
 
 REQUEST_TIMEOUT_SECONDS = 10.0
-MAX_RETRIES = 3
-RATE_LIMIT_BACKOFF_SECONDS = 1.5
-MIN_REQUEST_SPACING_SECONDS = 1.0  # 실측: 0.3초 간격은 부족했다
-RATE_LIMIT_MSG_CODE = "EGW00201"
+MAX_ATTEMPTS = 5
+# 1.5 → 3 → 6 → 10초 (누적 20.5초). 09:00 장 시작 직후 모의투자 원장이 순간적으로
+# 유량을 막는 구간을 넘기려면 이 정도는 버텨야 한다 — 2026-08-19에 09:00:07의
+# 0.06초짜리 거부 한 번이 재시도 없이 그날 유일한 승인 매수를 날렸다.
+RETRY_BACKOFF_SECONDS = (1.5, 3.0, 6.0, 10.0)
+MIN_REQUEST_SPACING_SECONDS = 1.0  # 실측: 0.3초 간격은 부족했다. 모의투자 한도는 초당 2건(2026-08-19)
+
+# 용량 거부(= 다시 보내면 통과할 수 있는 "지금 바빠서 안 됨")를 가리는 기준.
+# msg_cd가 1순위다. msg1 문구 매칭은 원장 거부의 msg_cd를 아직 실측하지 못해서
+# 두는 한시적 보조 수단이고, kis_api_error 로그가 이제 msg_cd를 남기므로 실제
+# 코드가 관측되는 즉시 CAPACITY_MSG_CODES로 옮기고 이 문구 매칭은 걷어낸다.
+CAPACITY_MSG_CODES = frozenset({"EGW00201"})
+CAPACITY_MSG1_MARKERS = ("초당 거래건수",)
+
 TOKEN_EXPIRY_SAFETY_MARGIN = timedelta(minutes=5)
+
+
+class OrderResponseLost(Exception):
+    """주문을 보냈지만 응답을 받지 못했다 — 접수됐는지 알 수 없는 상태.
+
+    주문 POST는 멱등이 아니라 재전송할 수 없다(같은 종목을 두 번 산다). 그런데
+    "응답이 없다"와 "접수가 거부됐다"는 전혀 다른 사건이다 — 전자는 브로커에
+    포지션이 생겼는데 우리 상태엔 없는 경우를 포함한다. 둘을 None으로 뭉뚱그리면
+    호출부가 구분할 수 없으므로 예외로 올린다. 실제 접수 여부를 원장(체결 조회)으로
+    확인하는 건 호출부 책임이다.
+    """
+
 
 _token_lock = threading.Lock()
 _throttle_lock = threading.Lock()
@@ -138,15 +172,48 @@ def _throttle() -> None:
         _last_request_at = time.monotonic()
 
 
-def _kis_request(
-    method: str, path: str, tr_id: str, *, params: dict | None = None, body: dict | None = None
-) -> dict | None:
-    """공통 KIS 요청(GET/POST). 초당 거래건수 제한(EGW00201)만 재시도 대상이다.
+def _backoff_seconds(attempt: int) -> float:
+    """attempt번째 시도 직후 쉴 시간. 표를 넘어가면 마지막 값을 계속 쓴다."""
+    return RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS)) - 1]
 
-    네트워크 예외도 재시도 대상(규칙 4)이지만, 그 외 API 비즈니스 오류
-    (rt_cd != "0", 예: 잘못된 종목코드)는 재시도해도 같은 응답이 나오므로
-    즉시 실패로 처리한다 — "결과가 마음에 안 들어서 재시도"와 구분되는,
-    "재시도해도 바뀌지 않는 실패"다.
+
+def _is_capacity_rejection(data: dict) -> bool:
+    """다시 보내면 통과할 수 있는 용량 거부인가.
+
+    같은 잔고조회 엔드포인트가 층에 따라 다른 문구를 돌려준다(2026-08-19 실측):
+    게이트웨이 한도는 msg_cd=EGW00201 "초당 거래건수를 초과하였습니다",
+    원장 쪽은 "원장에서 허용 가능한 초당 거래건수를 초과하였습니다"(msg_cd 미상).
+    코드 하나만 화이트리스트로 두면 후자가 영구 실패로 오분류된다 — 실제로
+    그 오분류가 2026-08-19 승인 매수를 통째로 날렸다.
+    """
+    if data.get("msg_cd") in CAPACITY_MSG_CODES:
+        return True
+    msg1 = data.get("msg1") or ""
+    return any(marker in msg1 for marker in CAPACITY_MSG1_MARKERS)
+
+
+def _kis_request(
+    method: str,
+    path: str,
+    tr_id: str,
+    *,
+    params: dict | None = None,
+    body: dict | None = None,
+    idempotent: bool = True,
+) -> dict | None:
+    """공통 KIS 요청(GET/POST).
+
+    재시도 대상은 "다시 보내면 통과할 수 있는 실패"뿐이다 — 네트워크 예외와
+    용량 거부(_is_capacity_rejection). 비즈니스 오류(rt_cd != "0", 예: 잘못된
+    종목코드·잔고 부족)는 몇 번을 보내도 같은 답이라 즉시 실패로 처리한다.
+    CLAUDE.md 규칙 4의 "수집 실패는 재시도 OK, 결과가 마음에 안 들어 재시도는
+    금지"와 같은 구분선이다.
+
+    **idempotent=False는 주문 전용이다(_kis_post).** 주문 POST는 재전송하면 같은
+    종목을 두 번 사므로 한 번만 보낸다. 이때 용량 거부·비즈니스 오류는 브로커가
+    "안 받았다"고 답한 것이라 그대로 None을 돌려주면 되지만, 네트워크 예외는
+    접수 여부를 알 수 없는 상태라 OrderResponseLost로 올린다 — 호출부가 원장에서
+    확인해야 한다.
     """
     token = get_access_token()
     if token is None:
@@ -162,8 +229,9 @@ def _kis_request(
     if body is not None:
         headers["custtype"] = "P"
 
+    max_attempts = MAX_ATTEMPTS if idempotent else 1
     last_error: Exception | str | None = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_attempts + 1):
         _throttle()
         try:
             if method == "GET":
@@ -176,24 +244,33 @@ def _kis_request(
                 )
             data = response.json()
         except (requests.RequestException, ValueError) as exc:
+            if not idempotent:
+                logger.error("kis_order_response_lost path=%s error=%s", path, exc)
+                raise OrderResponseLost(str(exc)) from exc
             last_error = exc
             logger.warning("kis_fetch_failed path=%s attempt=%d error=%s", path, attempt, exc)
-            if attempt < MAX_RETRIES:
-                time.sleep(RATE_LIMIT_BACKOFF_SECONDS * attempt)
+            if attempt < max_attempts:
+                time.sleep(_backoff_seconds(attempt))
             continue
 
-        if data.get("msg_cd") == RATE_LIMIT_MSG_CODE:
-            last_error = "rate_limited"
-            logger.warning("kis_rate_limited path=%s attempt=%d", path, attempt)
-            if attempt < MAX_RETRIES:
-                time.sleep(RATE_LIMIT_BACKOFF_SECONDS * attempt)
+        if data.get("rt_cd") == "0":
+            return data
+
+        msg_cd, msg1 = data.get("msg_cd"), (data.get("msg1") or "").strip()
+
+        if _is_capacity_rejection(data):
+            last_error = f"capacity_rejected msg_cd={msg_cd}"
+            logger.warning(
+                "kis_rate_limited path=%s attempt=%d msg_cd=%s msg=%s", path, attempt, msg_cd, msg1
+            )
+            if attempt < max_attempts:
+                time.sleep(_backoff_seconds(attempt))
             continue
 
-        if data.get("rt_cd") != "0":
-            logger.error("kis_api_error path=%s msg=%s", path, data.get("msg1"))
-            return None
-
-        return data
+        # msg_cd를 반드시 함께 남긴다 — 이게 없으면 새로운 용량 거부가 나타나도
+        # 어떤 코드를 화이트리스트에 넣어야 하는지 사후에 알 방법이 없다.
+        logger.error("kis_api_error path=%s msg_cd=%s msg=%s", path, msg_cd, msg1)
+        return None
 
     logger.error("kis_fetch_exhausted path=%s error=%s", path, last_error)
     return None
@@ -204,7 +281,8 @@ def _kis_get(path: str, tr_id: str, params: dict) -> dict | None:
 
 
 def _kis_post(path: str, tr_id: str, body: dict) -> dict | None:
-    return _kis_request("POST", path, tr_id, body=body)
+    """주문 접수 전용. 재시도하지 않는다 — _kis_request docstring 참고."""
+    return _kis_request("POST", path, tr_id, body=body, idempotent=False)
 
 
 def _parse_daily_chart(data: dict) -> list[OHLCVBar]:

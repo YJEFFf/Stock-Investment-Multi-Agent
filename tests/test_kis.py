@@ -365,3 +365,99 @@ def test_fetch_fill_price_returns_none_when_request_fails(monkeypatch):
     monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params: None)
 
     assert kis.fetch_fill_price("005930", date(2026, 8, 9)) is None
+
+
+# --- 용량 거부 분류 / 주문 재시도 금지 (2026-08-19) ---
+
+LEDGER_LIMITED_RESPONSE = {
+    "rt_cd": "1",
+    "msg_cd": "UNKNOWN_LEDGER_CODE",
+    "msg1": "원장에서 허용 가능한 초당 거래건수를 초과하였습니다.",
+}
+
+
+def test_is_capacity_rejection_matches_both_layers():
+    """게이트웨이 한도(EGW00201)와 원장 한도는 문구가 다르다 — 둘 다 잡아야 한다."""
+    assert kis._is_capacity_rejection(RATE_LIMITED_RESPONSE)
+    assert kis._is_capacity_rejection(LEDGER_LIMITED_RESPONSE)
+    assert not kis._is_capacity_rejection(BAD_TICKER_RESPONSE)
+
+
+def test_kis_get_retries_on_ledger_capacity_rejection(monkeypatch):
+    """msg_cd를 모르는 원장 거부도 재시도 대상이다.
+
+    2026-08-19에 이게 rt_cd != "0" 분기로 떨어져 재시도 0회로 실패했고,
+    그날 유일한 승인 매수(012450)가 집행되지 못했다.
+    """
+    monkeypatch.setattr(kis, "get_access_token", lambda: "tok")
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    responses = [FakeResponse(LEDGER_LIMITED_RESPONSE), FakeResponse(FAKE_CHART_RESPONSE)]
+    monkeypatch.setattr(kis.requests, "get", lambda *a, **k: responses.pop(0))
+
+    assert kis._kis_get("/some/path", "TRID", {}) == FAKE_CHART_RESPONSE
+
+
+def test_kis_post_does_not_retry_capacity_rejection(monkeypatch):
+    """주문은 재전송하면 두 번 체결될 수 있어 한 번만 보낸다.
+
+    용량 거부는 브로커가 "안 받았다"고 답한 것이라 그대로 실패로 돌린다.
+    """
+    monkeypatch.setattr(kis, "get_access_token", lambda: "tok")
+    calls = {"n": 0}
+
+    class FakeResponse:
+        def json(self):
+            return RATE_LIMITED_RESPONSE
+
+    def fake_post(*a, **k):
+        calls["n"] += 1
+        return FakeResponse()
+
+    monkeypatch.setattr(kis.requests, "post", fake_post)
+
+    assert kis._kis_post("/some/path", "TRID", {}) is None
+    assert calls["n"] == 1
+
+
+def test_kis_post_raises_order_response_lost_without_resending(monkeypatch):
+    """응답을 못 받은 주문은 접수 여부를 알 수 없다 — 재전송 금지, 예외로 올린다."""
+    monkeypatch.setattr(kis, "get_access_token", lambda: "tok")
+    calls = {"n": 0}
+
+    def fake_post(*a, **k):
+        calls["n"] += 1
+        raise requests.ConnectionError("read timeout")
+
+    monkeypatch.setattr(kis.requests, "post", fake_post)
+
+    with pytest.raises(kis.OrderResponseLost):
+        kis._kis_post("/some/path", "TRID", {})
+    assert calls["n"] == 1
+
+
+def test_kis_get_still_retries_network_errors(monkeypatch):
+    """조회는 멱등이라 네트워크 예외를 계속 재시도한다(규칙 4)."""
+    monkeypatch.setattr(kis, "get_access_token", lambda: "tok")
+    calls = {"n": 0}
+
+    class FakeResponse:
+        def json(self):
+            return FAKE_CHART_RESPONSE
+
+    def fake_get(*a, **k):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise requests.ConnectionError("down")
+        return FakeResponse()
+
+    monkeypatch.setattr(kis.requests, "get", fake_get)
+
+    assert kis._kis_get("/some/path", "TRID", {}) == FAKE_CHART_RESPONSE
+    assert calls["n"] == 3

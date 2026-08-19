@@ -457,3 +457,69 @@ def test_later_sources_are_not_queried_once_a_price_is_found(monkeypatch, tmp_pa
 
     assert daily_calls == []
     assert balance_calls == []
+
+
+# --- 주문 응답 유실 (2026-08-19) ---
+
+
+def _raise_response_lost(ticker, qty):
+    raise kis.OrderResponseLost("read timeout")
+
+
+def test_records_position_when_order_response_lost_but_fill_appears(monkeypatch, tmp_path):
+    """응답만 유실되고 주문은 살아 있던 경우 — 포지션으로 기록해야 한다.
+
+    여기서 그냥 포기하면 브로커엔 주식이 있는데 우리 상태엔 없어서, 그 보유가
+    손절·익절 평가 대상에서 통째로 빠진다.
+    """
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)
+    monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
+    monkeypatch.setattr(kis, "place_market_buy_order", _raise_response_lost)
+
+    totals = iter([(0, 0.0), (10, 1020.0)])
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: next(totals, (10, 1020.0)))
+
+    portfolio = PortfolioState(cash_weight=1.0)
+    log_path = tmp_path / "trade_journal.jsonl"
+    result = asyncio.run(
+        pipeline.execute_buy_order(
+            _decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08, log_path=log_path
+        )
+    )
+
+    assert len(result.positions) == 1
+    assert result.positions[0].ticker == TICKER
+    assert result.positions[0].entry_price == pytest.approx(102.0)  # 1020.0 / 10주
+
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert entries[0]["event"] == "buy"
+
+
+def test_skips_when_order_response_lost_and_no_fill(monkeypatch, tmp_path):
+    """응답 유실 + 원장에 체결 흔적 없음 = 주문이 안 나갔다고 본다. 재전송하지 않는다."""
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)
+    monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
+
+    order_calls = {"n": 0}
+
+    def order(ticker, qty):
+        order_calls["n"] += 1
+        raise kis.OrderResponseLost("read timeout")
+
+    monkeypatch.setattr(kis, "place_market_buy_order", order)
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: (0, 0.0))
+
+    portfolio = PortfolioState()
+    log_path = tmp_path / "trade_journal.jsonl"
+    result = asyncio.run(
+        pipeline.execute_buy_order(
+            _decision(), GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08, log_path=log_path
+        )
+    )
+
+    assert result == portfolio
+    assert order_calls["n"] == 1  # 재전송 금지
+    entries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert entries[0]["reason"] == "order_response_lost"

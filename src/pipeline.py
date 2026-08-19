@@ -263,11 +263,21 @@ async def execute_buy_order(
     # 섞이지 않는다. 집계 하나만 사후 조회하면 두 건이 합산돼버린다.
     fills_before = await asyncio.to_thread(kis.fetch_daily_fill_totals, ticker, _kst_today(), "buy")
 
-    order_no = await asyncio.to_thread(kis.place_market_buy_order, ticker, quantity)
-    if order_no is None:
-        logger.error("execute_buy_order_failed ticker=%s reason=order_rejected", ticker)
-        _log_buy_skip(log_path, today, ticker, "order_rejected")
-        return portfolio
+    try:
+        order_no = await asyncio.to_thread(kis.place_market_buy_order, ticker, quantity)
+    except kis.OrderResponseLost:
+        # 주문은 나갔는데 응답을 못 받았다. 재전송하면 두 번 사므로 하지 않는다 —
+        # 실제 접수 여부는 아래에서 원장(체결 조회)으로 가른다. 여기서 그냥
+        # 포기해버리면 브로커엔 포지션이 있는데 우리 상태엔 없는, 손절·익절
+        # 대상에서 통째로 빠진 보유가 생긴다.
+        logger.error("execute_buy_order_response_lost ticker=%s quantity=%d", ticker, quantity)
+        order_no = None
+    else:
+        if order_no is None:
+            # 브로커가 응답으로 거부했다 — 주문이 안 나간 게 확실하다.
+            logger.error("execute_buy_order_failed ticker=%s reason=order_rejected", ticker)
+            _log_buy_skip(log_path, today, ticker, "order_rejected")
+            return portfolio
 
     # 진입가는 손절·익절 판정의 유일한 기준점이라 반드시 **실제 체결가**여야 한다.
     # 주문 직전 호가로 폴백하면 그 오차가 포지션 수명 내내 남는다 — 192820이
@@ -280,6 +290,14 @@ async def execute_buy_order(
     fill = await asyncio.to_thread(
         kis.fill_after_order, ticker, _kst_today(), "buy", fills_before, quantity
     )
+    if order_no is None and fill is None:
+        # 응답 유실 + 원장에 체결 흔적 없음 = 주문이 접수되지 않았다고 본다.
+        # 체결이 잡혔다면(fill is not None) 주문은 살아 있는 것이므로 아래 정상
+        # 경로로 그대로 내려가 포지션으로 기록된다.
+        logger.error("execute_buy_order_failed ticker=%s reason=order_response_lost", ticker)
+        _log_buy_skip(log_path, today, ticker, "order_response_lost")
+        return portfolio
+
     fill_price = fill.price if fill is not None else None
     entry_price_source = "fill"
     if fill_price is None:
