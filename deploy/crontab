@@ -1,0 +1,27 @@
+# SIMA 운영 크론 — EC2(ubuntu) 기준. 시스템 TZ는 Asia/Seoul이라 아래 시각은 전부 KST다.
+#
+# 적용:  ssh sima-ec2 'cd ~/sima && crontab deploy/crontab && crontab -l'
+#
+# 이 파일이 원본이다. EC2에서 `crontab -e`로 직접 고치지 말 것 —
+# crontab은 git 밖에 있어서 직접 고치면 변경 흔적이 파일 mtime과 syslog에만 남는다.
+# 2026-08-19 execute_open을 09:00에서 09:01로 옮긴 변경이 정확히 그렇게 유실될 뻔했다
+# (docs/CHANGELOG.md 2026-08-20 항목).
+
+# 08:30 — 매수 판단만. 집행 안 함. 개장 30분 전.
+30 8 * * 1-5    /home/ubuntu/sima/scripts/decide_buys.sh
+
+# 09:01 — 전날 매도 → 오늘 매수 집행 + 노션 매매일지 동기화.
+# 09:00이 아니라 09:01인 이유: 개장 직후 KIS 모의투자 원장이 용량을 떨어뜨린다.
+# 2026-08-19 09:00:07에 잔고 조회가 "원장에서 허용 가능한 초당 거래건수를
+# 초과하였습니다"로 거부돼 그날 유일한 승인 매수가 통째로 날아갔다. 1분 비켜서면
+# 그 구간을 피한다. 되돌리지 말 것.
+1 9 * * 1-5     /home/ubuntu/sima/scripts/execute_open.sh
+
+# 09:00–15:30 매분 — 결정론적 손절/익절만. LLM 없음.
+# 앞 회차가 아직 돌고 있으면 그 분은 스스로 건너뛴다(커밋 246efbc).
+* 9-14 * * 1-5  /home/ubuntu/sima/scripts/check_stop_loss.sh
+0-30 15 * * 1-5 /home/ubuntu/sima/scripts/check_stop_loss.sh
+
+# 15:35 — 보유 종목 LLM 재량 매도 판단만(pending_sells.json). 집행은 다음 거래일 09:01.
+# 직후 노션 일일 리포트 동기화 — 이 시점 portfolio가 그날의 진짜 장마감 스냅샷이다.
+35 15 * * 1-5   /home/ubuntu/sima/scripts/decide_llm_sell.sh
