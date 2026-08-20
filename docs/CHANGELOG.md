@@ -137,9 +137,31 @@ CLAUDE.md 감시 지표는 "관망일이 절반 이상"을 정상으로 본다. 
 쓰이고 production(`judgment.judge`)은 안 탄다 — 참고로 오늘 최고 avg_score는
 0.45라 그 문턱이 켜져 있었다면 아무것도 안 샀을 것이다.
 
-**아직 아무 조치도 하지 않았다.** 규칙 2·3 때문에 목표 개수나 상위 N을 도입하는
-방향은 막혀 있고, 문턱을 임의로 올리는 것도 사용자 결정 사항이다.
-20영업일이 쌓이는 시점(대략 9월 초)에 다시 보고 판단한다.
+**조치하지 않고 데이터를 더 쌓기로 확정했다(사용자, 2026-08-20).** 규칙 2·3 때문에
+목표 개수나 상위 N을 도입하는 방향은 애초에 막혀 있고, 표본 6일로 문턱을 건드리면
+그거야말로 근거 없이 문턱을 움직이는 것이다. 20영업일이 쌓이는 시점(대략 9월 초)에
+다시 본다.
+
+### EC2 정리 — 쓰이지 않던 `run_daily.sh` 삭제
+
+레포 루트에 `run_daily.sh`가 untracked로 남아 있었다(2026-08-10자). 크론탭·레포·홈
+어디서도 참조하지 않고, 스크립트 진입점 로그(`run_daily_start`)는 **2026-08-11
+09:10 한 번뿐**이다 — decide_buys/execute_open으로 쪼개기 전의 유물이다.
+(cron.log에 매일 찍히는 `run_daily_filtered`는 `decide_buys`가 부르는
+`pipeline.run_daily()` **함수** 로그라서 이것과 무관하다. 헷갈리기 쉬워서 적어둔다.)
+
+내용은 4줄이었고 필요하면 이걸로 복구된다:
+
+```bash
+#!/bin/bash
+cd $HOME/sima
+export PATH="$HOME/.local/bin:$PATH"
+uv run python scripts/run_daily.py >> $HOME/sima/logs/cron.log 2>&1
+```
+
+`scripts/run_daily.py`는 레포에 그대로 둔다(tracked, `tests/test_run_daily.py`가 씀).
+지운 건 크론이 안 부르는 래퍼 하나뿐이고, 이제 EC2 워킹트리가 깨끗하다 —
+남은 `scripts/*.sh` 4개가 크론탭이 부르는 것과 정확히 일치한다.
 
 ---
 
