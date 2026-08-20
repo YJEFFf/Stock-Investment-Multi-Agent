@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypeVar
+from zoneinfo import ZoneInfo
 
 import anthropic
 from anthropic import AsyncAnthropic
@@ -25,6 +26,8 @@ MAX_STRUCTURED_RETRIES = 2
 # pipeline.py의 DEFAULT_LOG_PATH/DEFAULT_SELL_LOG_PATH와 같은 패턴(호출부에서 override 가능).
 DEFAULT_LLM_CALL_LOG_PATH = Path("logs/llm_calls.jsonl")
 
+KST = ZoneInfo("Asia/Seoul")
+
 _client = AsyncAnthropic(max_retries=3, timeout=30.0)
 
 T = TypeVar("T", bound=BaseModel)
@@ -34,6 +37,28 @@ def _append_call_log(log_path: Path, entry: dict) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a") as f:
         f.write(json.dumps(entry, default=str) + "\n")
+
+
+def _call_log_entry(label: str, model: str, **fields) -> dict:
+    """호출 로그 한 줄. timestamp(UTC)와 day(KST)를 **둘 다** 남긴다.
+
+    timestamp만으로는 일별 집계가 하루씩 밀린다: 매수 판단 cron은 08:30 KST인데
+    그건 UTC로 전날 23:30이라, 하루 호출의 대부분(분석가·토론·매니저 수백 건)이
+    전날 몫으로 잡히고 그날엔 15:35 KST 매도 판단분만 남는다. 2026-08-20이
+    실제로 그랬다 — 파일상 35건, 실제로는 그 10배 이상. CLAUDE.md 감시 지표의
+    "분석가별 호출 수·토큰 사용량"이 그대로 틀린 숫자가 된다.
+    pipeline.jsonl이 같은 이유로 이미 KST를 쓴다(2026-08-13, 커밋 832fb8b) —
+    "하루"의 경계는 장이 도는 시간대 기준으로 통일한다. timestamp를 KST로
+    바꾸지 않고 day를 더하는 이유는 기존 줄과의 비교 가능성을 깨지 않기 위해서다.
+    """
+    now = datetime.now(timezone.utc)
+    return {
+        "timestamp": now.isoformat(),
+        "day": now.astimezone(KST).date().isoformat(),
+        "label": label,
+        "model": model,
+        **fields,
+    }
 
 
 async def call_structured(
@@ -94,17 +119,16 @@ async def call_structured(
         if response.stop_reason == "refusal":
             _append_call_log(
                 log_path,
-                {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "label": label,
-                    "model": model,
-                    "attempts": attempt,
-                    "input_tokens": total_input_tokens,
-                    "output_tokens": total_output_tokens,
-                    "elapsed_s": round(time.monotonic() - start, 2),
-                    "success": False,
-                    "error": "refusal",
-                },
+                _call_log_entry(
+                    label,
+                    model,
+                    attempts=attempt,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    elapsed_s=round(time.monotonic() - start, 2),
+                    success=False,
+                    error="refusal",
+                ),
             )
             raise RuntimeError(f"LLM refused the request: {response.stop_reason}")
 
@@ -119,32 +143,30 @@ async def call_structured(
 
         _append_call_log(
             log_path,
-            {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "label": label,
-                "model": model,
-                "attempts": attempt,
-                "input_tokens": total_input_tokens,
-                "output_tokens": total_output_tokens,
-                "elapsed_s": round(time.monotonic() - start, 2),
-                "success": True,
-            },
+            _call_log_entry(
+                label,
+                model,
+                attempts=attempt,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                elapsed_s=round(time.monotonic() - start, 2),
+                success=True,
+            ),
         )
         return result
 
     _append_call_log(
         log_path,
-        {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "label": label,
-            "model": model,
-            "attempts": MAX_STRUCTURED_RETRIES,
-            "input_tokens": total_input_tokens,
-            "output_tokens": total_output_tokens,
-            "elapsed_s": round(time.monotonic() - start, 2),
-            "success": False,
-            "error": repr(last_error),
-        },
+        _call_log_entry(
+            label,
+            model,
+            attempts=MAX_STRUCTURED_RETRIES,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            elapsed_s=round(time.monotonic() - start, 2),
+            success=False,
+            error=repr(last_error),
+        ),
     )
     raise RuntimeError(
         f"LLM structured call failed after {MAX_STRUCTURED_RETRIES} attempts"

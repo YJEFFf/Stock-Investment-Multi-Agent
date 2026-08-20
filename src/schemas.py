@@ -151,7 +151,7 @@ class RiskGateConfig(BaseModel):
 
     position_limit: float = 0.15  # 종목당 최대 비중
     sector_concentration_limit: float = 0.40  # 섹터 집중도 한도
-    daily_loss_limit: float = -0.05  # 일일 손실 한도 (도달 시 신규 매수 중단)
+    # 일일 손실 한도(daily_loss_limit) 룰은 2026-08-20 폐기 — pipeline.check_gate docstring 참고.
     total_exposure_limit: float = 1.0  # 총 노출 한도 (현재는 개별 한도로만 통제)
 
 
@@ -192,4 +192,3 @@ class SellAction(BaseModel):
 class PortfolioState(BaseModel):
     positions: list[Position] = Field(default_factory=list)
     cash_weight: float = 1.0
-    daily_pnl_pct: float = 0.0

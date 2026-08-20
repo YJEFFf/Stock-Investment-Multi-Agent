@@ -125,7 +125,6 @@ def execute_sell(portfolio: PortfolioState, action: SellAction, current_price: f
         return PortfolioState(
             positions=other_positions,
             cash_weight=portfolio.cash_weight + sold_weight,
-            daily_pnl_pct=portfolio.daily_pnl_pct,
         )
 
     update = {"weight": remaining_weight}
@@ -138,7 +137,6 @@ def execute_sell(portfolio: PortfolioState, action: SellAction, current_price: f
     return PortfolioState(
         positions=[*other_positions, position.model_copy(update=update)],
         cash_weight=portfolio.cash_weight + sold_weight,
-        daily_pnl_pct=portfolio.daily_pnl_pct,
     )
 
 
@@ -184,8 +182,20 @@ async def execute_sell_order(
         position.quantity if action.sell_fraction >= 1.0 else int(position.quantity * action.sell_fraction)
     )
     if shares_to_sell <= 0:
-        logger.warning("execute_sell_order_skipped ticker=%s reason=rounds_to_zero_shares", action.ticker)
-        return portfolio, None
+        # 부분 익절 비율이 내림 때문에 0주가 됐다. 여기서 그냥 돌아가면 이 포지션은
+        # **영원히 청산되지 않는다** — 트리거는 계속 걸리는데 매번 0주라 아무 일도
+        # 안 일어나고, 비중도 1/3씩만 줄어드니 execute_sell의 제거 조건(잔여 ≈ 0)에
+        # 닿지 않는다. 실제로 192820이 4단계까지 내려와 8주가 됐고, 그대로 두면
+        # 8→6→4→3→2주에서 int(2 * 1/3)=0으로 굳는다(2026-08-20 발견).
+        # 그래서 남은 걸 전량 판다. 진입 시 확정된 문턱(ExitPlan)을 건드리는 게
+        # 아니라 이미 내려진 매도 판정을 집행하는 방법의 문제라, 보유 중 문턱을
+        # 재결정하지 않는다는 원칙과 충돌하지 않는다(사용자 확정 2026-08-20).
+        logger.info(
+            "execute_sell_order_liquidating_dust ticker=%s quantity=%d reason=fraction_rounds_to_zero",
+            action.ticker,
+            position.quantity,
+        )
+        shares_to_sell = position.quantity
 
     today = datetime.now(KST).date()
     before = await asyncio.to_thread(kis.fetch_daily_fill_totals, action.ticker, today, "sell")
@@ -246,7 +256,6 @@ async def execute_sell_order(
         PortfolioState(
             positions=updated_positions,
             cash_weight=updated_portfolio.cash_weight,
-            daily_pnl_pct=updated_portfolio.daily_pnl_pct,
         ),
         fill,
     )

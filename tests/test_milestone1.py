@@ -15,15 +15,12 @@ def _simulate(log_path):
     portfolio = PortfolioState()
     config = RiskGateConfig()
     analyst_fn = make_dummy_analyst_fn(BASE_SEED)
-    pnl_rng = random.Random(BASE_SEED)
     start = datetime(2026, 1, 5, tzinfo=timezone.utc)
 
     async def _run():
         nonlocal portfolio
         for i in range(TRADING_DAYS):
             day = start + timedelta(days=i)
-            # 당일 손익은 분석 결과와 무관한 시장 요인 — 별도 시드로 시뮬레이션.
-            portfolio = portfolio.model_copy(update={"daily_pnl_pct": pnl_rng.uniform(-0.08, 0.03)})
             portfolio, _ = await run_day(
                 UNIVERSE, day, portfolio, config, analyst_fn, propose_decision, execute_simulated, log_path=log_path
             )

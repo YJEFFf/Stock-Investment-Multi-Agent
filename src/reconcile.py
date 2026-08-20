@@ -129,7 +129,6 @@ def reconcile(
         PortfolioState(
             positions=corrected_positions,
             cash_weight=portfolio.cash_weight,
-            daily_pnl_pct=portfolio.daily_pnl_pct,
         ),
         drifts,
     )

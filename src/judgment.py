@@ -87,7 +87,10 @@ async def debate(ticker: str, opinions: list[AnalystOpinion]) -> tuple[DebateArg
 # 쪽으로도 느슨한 쪽으로도 갈 수 있다 — 대신 진입 시점에 한 번만 정하고 보유 중에는
 # 재결정하지 않는다(ExitPlan docstring). 이 바운드는 "적정 수준" 판단이 아니라
 # 파싱 사고 방지선이다: 손절 3% 미만은 KOSPI 대형주 일간 노이즈에 그냥 털리고,
-# 15% 초과는 종목당 비중 한도 15%와 곱해도 일일 손실 한도(-5%) 안에 들어야 한다.
+# 15% 초과는 종목당 비중 한도 15%와 곱했을 때 포트폴리오 한 종목이 낼 수 있는
+# 손실을 2.25% 안에 묶어두기 위한 상한이다. (원래 근거는 "일일 손실 한도(-5%)
+# 안에 들어야 한다"였는데, 그 게이트 룰은 2026-08-20에 폐기됐다 —
+# pipeline.check_gate docstring. 상한 자체는 같은 이유로 그대로 유효하다.)
 _MIN_STOP_LOSS_PCT = 3.0
 _MAX_STOP_LOSS_PCT = 15.0
 _MIN_TAKE_PROFIT_FRACTION = 0.15

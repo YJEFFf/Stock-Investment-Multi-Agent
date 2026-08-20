@@ -169,3 +169,32 @@ def test_call_structured_logs_failure_with_label(monkeypatch, tmp_path):
     assert len(entries) == 1
     assert entries[0]["label"] == "news"
     assert entries[0]["success"] is False
+
+
+def test_call_log_day_is_kst_not_utc(monkeypatch, tmp_path):
+    """08:30 KST 매수 판단 cron은 UTC로 전날 23:30이다 — timestamp만 있으면
+    하루 호출의 대부분이 전날 몫으로 집계된다(2026-08-20 실측: 파일상 35건).
+    day는 반드시 KST 기준이어야 CLAUDE.md 감시 지표가 맞는 숫자를 낸다."""
+    from datetime import datetime, timezone
+
+    log_path = tmp_path / "llm_calls.jsonl"
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            # 2026-08-19 23:35 UTC == 2026-08-20 08:35 KST (아침 매수 판단 시각)
+            utc = datetime(2026, 8, 19, 23, 35, tzinfo=timezone.utc)
+            return utc if tz is None else utc.astimezone(tz)
+
+    monkeypatch.setattr(llm, "datetime", _FixedDatetime)
+
+    async def fake_create(**kwargs):
+        return _Response(json.dumps({"value": 1}))
+
+    monkeypatch.setattr(llm._client.messages, "create", fake_create)
+
+    asyncio.run(_call(log_path))
+
+    entry = json.loads(log_path.read_text().strip())
+    assert entry["timestamp"].startswith("2026-08-19T23:35")  # 순간은 UTC 그대로
+    assert entry["day"] == "2026-08-20"  # 집계 단위는 장이 도는 날짜

@@ -65,16 +65,28 @@ async def _execute_pending_sells(portfolio, day, today_kst):
         PENDING_SELLS_PATH.unlink()
         return portfolio
 
+    # 집행하지 못한 매도 중 **다시 시도하면 될 수도 있는 것**만 남긴다.
+    # 규칙 4가 금지하는 "결과가 마음에 안 들어서 재분석"이 아니다 — 판단은 이미
+    # 끝났고 바뀌지 않는다(같은 SellAction을 그대로 다시 낸다). 시세 조회라는
+    # 데이터 수집이 실패한 것이라 재시도 대상이 맞다.
+    carried_over: list[dict] = []
+
     for raw_action in payload["actions"]:
         action = SellAction.model_validate(raw_action)
         position = next((p for p in portfolio.positions if p.ticker == action.ticker), None)
         if position is None:
+            # 이미 안 들고 있다(장중 손절이 먼저 털었거나 전량 청산됨) — 팔 것이
+            # 없으므로 남겨봐야 영원히 못 판다. 이건 버린다.
             logger.warning("pending_sell_skipped ticker=%s reason=position_not_found", action.ticker)
             continue
 
         current_price = await asyncio.to_thread(kis.fetch_current_price, action.ticker)
         if current_price is None:
-            logger.warning("pending_sell_skipped ticker=%s reason=price_unavailable", action.ticker)
+            # 아직 들고 있는데 시세만 못 받았다. 여기서 버리면 LLM이 "나가라"고
+            # 한 포지션을 아무도 모르게 계속 들고 있게 된다 — 매도는 망설이면
+            # 손실을 들고 있는 쪽이라 침묵이 안전한 방향이 아니다(src/sell.py 상단).
+            logger.warning("pending_sell_carried_over ticker=%s reason=price_unavailable", action.ticker)
+            carried_over.append(raw_action)
             continue
 
         portfolio = await pipeline.finalize_sell(
@@ -88,7 +100,24 @@ async def _execute_pending_sells(portfolio, day, today_kst):
             pipeline.DEFAULT_TRADE_JOURNAL_LOG_PATH,
         )
 
-    PENDING_SELLS_PATH.unlink()
+    if carried_over:
+        # decided_on은 원래 값을 그대로 둔다 — 그래야 STALE_PENDING_SELLS_DAYS가
+        # 계속 세어져서 무한정 재시도되지 않고 4일 뒤엔 스스로 만료된다.
+        PENDING_SELLS_PATH.write_text(
+            json.dumps(
+                {"decided_on": payload["decided_on"], "actions": carried_over},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        notify.send_telegram_alert(
+            notify.format_error_alert(
+                "매도 집행 실패 — 시세 조회 불가, 다음 거래일 09:01에 재시도합니다",
+                f"{len(carried_over)}건 이월: {', '.join(pipeline.display_name(a['ticker']) for a in carried_over)}",
+            )
+        )
+    else:
+        PENDING_SELLS_PATH.unlink()
     return portfolio
 
 

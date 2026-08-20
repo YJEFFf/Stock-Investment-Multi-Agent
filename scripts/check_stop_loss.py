@@ -35,18 +35,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("check_stop_loss")
 
 KST = ZoneInfo("Asia/Seoul")
-# 매분 도는 잡이라 지속 장애 시 텔레그램이 하루 수백 번 울릴 수 있다 — 하루 첫
-# 실패에만 알리고 그 이후는 로그(logs/cron.log)로만 남긴다.
-LAST_ALERT_MARKER_PATH = Path("logs/check_stop_loss_last_alert.txt")
-
-
-def _alert_once_per_day(context: str, error: str) -> None:
-    today = datetime.now(KST).date().isoformat()
-    if LAST_ALERT_MARKER_PATH.exists() and LAST_ALERT_MARKER_PATH.read_text().strip() == today:
-        return
-    notify.send_telegram_alert(notify.format_error_alert(context, error))
-    LAST_ALERT_MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
-    LAST_ALERT_MARKER_PATH.write_text(today)
 
 
 async def main() -> None:
@@ -76,5 +64,13 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as exc:
         logger.exception("check_stop_loss_failed")
-        _alert_once_per_day("check_stop_loss 실패 (이번 1분 체크만 스킵, 이후 반복 실패는 로그만)", repr(exc))
+        # 하루 첫 실패에만 알린다(notify.alert_once_per_day) — 매분 도는 잡이라
+        # 지속 장애면 텔레그램이 하루 수백 번 울린다. 사유별로 따로 세므로
+        # 이 알림이 나간 뒤에도 "시세 전부 실패" 알림은 따로 울린다.
+        notify.alert_once_per_day(
+            "check_stop_loss_failed",
+            notify.format_error_alert(
+                "check_stop_loss 실패 (이번 1분 체크만 스킵, 이후 반복 실패는 로그만)", repr(exc)
+            ),
+        )
         raise

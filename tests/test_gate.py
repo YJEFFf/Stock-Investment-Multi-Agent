@@ -63,20 +63,6 @@ def test_sector_concentration_rejects_when_exceeded():
     assert result.rejected_by == "sector_concentration"
 
 
-def test_daily_loss_limit_blocks_new_buys():
-    portfolio = PortfolioState(daily_pnl_pct=-0.06)
-    result = check_gate(_buy_decision(), portfolio, CONFIG, sector="반도체", trade_weight=0.08)
-    assert result.approved is False
-    assert result.rejected_by == "daily_loss_limit"
-
-
-def test_daily_loss_limit_boundary_is_inclusive():
-    portfolio = PortfolioState(daily_pnl_pct=-0.05)
-    result = check_gate(_buy_decision(), portfolio, CONFIG, sector="반도체", trade_weight=0.08)
-    assert result.approved is False
-    assert result.rejected_by == "daily_loss_limit"
-
-
 def test_total_exposure_rejects_when_exceeded():
     tight_config = RiskGateConfig(total_exposure_limit=0.20)
     portfolio = PortfolioState(

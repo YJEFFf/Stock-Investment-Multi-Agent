@@ -256,3 +256,109 @@ def test_sync_trade_journal_sends_error_alert_on_failure(monkeypatch):
 
     assert len(alerts) == 1
     assert "노션 매매일지 동기화 실패" in alerts[0]
+
+
+def test_pending_sell_is_carried_over_when_price_is_unavailable(monkeypatch, tmp_path):
+    """시세 조회 실패로 못 판 매도를 파일에서 지우면, LLM이 "나가라"고 한
+    포지션을 아무도 모르게 계속 들고 있게 된다. 매수와 달리 매도는 침묵이
+    안전한 방향이 아니다 — 다음 거래일에 다시 시도해야 한다."""
+    monkeypatch.chdir(tmp_path)
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position()])
+    portfolio_store.save_portfolio(portfolio)
+
+    decided_on = (TODAY - timedelta(days=1)).isoformat()
+    eo.PENDING_SELLS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    eo.PENDING_SELLS_PATH.write_text(
+        json.dumps(
+            {
+                "decided_on": decided_on,
+                "actions": [{"ticker": "005930", "reason": "llm_discretionary", "sell_fraction": 1.0}],
+            }
+        )
+    )
+
+    def fail(*a, **k):
+        raise AssertionError("시세를 못 받았으면 집행하면 안 된다")
+
+    monkeypatch.setattr(eo.pipeline, "finalize_sell", fail)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: None)
+
+    alerts = []
+    monkeypatch.setattr(eo.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    asyncio.run(eo.main())
+
+    assert eo.PENDING_SELLS_PATH.exists(), "이월돼야 다음 거래일에 재시도된다"
+    payload = json.loads(eo.PENDING_SELLS_PATH.read_text())
+    assert [a["ticker"] for a in payload["actions"]] == ["005930"]
+    # decided_on을 오늘로 갱신하면 만료가 매일 미뤄져 영원히 재시도된다 —
+    # 원래 값을 그대로 둬야 STALE_PENDING_SELLS_DAYS가 계속 세어진다.
+    assert payload["decided_on"] == decided_on
+    assert any("재시도" in a for a in alerts)
+    assert portfolio_store.load_portfolio().positions[0].ticker == "005930"
+
+
+def test_carried_over_sell_still_expires_by_staleness(monkeypatch, tmp_path):
+    """이월이 무한 재시도가 되지 않는지 — decided_on이 보존되므로 4일이 지나면
+    기존 만료 경로가 그대로 걷어간다."""
+    monkeypatch.chdir(tmp_path)
+    portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))
+
+    too_old = (TODAY - timedelta(days=eo.STALE_PENDING_SELLS_DAYS + 1)).isoformat()
+    eo.PENDING_SELLS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    eo.PENDING_SELLS_PATH.write_text(
+        json.dumps(
+            {"decided_on": too_old, "actions": [{"ticker": "005930", "reason": "llm_discretionary", "sell_fraction": 1.0}]}
+        )
+    )
+
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: None)
+    monkeypatch.setattr(eo.notify, "send_telegram_alert", lambda message: True)
+
+    asyncio.run(eo.main())
+
+    assert not eo.PENDING_SELLS_PATH.exists()
+
+
+def test_executed_and_unavailable_sells_are_split(monkeypatch, tmp_path):
+    """한 건은 집행되고 한 건은 시세 실패일 때, 집행된 것만 빠지고 실패분만 남아야
+    한다 — 통째로 남기면 이미 판 종목을 다음날 또 팔려고 든다."""
+    monkeypatch.chdir(tmp_path)
+    portfolio_store.save_portfolio(
+        PortfolioState(
+            cash_weight=0.80,
+            positions=[_position(), _position(ticker="000660", sector="반도체")],
+        )
+    )
+
+    eo.PENDING_SELLS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    eo.PENDING_SELLS_PATH.write_text(
+        json.dumps(
+            {
+                "decided_on": (TODAY - timedelta(days=1)).isoformat(),
+                "actions": [
+                    {"ticker": "005930", "reason": "llm_discretionary", "sell_fraction": 1.0},
+                    {"ticker": "000660", "reason": "llm_discretionary", "sell_fraction": 1.0},
+                ],
+            }
+        )
+    )
+
+    sold = []
+
+    async def fake_finalize_sell(portfolio, action, position, current_price, day, sell_execute_fn, log_path, tj_path):
+        sold.append(action.ticker)
+        return PortfolioState(
+            cash_weight=portfolio.cash_weight + position.weight,
+            positions=[p for p in portfolio.positions if p.ticker != action.ticker],
+        )
+
+    monkeypatch.setattr(eo.pipeline, "finalize_sell", fake_finalize_sell)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 100.0 if ticker == "005930" else None)
+    monkeypatch.setattr(eo.notify, "send_telegram_alert", lambda message: True)
+
+    asyncio.run(eo.main())
+
+    assert sold == ["005930"]
+    payload = json.loads(eo.PENDING_SELLS_PATH.read_text())
+    assert [a["ticker"] for a in payload["actions"]] == ["000660"]

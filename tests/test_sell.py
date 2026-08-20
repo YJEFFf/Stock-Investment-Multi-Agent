@@ -279,15 +279,25 @@ def test_execute_sell_order_full_exit_sells_all_shares(monkeypatch):
     assert updated.positions == []
 
 
-def test_execute_sell_order_skips_when_rounds_to_zero_shares(monkeypatch):
+def test_execute_sell_order_liquidates_dust_when_fraction_rounds_to_zero(monkeypatch):
+    """부분 익절이 0주로 내림되면 남은 걸 전량 판다.
+
+    예전엔 여기서 그냥 돌아갔는데, 그러면 이 포지션은 영원히 청산되지 않는다 —
+    트리거는 계속 걸리지만 매번 0주고, 비중도 1/3씩만 줄어드니 제거 조건(잔여 ≈ 0)에
+    닿지 않는다. 192820이 실제로 4단계까지 내려와 8주가 됐고, 2주에서 굳을 참이었다
+    (2026-08-20).
+    """
     import asyncio
 
     from src.schemas import SellAction
 
-    def fail(*a, **k):
-        raise AssertionError("0주로 반올림되면 주문을 내면 안 된다")
+    captured = {}
 
-    monkeypatch.setattr(kis, "place_market_sell_order", fail)
+    def fake_order(ticker, qty):
+        captured["qty"] = qty
+        return "ORDER-1"
+
+    monkeypatch.setattr(kis, "place_market_sell_order", fake_order)
 
     position = _position(weight=0.09, entry_price=100.0, peak_price=150.0, take_profit_stage=1, quantity=2)
     portfolio = PortfolioState(positions=[position], cash_weight=0.91)
@@ -295,7 +305,30 @@ def test_execute_sell_order_skips_when_rounds_to_zero_shares(monkeypatch):
 
     updated, _fill = asyncio.run(sell.execute_sell_order(portfolio, action, current_price=139.5))
 
-    assert updated == portfolio  # 아무 것도 안 바뀜
+    assert captured["qty"] == 2  # 남은 전량
+    assert updated.positions == []  # 포지션이 실제로 닫힌다
+    assert updated.cash_weight == pytest.approx(1.0)
+
+
+def test_execute_sell_order_liquidates_single_share_position(monkeypatch):
+    """자투리의 종점 — 1주 남은 포지션에 부분 익절이 걸려도 닫힌다."""
+    import asyncio
+
+    from src.schemas import SellAction
+
+    captured = {}
+    monkeypatch.setattr(
+        kis, "place_market_sell_order", lambda ticker, qty: captured.setdefault("qty", qty) and "ORDER-1"
+    )
+
+    position = _position(weight=0.01, entry_price=100.0, peak_price=150.0, take_profit_stage=3, quantity=1)
+    portfolio = PortfolioState(positions=[position], cash_weight=0.99)
+    action = SellAction(ticker="005930", reason="take_profit_trail", sell_fraction=1 / 3)
+
+    updated, _fill = asyncio.run(sell.execute_sell_order(portfolio, action, current_price=139.5))
+
+    assert captured["qty"] == 1
+    assert updated.positions == []
 
 
 def test_execute_sell_order_returns_unchanged_when_order_rejected(monkeypatch):

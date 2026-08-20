@@ -139,7 +139,15 @@ def check_gate(
     sector: str,
     trade_weight: float,
 ) -> GateResult:
-    """4개 룰을 순서대로 확정 판정. 첫 위반에서 즉시 거부."""
+    """룰을 순서대로 확정 판정. 첫 위반에서 즉시 거부.
+
+    일일 손실 한도(`daily_loss_limit`) 룰은 2026-08-20에 폐기했다(사용자 확정).
+    두 가지가 겹쳤다: `daily_pnl_pct`를 production 경로에서 아무도 계산하지 않아
+    항상 0.0이었고, 애초에 이 게이트가 도는 시점이 08:30(개장 전)이라 "오늘 손익"은
+    정의상 0이다 — 하루 한 번 개장 직후에만 매수하는 지금 구조에서는 장중
+    서킷브레이커라는 개념이 성립하지 않는다. 계산만 채워 넣으면 살아나는 룰이
+    아니라 구조가 안 맞는 룰이라, 살아있는 척하게 두는 대신 걷어냈다.
+    """
     if decision.action != "BUY":
         return GateResult(approved=False, rejected_by=None)
 
@@ -151,9 +159,6 @@ def check_gate(
     sector_weight = sum(p.weight for p in portfolio.positions if p.sector == sector)
     if sector_weight + trade_weight > config.sector_concentration_limit:
         return GateResult(approved=False, rejected_by="sector_concentration")
-
-    if portfolio.daily_pnl_pct <= config.daily_loss_limit:
-        return GateResult(approved=False, rejected_by="daily_loss_limit")
 
     invested_weight = 1.0 - portfolio.cash_weight
     if invested_weight + trade_weight > config.total_exposure_limit:
@@ -187,7 +192,6 @@ def execute(
     return PortfolioState(
         positions=positions,
         cash_weight=portfolio.cash_weight - trade_weight,
-        daily_pnl_pct=portfolio.daily_pnl_pct,
     )
 
 
@@ -384,7 +388,6 @@ async def execute_buy_order(
     return PortfolioState(
         positions=positions,
         cash_weight=portfolio.cash_weight - trade_weight,
-        daily_pnl_pct=portfolio.daily_pnl_pct,
     )
 
 
@@ -754,13 +757,32 @@ async def evaluate_holdings(
             continue
         price_by_ticker[position.ticker] = price
 
+    # 한 종목도 못 받았으면 이 회차는 손절·익절을 **아무것도 판정하지 않았다** —
+    # 문턱을 넘지 않아서 조용한 것과 눈을 감아서 조용한 것은 전혀 다른데, 지금까지
+    # 둘 다 똑같이 조용했다. 2026-08-20 15:17~15:27에 KIS 시세가 통째로 죽어
+    # 장 마감 직전 11분간 안전장치가 한 번도 판정을 못 했고, 그 사실이 로그
+    # 안쪽에만 남아 아무도 몰랐다. 종목별 WARNING은 정상 장애에서도 흔해서
+    # 알림 기준으로 못 쓴다 — "전부 실패"만 알린다.
+    if not price_by_ticker:
+        logger.error(
+            "evaluate_holdings_all_prices_unavailable positions=%d — 이번 회차 손절/익절 판정 없음",
+            len(portfolio.positions),
+        )
+        notify.alert_once_per_day(
+            "holdings_all_prices_unavailable",
+            notify.format_error_alert(
+                "보유 종목 시세를 하나도 못 받아 손절/익절 판정을 못 했습니다 (이 회차)",
+                f"보유 {len(portfolio.positions)}종목 전부 시세 조회 실패 — KIS 장애 의심. "
+                "복구될 때까지 매분 체크가 계속 헛돕니다(오늘 이 알림은 1회만).",
+            ),
+        )
+
     for ticker, current_price in price_by_ticker.items():
         position = next(p for p in portfolio.positions if p.ticker == ticker)
         position = sell.update_peak_price(position, current_price)
         portfolio = PortfolioState(
             positions=[position if p.ticker == ticker else p for p in portfolio.positions],
             cash_weight=portfolio.cash_weight,
-            daily_pnl_pct=portfolio.daily_pnl_pct,
         )
 
         action = sell.evaluate_deterministic_sell(position, current_price)

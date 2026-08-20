@@ -14,6 +14,9 @@ CLAUDE.md의 재시도 규칙(규칙 4)과는 무관한 영역이다 — 이건 
 
 import logging
 import os
+from datetime import date, datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -23,6 +26,8 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+
+KST = ZoneInfo("Asia/Seoul")  # "하루"의 경계는 장이 도는 시간대 기준이어야 한다 (pipeline._kst_today와 같은 이유)
 
 # notion_sync.REASON_LABELS와 값은 같지만 독립적으로 든다 — 이 파일과 notion_sync.py는
 # "노션에 뭘 쓰나"/"텔레그램에 뭘 보내나"로 고치는 이유가 다르다.
@@ -108,3 +113,38 @@ def send_telegram_alert(message: str) -> bool:
     except Exception:
         logger.exception("telegram_alert_failed")
         return False
+
+
+# 매분 도는 잡(check_stop_loss)이 지속 장애를 만나면 텔레그램이 하루 수백 번
+# 울린다 — 하루 첫 발생에만 보내고 나머지는 logs/cron.log로만 남긴다.
+# 원래 scripts/check_stop_loss.py 안에 있던 로직을 여기로 올렸다. 이유는 두
+# 가지다: (1) "알림을 얼마나 자주 보낼 것인가"는 알림 쪽 관심사고, (2) 원래
+# 구현은 마커 파일이 하나뿐이라 사유가 여럿이면 서로를 묻어버렸다 — 그날
+# 손절 체크가 한 번 예외로 죽어 알림이 나가면, 그 뒤 장 마감까지 시세가 통째로
+# 안 나와도(안전장치가 눈을 감은 상태) 두 번째 알림이 안 나간다. context별로
+# 따로 센다.
+ALERT_MARKER_DIR = Path("logs/alert_markers")
+
+
+def alert_once_per_day(context_key: str, message: str, today: date | None = None) -> bool:
+    """오늘 이 context_key로 아직 안 보냈으면 보내고 True. 이미 보냈으면 False.
+
+    마커 쓰기가 실패해도 알림 자체는 이미 나갔으므로 True를 돌려준다 — 다음
+    호출에서 한 번 더 울릴 뿐이고, 그게 알림을 통째로 잃는 것보다 낫다.
+    """
+    today = today or datetime.now(KST).date()
+    marker = ALERT_MARKER_DIR / f"{context_key}.txt"
+    try:
+        if marker.exists() and marker.read_text().strip() == today.isoformat():
+            return False
+    except OSError:
+        pass  # 마커를 못 읽으면 "아직 안 보냈다"로 본다 — 알림은 놓치는 쪽이 더 위험하다
+
+    send_telegram_alert(message)
+
+    try:
+        ALERT_MARKER_DIR.mkdir(parents=True, exist_ok=True)
+        marker.write_text(today.isoformat())
+    except OSError as exc:
+        logger.warning("alert_marker_write_failed context=%s error=%s", context_key, exc)
+    return True

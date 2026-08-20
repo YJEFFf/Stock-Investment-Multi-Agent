@@ -88,3 +88,38 @@ def test_format_sell_alert_missing_pnl():
 def test_format_error_alert():
     msg = notify.format_error_alert("evaluate_holdings 실패", "RuntimeError: boom")
     assert msg == "⚠️ [SIMA] 오류 — evaluate_holdings 실패\nRuntimeError: boom"
+
+
+def test_alert_once_per_day_sends_only_first_time(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    sent = []
+    monkeypatch.setattr(notify, "send_telegram_alert", lambda m: sent.append(m) or True)
+
+    assert notify.alert_once_per_day("ctx", "첫 번째") is True
+    assert notify.alert_once_per_day("ctx", "두 번째") is False
+    assert sent == ["첫 번째"]
+
+
+def test_alert_once_per_day_counts_each_context_separately(monkeypatch, tmp_path):
+    """마커가 하나뿐이던 옛 구현에서는 사유 A가 울리면 그날 사유 B가 통째로
+    묻혔다 — 손절 체크가 죽어 알림이 나간 날엔 시세 전면 장애를 못 듣는다."""
+    monkeypatch.chdir(tmp_path)
+    sent = []
+    monkeypatch.setattr(notify, "send_telegram_alert", lambda m: sent.append(m) or True)
+
+    assert notify.alert_once_per_day("check_stop_loss_failed", "A") is True
+    assert notify.alert_once_per_day("holdings_all_prices_unavailable", "B") is True
+    assert sent == ["A", "B"]
+
+
+def test_alert_once_per_day_resets_on_a_new_day(monkeypatch, tmp_path):
+    from datetime import date
+
+    monkeypatch.chdir(tmp_path)
+    sent = []
+    monkeypatch.setattr(notify, "send_telegram_alert", lambda m: sent.append(m) or True)
+
+    assert notify.alert_once_per_day("ctx", "어제", today=date(2026, 8, 20)) is True
+    assert notify.alert_once_per_day("ctx", "어제 또", today=date(2026, 8, 20)) is False
+    assert notify.alert_once_per_day("ctx", "오늘", today=date(2026, 8, 21)) is True
+    assert sent == ["어제", "오늘"]

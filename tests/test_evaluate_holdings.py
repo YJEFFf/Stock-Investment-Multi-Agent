@@ -18,7 +18,7 @@ DAY = datetime(2026, 8, 9, tzinfo=timezone.utc)
 
 
 @pytest.fixture(autouse=True)
-def _no_real_notify_or_name_lookup(monkeypatch):
+def _no_real_notify_or_name_lookup(monkeypatch, tmp_path):
     # evaluate_holdings가 매도마다 텔레그램 알림 + 종목명 조회를 시도한다 — 목킹
     # 안 하면 테스트가 실제 텔레그램 메시지를 보내고 실제 네이버를 긁는다
     # (2026-08-09, execute_buy_order 쪽과 같은 이유로 실수로 한 번 겪음).
@@ -36,6 +36,11 @@ def _no_real_notify_or_name_lookup(monkeypatch):
         return text
 
     monkeypatch.setattr(pipeline.translate, "to_korean", _identity)
+
+    # "하루 1회" 알림 마커를 tmp로 돌린다. 기본값은 레포의 logs/alert_markers라,
+    # 안 막으면 테스트가 실제 운영 마커를 써버린다 — EC2에서 테스트를 한 번
+    # 돌리면 그날 진짜 장애 알림이 "이미 보냈다"로 묻힌다.
+    monkeypatch.setattr(pipeline.notify, "ALERT_MARKER_DIR", tmp_path / "alert_markers")
 
 
 def test_returns_unchanged_when_no_positions(monkeypatch):
@@ -509,3 +514,39 @@ def test_journal_does_not_trust_a_fill_that_missed_part_of_the_order(monkeypatch
     assert entry["sell_amount"] == pytest.approx(31 * (4_364_500 / 19))
     assert entry["sell_amount_source"] == "estimated"
     assert entry["exit_price_source"] == "fill_partial"
+
+
+def test_alerts_once_when_no_position_price_could_be_fetched(monkeypatch, tmp_path):
+    """보유 종목 시세를 하나도 못 받으면 이 회차는 손절·익절을 아무것도 판정하지
+    않는다. 문턱을 안 넘어서 조용한 것과 눈을 감아서 조용한 것은 다른데, 지금까지
+    둘 다 똑같이 조용했다 — 2026-08-20 15:17~15:27에 실제로 그랬다."""
+    portfolio = PortfolioState(cash_weight=0.80, positions=[_position(), _position(ticker="000660")])
+
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: None)
+
+    alerts = []
+    monkeypatch.setattr(pipeline.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    result = asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    assert result == portfolio  # 아무것도 안 팔았고 상태도 그대로
+    assert len(alerts) == 1
+    assert "시세" in alerts[0]
+
+    # 매분 도는 잡이라 두 번째 회차는 조용해야 한다(로그에는 계속 남는다).
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+    assert len(alerts) == 1
+
+
+def test_no_all_prices_alert_when_at_least_one_price_arrives(monkeypatch, tmp_path):
+    """일부만 실패하는 건 정상 장애 범위다 — 여기까지 알리면 매분 울린다."""
+    portfolio = PortfolioState(cash_weight=0.80, positions=[_position(), _position(ticker="000660")])
+
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 100.0 if ticker == "005930" else None)
+
+    alerts = []
+    monkeypatch.setattr(pipeline.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    assert alerts == []
