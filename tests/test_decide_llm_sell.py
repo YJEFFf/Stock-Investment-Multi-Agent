@@ -71,7 +71,7 @@ def test_decides_sell_without_executing(monkeypatch, tmp_path):
     portfolio = PortfolioState(cash_weight=0.90, positions=[_position()])
     portfolio_store.save_portfolio(portfolio)
 
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 105.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 105.0)
 
     async def fake_analyst_fn(ticker, sector, day):
         return [AnalystOpinion(agent="chart", ticker=ticker, score=-0.6, confidence=0.7, evidence=["e"], as_of=day)]
@@ -105,7 +105,7 @@ def test_skips_position_when_price_unavailable(monkeypatch, tmp_path):
     monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
     portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))
 
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: None)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: None)
 
     def fail(*a, **k):
         raise AssertionError("시세 조회가 실패했으면 분석가/judge_sell을 부르면 안 된다")
@@ -198,7 +198,7 @@ def test_hold_when_judge_sell_returns_none(monkeypatch, tmp_path):
     monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
     portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))
 
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 105.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 105.0)
 
     async def fake_analyst_fn(ticker, sector, day):
         return []
@@ -239,3 +239,42 @@ def test_main_syncs_the_trade_journal_before_the_daily_report(monkeypatch, tmp_p
     asyncio.run(dls.main())
 
     assert calls == ["journal", "report"]
+
+
+# --- 복구를 못 본 채 장이 끝난 시세 공백 (2026-08-21 15:07~15:29) ---
+
+
+def test_reports_a_blackout_that_never_recovered_before_close(monkeypatch, tmp_path):
+    """복구 알림은 "시세가 돌아온 회차"에서만 나온다. 공백이 그대로 마감으로
+    이어지면 그 회차가 영영 안 오므로, 장 마감 후 첫 실행인 이 스크립트가 닫는다."""
+    from datetime import datetime, timedelta
+
+    from src import notify
+
+    # 같은 날 안에서만 이어 센다(자정을 넘긴 상태 파일은 무시) — 그래서 고정 날짜가
+    # 아니라 "오늘 장중"으로 만든다. 운영에서도 15:35는 공백과 같은 날이다.
+    monkeypatch.setattr(notify, "BLACKOUT_STATE_DIR", tmp_path / "markers")
+    now = datetime.now(notify.KST)
+    notify.track_blackout(dls.pipeline.BLACKOUT_CONTEXT, True, now=now - timedelta(minutes=28))
+    notify.track_blackout(dls.pipeline.BLACKOUT_CONTEXT, True, now=now - timedelta(minutes=6))
+
+    alerts = []
+    monkeypatch.setattr(dls.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    dls._report_unresolved_blackout()
+
+    assert len(alerts) == 1
+    assert "공백인 채로 장 마감" in alerts[0]
+
+
+def test_no_blackout_report_when_the_day_was_clean(monkeypatch, tmp_path):
+    from src import notify
+
+    monkeypatch.setattr(notify, "BLACKOUT_STATE_DIR", tmp_path / "markers")
+
+    alerts = []
+    monkeypatch.setattr(dls.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    dls._report_unresolved_blackout()
+
+    assert alerts == []

@@ -12,10 +12,13 @@ CLAUDE.md의 재시도 규칙(규칙 4)과는 무관한 영역이다 — 이건 
 같이 바뀐다.
 """
 
+import json
 import logging
 import os
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import requests
@@ -71,6 +74,30 @@ def format_sell_alert(
 
 def format_error_alert(context: str, error: str) -> str:
     return f"⚠️ [SIMA] 오류 — {context}\n{_truncate(error, 500)}"
+
+
+def format_blackout_escalation_alert(minutes: float, positions: int) -> str:
+    return (
+        f"🔴 [SIMA] 시세 공백 지속\n"
+        f"{minutes:.0f}분째 보유 {positions}종목 시세 전멸 — 손절/익절 판정이 그동안 한 번도 없었습니다\n"
+        f"사유: KIS 시세 조회 연속 실패. 복구되면 총 공백 시간을 다시 알립니다."
+    )
+
+
+def format_blackout_recovery_alert(minutes: float) -> str:
+    return (
+        f"🟡 [SIMA] 시세 공백 종료\n"
+        f"총 {minutes:.0f}분간 손절/익절 판정 없음 — 지금은 시세가 정상입니다\n"
+        f"사유: 그 구간에 문턱을 넘은 종목이 있었는지는 확인이 불가능합니다."
+    )
+
+
+def format_blackout_unresolved_alert(minutes: float) -> str:
+    return (
+        f"🔴 [SIMA] 시세 공백인 채로 장 마감\n"
+        f"마감까지 {minutes:.0f}분간 손절/익절 판정 없음 — 복구를 못 보고 끝났습니다\n"
+        f"사유: 장 마감 직전 구간은 KIS 모의투자 지연이 가장 심한 시간대입니다."
+    )
 
 
 def format_buy_decision_alert(day: str, names: list[str]) -> str:
@@ -148,3 +175,122 @@ def alert_once_per_day(context_key: str, message: str, today: date | None = None
     except OSError as exc:
         logger.warning("alert_marker_write_failed context=%s error=%s", context_key, exc)
     return True
+
+
+# --- 공백(전멸) 구간 추적 ---
+#
+# alert_once_per_day만으로는 "장애가 시작됐다"까지만 알 수 있고 "얼마나 길어지고
+# 있나"는 못 알린다. 2026-08-21이 정확히 그랬다: 13:02에 하루치 알림을 써버려서
+# 15:07~15:29의 23분 공백(장 마감 직전, 안전장치가 통째로 눈을 감은 구간)이
+# 무알림으로 지나갔다. 같은 날 오전에 이미 울렸다는 이유로 더 심한 오후를 못 알리는
+# 건 알림이 아니라 소음 억제일 뿐이다.
+#
+# 그래서 여기서는 연속 구간을 상태 파일로 들고 간다. 매분 새 프로세스가 뜨는
+# 구조(check_stop_loss)라 메모리에 둘 수 없다.
+BLACKOUT_STATE_DIR = Path("logs/alert_markers")
+BLACKOUT_ESCALATE_AFTER = timedelta(minutes=5)
+
+
+@dataclass(frozen=True)
+class BlackoutEvent:
+    """알릴 만한 일이 생겼을 때만 나온다. 조용한 회차는 None이다."""
+
+    kind: Literal["escalated", "recovered"]
+    minutes: float
+
+
+def _blackout_state_path(context_key: str, state_dir: Path | None = None) -> Path:
+    return (state_dir or BLACKOUT_STATE_DIR) / f"{context_key}.blackout.json"
+
+
+def _read_blackout(path: Path, now: datetime) -> tuple[datetime, bool] | None:
+    try:
+        raw = json.loads(path.read_text())
+        since = datetime.fromisoformat(raw["since"])
+    except (OSError, ValueError, KeyError):
+        return None
+    # 날짜가 넘어갔으면 이어붙이지 않는다 — 장 마감 시점에 공백인 채로 끝나면
+    # 파일이 남는데, 그걸 다음 날 아침에 이어 세면 "밤새 15시간 공백"이 된다.
+    if since.date() != now.date():
+        return None
+    return since, bool(raw.get("escalated"))
+
+
+def track_blackout(
+    context_key: str,
+    blind: bool,
+    *,
+    now: datetime | None = None,
+    state_dir: Path | None = None,
+    escalate_after: timedelta = BLACKOUT_ESCALATE_AFTER,
+) -> BlackoutEvent | None:
+    """매 회차 호출한다. blind=True면 이번 회차가 아무것도 관측 못 했다는 뜻.
+
+    돌려주는 것은 "지금 알려야 할 일"뿐이다:
+      - 공백이 escalate_after를 넘긴 첫 회차 -> BlackoutEvent("escalated")
+      - 알림까지 갔던 공백이 끝난 회차       -> BlackoutEvent("recovered")
+      - 그 외(공백 시작, 짧은 공백, 평상시)  -> None
+
+    짧은 공백에 복구 알림을 안 보내는 이유: 1~2분짜리 blip은 정상 장애 범위라
+    (kis 재시도가 흡수한다) 매번 울리면 그 알림을 안 보게 된다. 시작 알림은
+    기존대로 alert_once_per_day가 하루 한 번 맡는다 — 여기서 다시 보내지 않는다.
+    """
+    now = now or datetime.now(KST)
+    path = _blackout_state_path(context_key, state_dir)
+    state = _read_blackout(path, now)
+
+    if blind:
+        if state is None:
+            _write_blackout(path, now, escalated=False)
+            return None
+        since, escalated = state
+        elapsed = now - since
+        if not escalated and elapsed >= escalate_after:
+            _write_blackout(path, since, escalated=True)
+            return BlackoutEvent("escalated", elapsed.total_seconds() / 60)
+        return None
+
+    if state is None:
+        return None
+    since, escalated = state
+    _clear_blackout(path)
+    if not escalated:
+        return None
+    # 여기서 재는 길이는 "공백 시작 ~ 시세가 돌아온 회차"라 실제보다 최대 한 회차
+    # 길다. 사람이 로그를 찾아볼 구간을 좁혀주는 게 목적이라 이 정도면 충분하다.
+    return BlackoutEvent("recovered", (now - since).total_seconds() / 60)
+
+
+def close_blackout(context_key: str, *, now: datetime | None = None, state_dir: Path | None = None) -> float | None:
+    """열려 있는 공백 구간을 강제로 닫고 그 길이(분)를 돌려준다. 없으면 None.
+
+    장 마감 후에 한 번 부른다(scripts/decide_llm_sell.py). track_blackout의 복구
+    알림은 "시세가 돌아온 회차"에서만 나오는데, 2026-08-21처럼 공백인 채로 장이
+    끝나면 그 회차가 영영 안 온다 — 하필 가장 심한 공백이 마감 직전에 몰리므로
+    이 경로가 없으면 최악의 사례만 조용히 지나간다.
+    """
+    now = now or datetime.now(KST)
+    path = _blackout_state_path(context_key, state_dir)
+    state = _read_blackout(path, now)
+    _clear_blackout(path)
+    if state is None:
+        return None
+    since, _escalated = state
+    return (now - since).total_seconds() / 60
+
+
+def _write_blackout(path: Path, since: datetime, *, escalated: bool) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"since": since.isoformat(), "escalated": escalated}))
+    except OSError as exc:
+        # 못 써도 다음 회차가 새 구간으로 다시 시작할 뿐이다 — 알림이 늦어지지
+        # 알림 자체가 사라지진 않는다.
+        logger.warning("blackout_state_write_failed path=%s error=%s", path, exc)
+
+
+def _clear_blackout(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("blackout_state_clear_failed path=%s error=%s", path, exc)

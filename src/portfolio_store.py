@@ -56,10 +56,15 @@ def portfolio_lock(lock_path: Path | None = None, *, blocking: bool = True):
     읽고-고치고-쓰면 나중에 쓴 쪽이 먼저 쓴 쪽의 변경을 덮어써 버릴 수 있다.
 
     blocking=False면 락이 잡혀 있을 때 기다리지 않고 PortfolioLockBusy를 올린다.
-    1분마다 도는 잡(check_stop_loss)에 필요하다: KIS가 죽어서 한 번 도는 데
-    1분이 넘게 걸리면(최악 25.5초/요청 × 보유 종목수, kis.RETRY_BACKOFF_SECONDS)
+    1분마다 도는 잡(check_stop_loss)에 필요하다: KIS가 죽으면 한 회차가 길어지는데,
     블로킹 락으로는 매분 새 프로세스가 줄줄이 쌓인다. 이미 도는 회차가 어차피
-    같은 일을 하므로 이번 분은 건너뛰는 게 맞다."""
+    같은 일을 하므로 이번 분은 건너뛰는 게 맞다.
+
+    이 경로의 회차 길이는 kis.FAST_FAIL_POLICY가 정한다(5종목 기준 최악 약 38초,
+    60초 주기 안. 보유 종목이 늘면 요청당 1초씩 길어진다 — 그 상수 주석 참고).
+    2026-08-21까지는 5시도 예산이라 실측 75초였고, 그래서 실패한 회차마다 다음 분이
+    통째로 스킵돼 공백이 2분이 됐다 — 스킵 자체는 정상 동작이지만 그 빈도가
+    문제였다. 그 정책을 다시 늘린다면 여기 스킵률도 같이 봐야 한다."""
     lock_path = lock_path or PORTFOLIO_LOCK_PATH
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as f:

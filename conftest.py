@@ -16,3 +16,18 @@ def _no_fill_polling_wait(monkeypatch):
     """
     monkeypatch.setattr(kis, "FILL_POLL_TIMEOUT_S", 0.0)
     monkeypatch.setattr(kis, "FILL_POLL_INTERVAL_S", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_alert_state(monkeypatch, tmp_path):
+    """알림 상태 파일(하루 1회 마커 + 시세 공백 구간)을 항상 tmp로 돌린다.
+
+    기본값은 레포의 logs/alert_markers다. 막지 않으면 테스트가 운영 상태를
+    덮어쓴다 — EC2에서 테스트를 한 번 돌리면 그날 진짜 장애 알림이 "이미 보냈다"로
+    묻히고, 열려 있던 공백 구간도 지워진다. tests/test_evaluate_holdings.py에만
+    있던 방어를 여기로 올려 파일을 새로 만들 때 빠뜨릴 수 없게 했다.
+    """
+    from src import notify
+
+    monkeypatch.setattr(notify, "ALERT_MARKER_DIR", tmp_path / "alert_markers")
+    monkeypatch.setattr(notify, "BLACKOUT_STATE_DIR", tmp_path / "alert_markers")

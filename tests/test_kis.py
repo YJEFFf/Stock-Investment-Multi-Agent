@@ -173,7 +173,7 @@ def test_parse_daily_chart_extracts_bars_oldest_first():
 
 
 def test_fetch_daily_ohlcv_success(monkeypatch):
-    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params: FAKE_CHART_RESPONSE)
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: FAKE_CHART_RESPONSE)
 
     bars = kis.fetch_daily_ohlcv("005930", lookback_days=60)
 
@@ -182,13 +182,13 @@ def test_fetch_daily_ohlcv_success(monkeypatch):
 
 
 def test_fetch_daily_ohlcv_returns_none_when_request_fails(monkeypatch):
-    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params: None)
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: None)
 
     assert kis.fetch_daily_ohlcv("005930") is None
 
 
 def test_fetch_daily_ohlcv_trims_to_lookback_days(monkeypatch):
-    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params: FAKE_CHART_RESPONSE)
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: FAKE_CHART_RESPONSE)
 
     bars = kis.fetch_daily_ohlcv("005930", lookback_days=1)
 
@@ -238,14 +238,16 @@ def test_kis_post_returns_none_on_api_error(monkeypatch):
 
 def test_fetch_current_price_success(monkeypatch):
     monkeypatch.setattr(
-        kis, "_kis_get", lambda path, tr_id, params: {"rt_cd": "0", "output": {"stck_prpr": "231000"}}
+        kis,
+        "_kis_get",
+        lambda path, tr_id, params, policy=None: {"rt_cd": "0", "output": {"stck_prpr": "231000"}},
     )
 
     assert kis.fetch_current_price("005930") == 231000.0
 
 
 def test_fetch_current_price_returns_none_when_request_fails(monkeypatch):
-    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params: None)
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: None)
 
     assert kis.fetch_current_price("005930") is None
 
@@ -255,14 +257,14 @@ def test_fetch_current_price_returns_none_when_request_fails(monkeypatch):
 
 def test_fetch_account_balance_success(monkeypatch):
     monkeypatch.setattr(
-        kis, "_kis_get", lambda path, tr_id, params: {"output2": [{"tot_evlu_amt": "100000000"}]}
+        kis, "_kis_get", lambda path, tr_id, params, policy=None: {"output2": [{"tot_evlu_amt": "100000000"}]}
     )
 
     assert kis.fetch_account_balance() == 100000000.0
 
 
 def test_fetch_account_balance_returns_none_when_output_empty(monkeypatch):
-    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params: {"output2": []})
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: {"output2": []})
 
     assert kis.fetch_account_balance() is None
 
@@ -345,7 +347,7 @@ def test_place_market_sell_order_returns_none_when_request_fails(monkeypatch):
 
 def test_fetch_fill_price_success(monkeypatch):
     monkeypatch.setattr(
-        kis, "_kis_get", lambda path, tr_id, params: {"output2": {"pchs_avg_pric": "231500.0000"}}
+        kis, "_kis_get", lambda path, tr_id, params, policy=None: {"output2": {"pchs_avg_pric": "231500.0000"}}
     )
 
     price = kis.fetch_fill_price("005930", date(2026, 8, 9))
@@ -355,14 +357,14 @@ def test_fetch_fill_price_success(monkeypatch):
 
 def test_fetch_fill_price_returns_none_when_no_fills(monkeypatch):
     monkeypatch.setattr(
-        kis, "_kis_get", lambda path, tr_id, params: {"output2": {"pchs_avg_pric": "0"}}
+        kis, "_kis_get", lambda path, tr_id, params, policy=None: {"output2": {"pchs_avg_pric": "0"}}
     )
 
     assert kis.fetch_fill_price("005930", date(2026, 8, 9)) is None
 
 
 def test_fetch_fill_price_returns_none_when_request_fails(monkeypatch):
-    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params: None)
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: None)
 
     assert kis.fetch_fill_price("005930", date(2026, 8, 9)) is None
 
@@ -461,3 +463,98 @@ def test_kis_get_still_retries_network_errors(monkeypatch):
 
     assert kis._kis_get("/some/path", "TRID", {}) == FAKE_CHART_RESPONSE
     assert calls["n"] == 3
+
+
+# --- RetryPolicy (2026-08-21 장애 대응) ---
+
+
+def test_backoff_clamps_to_last_value_past_the_table():
+    policy = kis.RetryPolicy(timeout_seconds=1.0, max_attempts=5, backoff_seconds=(1.5, 3.0))
+
+    assert policy.backoff_for(1) == 1.5
+    assert policy.backoff_for(2) == 3.0
+    assert policy.backoff_for(3) == 3.0  # 표를 넘어가면 마지막 값을 계속 쓴다
+
+
+def test_fast_fail_policy_worst_case_fits_inside_the_one_minute_cron():
+    """이 정책의 존재 이유 자체다 — 숫자가 아니라 제약을 잠근다.
+
+    손절 체크는 매분 도는데, 한 회차가 60초를 넘기면 다음 분이 락에 막혀 통째로
+    스킵된다(portfolio_store.portfolio_lock, blocking=False). 2026-08-21 13:01에
+    기존 예산(5시도 x 10초 + 백오프 20.5초 = 실측 64초)이 정확히 그래서 13:02를
+    날렸고, 보유 5종목의 손절 판정이 2분간 비었다.
+    """
+    policy = kis.FAST_FAIL_POLICY
+    worst_case = policy.max_attempts * policy.timeout_seconds + sum(
+        policy.backoff_for(i) for i in range(1, policy.max_attempts)
+    )
+
+    assert worst_case < 60.0
+
+
+def test_default_policy_still_rides_out_the_ledger_capacity_window():
+    """하루 한 번짜리 경로는 예산을 줄이지 않는다 — 2026-08-19 회귀 방지.
+
+    09:00:07 원장 용량 거부 한 번에 그날 유일한 승인 매수가 날아간 뒤 넣은 게
+    이 누적 백오프다. 손절 체크가 빨라져야 한다는 이유로 여기까지 같이 깎으면
+    같은 사고가 재발한다.
+    """
+    policy = kis.DEFAULT_POLICY
+    cumulative_backoff = sum(policy.backoff_for(i) for i in range(1, policy.max_attempts))
+
+    assert policy.max_attempts == 5
+    assert cumulative_backoff >= 20.0
+
+
+def test_kis_get_stops_at_the_policy_attempt_limit(monkeypatch):
+    monkeypatch.setattr(kis, "get_access_token", lambda: "tok")
+    monkeypatch.setattr(kis.time, "sleep", lambda seconds: None)
+
+    class FakeResponse:
+        def json(self):
+            return RATE_LIMITED_RESPONSE
+
+    calls = {"n": 0}
+
+    def fake_get(*a, **k):
+        calls["n"] += 1
+        return FakeResponse()
+
+    monkeypatch.setattr(kis.requests, "get", fake_get)
+
+    assert kis._kis_get("/some/path", "TRID", {}, policy=kis.FAST_FAIL_POLICY) is None
+    assert calls["n"] == kis.FAST_FAIL_POLICY.max_attempts  # 기본값 5가 아니라 2
+
+
+def test_kis_get_uses_the_policy_timeout(monkeypatch):
+    monkeypatch.setattr(kis, "get_access_token", lambda: "tok")
+    seen = {}
+
+    class FakeResponse:
+        def json(self):
+            return FAKE_CHART_RESPONSE
+
+    def fake_get(*a, **kwargs):
+        seen["timeout"] = kwargs["timeout"]
+        return FakeResponse()
+
+    monkeypatch.setattr(kis.requests, "get", fake_get)
+
+    kis._kis_get("/some/path", "TRID", {}, policy=kis.FAST_FAIL_POLICY)
+
+    assert seen["timeout"] == kis.FAST_FAIL_POLICY.timeout_seconds
+
+
+def test_fetch_current_price_defaults_to_the_patient_policy(monkeypatch):
+    """정책을 명시하지 않은 호출처는 전부 기존 예산 그대로여야 한다."""
+    seen = {}
+
+    def fake_get(path, tr_id, params, policy=None):
+        seen["policy"] = policy
+        return {"rt_cd": "0", "output": {"stck_prpr": "231000"}}
+
+    monkeypatch.setattr(kis, "_kis_get", fake_get)
+
+    kis.fetch_current_price("005930")
+
+    assert seen["policy"] == kis.DEFAULT_POLICY

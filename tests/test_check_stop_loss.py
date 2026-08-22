@@ -48,7 +48,7 @@ def test_deterministic_only_no_llm_and_persists_result(monkeypatch, tmp_path):
     monkeypatch.setattr(csl.pipeline.notify, "send_telegram_alert", lambda message: True)
     monkeypatch.setattr(csl.pipeline, "display_name", lambda ticker: ticker)
 
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 89.0)  # -11%, 손절 트리거
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 89.0)  # -11%, 손절 트리거
 
     position = Position(ticker="005930", sector="반도체", weight=0.10, entry_price=100.0, peak_price=100.0)
     portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[position]))

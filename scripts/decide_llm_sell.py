@@ -73,6 +73,22 @@ async def _sync_daily_report(today_kst, portfolio) -> None:
         notify.send_telegram_alert(notify.format_error_alert("노션 일일 리포트 동기화 실패 (매매 자체엔 영향 없음)", repr(exc)))
 
 
+def _report_unresolved_blackout() -> None:
+    """장중 시세 공백이 복구를 못 본 채 끝났으면 여기서 마무리 보고한다.
+
+    pipeline.evaluate_holdings의 복구 알림은 "시세가 돌아온 회차"에서만 나온다.
+    2026-08-21처럼 15:07~15:29 공백이 그대로 장 마감으로 이어지면 그 회차가 영영
+    안 온다 — 하필 KIS 모의투자 지연이 가장 심한 시간대가 마감 직전이라, 이 경로가
+    없으면 제일 심한 공백만 조용히 지나간다. 15:35에 도는 이 스크립트가 장 마감 후
+    첫 실행이라 마무리를 맡는다.
+    """
+    minutes = notify.close_blackout(pipeline.BLACKOUT_CONTEXT)
+    if minutes is None:
+        return
+    logger.error("blackout_unresolved_at_close minutes=%.1f", minutes)
+    notify.send_telegram_alert(notify.format_blackout_unresolved_alert(minutes))
+
+
 async def main() -> None:
     today_kst = datetime.now(KST).date()
     if not is_krx_trading_day(today_kst):
@@ -81,6 +97,8 @@ async def main() -> None:
 
     day = datetime.now(timezone.utc)
     portfolio = load_portfolio()
+
+    _report_unresolved_blackout()
 
     actions: list[dict] = []
 

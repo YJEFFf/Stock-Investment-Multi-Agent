@@ -124,7 +124,7 @@ def test_sells_execute_before_buys(monkeypatch, tmp_path):
 
     monkeypatch.setattr(eo.pipeline, "finalize_sell", fake_finalize_sell)
     monkeypatch.setattr(eo.pipeline, "execute_buy_order", fake_execute_buy_order)
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 100.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 100.0)
 
     asyncio.run(eo.main())
 
@@ -281,7 +281,7 @@ def test_pending_sell_is_carried_over_when_price_is_unavailable(monkeypatch, tmp
         raise AssertionError("시세를 못 받았으면 집행하면 안 된다")
 
     monkeypatch.setattr(eo.pipeline, "finalize_sell", fail)
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: None)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: None)
 
     alerts = []
     monkeypatch.setattr(eo.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
@@ -312,7 +312,7 @@ def test_carried_over_sell_still_expires_by_staleness(monkeypatch, tmp_path):
         )
     )
 
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: None)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: None)
     monkeypatch.setattr(eo.notify, "send_telegram_alert", lambda message: True)
 
     asyncio.run(eo.main())
@@ -354,7 +354,7 @@ def test_executed_and_unavailable_sells_are_split(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(eo.pipeline, "finalize_sell", fake_finalize_sell)
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 100.0 if ticker == "005930" else None)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 100.0 if ticker == "005930" else None)
     monkeypatch.setattr(eo.notify, "send_telegram_alert", lambda message: True)
 
     asyncio.run(eo.main())

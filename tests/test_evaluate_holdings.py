@@ -56,7 +56,7 @@ def test_returns_unchanged_when_no_positions(monkeypatch):
 
 
 def test_skips_position_when_price_unavailable(monkeypatch, tmp_path):
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: None)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: None)
 
     position = _position()
     portfolio = PortfolioState(positions=[position], cash_weight=0.90)
@@ -71,7 +71,7 @@ def test_skips_position_when_price_unavailable(monkeypatch, tmp_path):
 
 
 def test_no_sell_when_price_within_normal_range(monkeypatch, tmp_path):
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 105.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 105.0)
 
     position = _position(entry_price=100.0, peak_price=100.0)
     portfolio = PortfolioState(positions=[position], cash_weight=0.90)
@@ -88,7 +88,7 @@ def test_no_sell_when_price_within_normal_range(monkeypatch, tmp_path):
 
 
 def test_stop_loss_removes_position_and_logs(monkeypatch, tmp_path):
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 89.0)  # -11%
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 89.0)  # -11%
 
     position = _position(entry_price=100.0, peak_price=100.0, weight=0.10, entry_day=DAY.date())
     portfolio = PortfolioState(positions=[position], cash_weight=0.90)
@@ -124,7 +124,7 @@ def test_stop_loss_removes_position_and_logs(monkeypatch, tmp_path):
 
 
 def test_take_profit_partial_sell_and_logs(monkeypatch, tmp_path):
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 120.0)  # +20%
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 120.0)  # +20%
 
     position = _position(entry_price=100.0, peak_price=100.0, weight=0.09, take_profit_stage=0)
     portfolio = PortfolioState(positions=[position], cash_weight=0.91)
@@ -152,7 +152,7 @@ def test_take_profit_partial_sell_and_logs(monkeypatch, tmp_path):
 
 def test_handles_multiple_positions_independently(monkeypatch, tmp_path):
     prices = {"005930": 89.0, "000660": 101.0}
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: prices[ticker])
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: prices[ticker])
 
     positions = [
         _position(ticker="005930", entry_price=100.0, peak_price=100.0, weight=0.10),
@@ -177,7 +177,7 @@ def test_handles_multiple_positions_independently(monkeypatch, tmp_path):
 
 
 def test_price_fetch_exception_is_treated_like_unavailable(monkeypatch, tmp_path):
-    def raise_error(ticker):
+    def raise_error(ticker, policy=None):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(kis, "fetch_current_price", raise_error)
@@ -200,7 +200,7 @@ def test_price_fetch_exception_is_treated_like_unavailable(monkeypatch, tmp_path
 def test_llm_layer_skipped_by_default(monkeypatch, tmp_path):
     """analyst_fn/judge_sell_fn을 안 넣으면 결정론적 안전장치만 돈다 — 트리거
     안 되는 정상 범위 가격에서는 아무것도 재평가하지 않는다."""
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 105.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 105.0)
 
     def fail(*a, **k):
         raise AssertionError("analyst_fn을 안 줬으면 호출되면 안 된다")
@@ -218,7 +218,7 @@ def test_llm_layer_skipped_by_default(monkeypatch, tmp_path):
 
 def test_llm_layer_not_consulted_when_deterministic_already_triggered(monkeypatch, tmp_path):
     """코드가 이미 손절을 결정했으면 같은 포지션에 대해 LLM에게 다시 묻지 않는다."""
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 89.0)  # -11%, 손절 트리거
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 89.0)  # -11%, 손절 트리거
 
     async def fail_analyst(ticker, sector, day):
         raise AssertionError("결정론적 매도가 이미 트리거됐으면 재분석하면 안 된다")
@@ -246,7 +246,7 @@ def test_llm_layer_not_consulted_when_deterministic_already_triggered(monkeypatc
 
 
 def test_llm_layer_consulted_when_no_deterministic_trigger(monkeypatch, tmp_path):
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 105.0)  # 트리거 없음
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 105.0)  # 트리거 없음
 
     captured = {}
 
@@ -289,7 +289,7 @@ def test_llm_layer_consulted_when_no_deterministic_trigger(monkeypatch, tmp_path
 
 
 def test_llm_layer_holds_when_judge_sell_returns_none(monkeypatch, tmp_path):
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 105.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 105.0)
 
     async def fake_analyst(ticker, sector, day):
         return [AnalystOpinion(agent="chart", ticker=ticker, score=0.3, confidence=0.5, evidence=["e"], as_of=day)]
@@ -317,7 +317,7 @@ def test_llm_layer_holds_when_judge_sell_returns_none(monkeypatch, tmp_path):
 
 
 def test_llm_layer_analyst_failure_treated_as_no_opinions(monkeypatch, tmp_path):
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 105.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 105.0)
 
     async def failing_analyst(ticker, sector, day):
         raise RuntimeError("boom")
@@ -353,7 +353,7 @@ def test_llm_layer_analyst_failure_treated_as_no_opinions(monkeypatch, tmp_path)
 def test_journal_records_weight_reduced_and_sell_amount_on_partial_take_profit(monkeypatch, tmp_path):
     """부분 익절은 sell_fraction(잔량 대비 비율)만 봐서는 포트폴리오를 얼마나 줄였는지
     안 보인다 — 전체 대비 줄인 비중과 매도 금액이 일지에 같이 남아야 한다."""
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 120.0)  # +20%, 1차 익절
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 120.0)  # +20%, 1차 익절
     monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
 
     position = _position(
@@ -387,7 +387,7 @@ def test_journal_records_weight_reduced_and_sell_amount_on_partial_take_profit(m
 
 
 def test_journal_records_full_position_on_stop_loss(monkeypatch, tmp_path):
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 89.0)  # -11%
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 89.0)  # -11%
     monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
 
     position = _position(
@@ -418,7 +418,7 @@ def test_journal_records_full_position_on_stop_loss(monkeypatch, tmp_path):
 
 def test_journal_records_the_exit_plan_that_actually_applied(monkeypatch, tmp_path):
     """LLM이 정한 계획으로 잘린 건지 고정 기본값으로 잘린 건지 나중에 갈라볼 수 있어야 한다."""
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 94.0)  # -6%
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 94.0)  # -6%
     monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
 
     plan = ExitPlan(
@@ -450,7 +450,7 @@ def test_position_fractions_always_sum_to_one(monkeypatch, tmp_path):
     """한 행만 보고 해석되려면 두 값의 합이 100%여야 한다 — 이게 깨지면 '보유분의
     몇 %'라는 말 자체가 성립하지 않는다. 주식수 내림으로 33.3%를 정확히 못 파는
     경우(30주가 아닌 31주)에도 성립해야 한다."""
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 120.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 120.0)
     monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
 
     position = _position(entry_price=100.0, peak_price=100.0, weight=0.12, entry_day=DAY.date(), quantity=31)
@@ -481,7 +481,7 @@ def test_journal_does_not_trust_a_fill_that_missed_part_of_the_order(monkeypatch
 
     덜 잡힌 체결(complete=False)이면 수량은 집행 전후 상태 차이에서 다시 뽑고,
     총액은 관측된 평균 단가로 되세운다."""
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 229_500.0)  # 판단 시점 호가
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 229_500.0)  # 판단 시점 호가
     monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
 
     # 주문 직전 0주 -> 조회 시점엔 19주만 잡힘(실제로는 31주가 다 체결됐다).
@@ -522,7 +522,7 @@ def test_alerts_once_when_no_position_price_could_be_fetched(monkeypatch, tmp_pa
     둘 다 똑같이 조용했다 — 2026-08-20 15:17~15:27에 실제로 그랬다."""
     portfolio = PortfolioState(cash_weight=0.80, positions=[_position(), _position(ticker="000660")])
 
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: None)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: None)
 
     alerts = []
     monkeypatch.setattr(pipeline.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
@@ -542,7 +542,7 @@ def test_no_all_prices_alert_when_at_least_one_price_arrives(monkeypatch, tmp_pa
     """일부만 실패하는 건 정상 장애 범위다 — 여기까지 알리면 매분 울린다."""
     portfolio = PortfolioState(cash_weight=0.80, positions=[_position(), _position(ticker="000660")])
 
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 100.0 if ticker == "005930" else None)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 100.0 if ticker == "005930" else None)
 
     alerts = []
     monkeypatch.setattr(pipeline.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
@@ -550,3 +550,110 @@ def test_no_all_prices_alert_when_at_least_one_price_arrives(monkeypatch, tmp_pa
     asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
 
     assert alerts == []
+
+
+def test_per_minute_check_asks_kis_with_the_fast_fail_policy(monkeypatch, tmp_path):
+    """매분 도는 이 경로만 빠른 실패 예산을 쓴다.
+
+    크론이 곧 재시도 루프라 회차 안에서 버티는 건 공백만 늘린다. 2026-08-21에
+    기존 예산으로 한 회차가 실측 75초 걸려, 회차 실패와 락 스킵이 교대로 이어지며
+    15:07~15:29 23분간 손절/익절 판정이 한 번도 없었다.
+    """
+    seen = []
+
+    def record(ticker, policy=None):
+        seen.append(policy)
+        return 105.0
+
+    monkeypatch.setattr(kis, "fetch_current_price", record)
+
+    portfolio = PortfolioState(positions=[_position()], cash_weight=0.90)
+
+    asyncio.run(
+        pipeline.evaluate_holdings(
+            portfolio, DAY, sell.execute_sell_simulated, log_path=tmp_path / "sell.jsonl"
+        )
+    )
+
+    assert seen == [kis.FAST_FAIL_POLICY]
+
+
+# --- 공백이 길어지면 다시 알린다 (2026-08-21 오후 23분 공백 무알림) ---
+
+
+def _blind(monkeypatch):
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: None)
+
+
+def _frozen_clock(monkeypatch, tmp_path, start):
+    """evaluate_holdings는 시계를 인자로 받지 않는다 — track_blackout을 감싸 시간만
+    갈아끼운다. 원본을 먼저 잡아두지 않으면 감싼 함수가 자기 자신을 부른다."""
+    real_track = pipeline.notify.track_blackout
+    clock = [start]
+    monkeypatch.setattr(
+        pipeline.notify,
+        "track_blackout",
+        lambda ctx, blind, **kw: real_track(ctx, blind, now=clock[0], state_dir=tmp_path / "bo"),
+    )
+    return clock
+
+
+def test_long_blackout_alerts_again_even_after_the_daily_one_was_spent(monkeypatch, tmp_path):
+    """하루 1회 알림은 "시작됐다"까지만 알린다. 2026-08-21은 13:02에 그걸 써버려서
+    15:07~15:29의 23분 공백(장 마감 직전, 안전장치가 통째로 눈을 감은 구간)이
+    무알림으로 지나갔다."""
+    portfolio = PortfolioState(cash_weight=0.80, positions=[_position(), _position(ticker="000660")])
+    _blind(monkeypatch)
+
+    alerts = []
+    monkeypatch.setattr(pipeline.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    clock = _frozen_clock(monkeypatch, tmp_path, datetime(2026, 8, 21, 15, 7, tzinfo=pipeline.notify.KST))
+
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+    assert len(alerts) == 1  # 하루 1회 알림
+
+    clock[0] = datetime(2026, 8, 21, 15, 13, tzinfo=pipeline.notify.KST)
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    assert len(alerts) == 2
+    assert "공백 지속" in alerts[1]
+    assert "6분째" in alerts[1]
+
+
+def test_recovery_reports_how_long_the_safety_net_was_blind(monkeypatch, tmp_path):
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position()])
+
+    alerts = []
+    monkeypatch.setattr(pipeline.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    clock = _frozen_clock(monkeypatch, tmp_path, datetime(2026, 8, 21, 13, 51, tzinfo=pipeline.notify.KST))
+
+    _blind(monkeypatch)
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+    clock[0] = datetime(2026, 8, 21, 13, 57, tzinfo=pipeline.notify.KST)
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 100.0)
+    clock[0] = datetime(2026, 8, 21, 13, 58, tzinfo=pipeline.notify.KST)
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    assert "공백 종료" in alerts[-1]
+    assert "7분간" in alerts[-1]
+
+
+def test_every_round_leaves_a_line_even_when_nothing_happens(monkeypatch, tmp_path, caplog):
+    """성공 회차가 무로깅이면 "문턱을 안 넘어 조용한 회차"와 "아예 안 돈 회차"가
+    로그에서 같은 모양이 된다 — 2026-08-21 장애를 사후 분석할 때 실패 로그의
+    부재로 성공을 역추정해야 했다."""
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position()])
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 100.0)
+
+    with caplog.at_level("INFO"):
+        asyncio.run(
+            pipeline.evaluate_holdings(
+                portfolio, DAY, sell.execute_sell_simulated, log_path=tmp_path / "sell.jsonl"
+            )
+        )
+
+    assert "evaluate_holdings_done positions=1 priced=1 sells=0" in caplog.text

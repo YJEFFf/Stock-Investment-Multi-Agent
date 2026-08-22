@@ -44,6 +44,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -73,12 +74,58 @@ ACCOUNT_PRODUCT_CODE = "01"  # 실측으로 확인됨 — 계좌번호 뒤 2자�
 
 TOKEN_CACHE_PATH = Path(__file__).resolve().parent.parent / ".kis_token_cache.json"
 
-REQUEST_TIMEOUT_SECONDS = 10.0
-MAX_ATTEMPTS = 5
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """한 번의 KIS 요청에 쓸 재시도 예산.
+
+    호출처마다 다른 이유: 같은 시세 조회라도 하루 한 번 도는 집행 경로와 매분
+    도는 손절 체크는 실패를 견디는 방식이 정반대다. 전자는 다음 기회가 없으니
+    회차 안에서 버텨야 하고, 후자는 1분 뒤 크론이 어차피 다시 부르므로 회차를
+    짧게 끝내는 쪽이 공백이 짧다.
+    """
+
+    timeout_seconds: float
+    max_attempts: int
+    backoff_seconds: tuple[float, ...]
+
+    def backoff_for(self, attempt: int) -> float:
+        """attempt번째 시도 직후 쉴 시간. 표를 넘어가면 마지막 값을 계속 쓴다."""
+        return self.backoff_seconds[min(attempt, len(self.backoff_seconds)) - 1]
+
+
 # 1.5 → 3 → 6 → 10초 (누적 20.5초). 09:00 장 시작 직후 모의투자 원장이 순간적으로
 # 유량을 막는 구간을 넘기려면 이 정도는 버텨야 한다 — 2026-08-19에 09:00:07의
 # 0.06초짜리 거부 한 번이 재시도 없이 그날 유일한 승인 매수를 날렸다.
-RETRY_BACKOFF_SECONDS = (1.5, 3.0, 6.0, 10.0)
+# 하루 한 번짜리 경로(08:30 판단·09:01 집행·15:35 판단)는 전부 이걸 쓴다.
+DEFAULT_POLICY = RetryPolicy(
+    timeout_seconds=10.0,
+    max_attempts=5,
+    backoff_seconds=(1.5, 3.0, 6.0, 10.0),
+)
+
+# 매분 도는 손절/익절 체크 전용(pipeline.evaluate_holdings).
+# 크론이 곧 재시도 루프라 회차 안에서 오래 버티지 않는다 — 5종목 기준 최악 약 38초로
+# 60초 주기 안에 들어와, 다음 분이 락에 막혀 통째로 스킵되는 일이 없다.
+#
+# 38초의 내역: 15초(1차 타임아웃) + 1.5초(백오프) + 15초(2차) + 종목 수만큼의 스태거.
+# _throttle이 요청을 1초 간격으로 벌리므로 **보유 종목이 늘면 그만큼 길어진다**
+# (대략 31.5 + N초). 20종목을 넘으면 다시 60초를 넘기니 그때 이 값을 다시 봐야 한다.
+#
+# 2026-08-21 장애가 근거다. 기존 예산(5시도)으로 한 회차가 **실측 75초**(15:08:02
+# 시작 → 15:09:17 exhausted) 걸려, 짝수 분 회차가 실패하고 홀수 분은 락에 막히는
+# 교대 패턴이 15:07~15:29 23분간 이어졌다. 타임아웃을 10→15초로 오히려 **늘린** 건
+# 그 장애가 전부 read timeout이었기 때문이다(당시 실측 응답 6초, 한계 10초라 여유 4초).
+# 시도 횟수를 줄여 확보한 시간을 회당 인내심으로 옮긴 것이다.
+#
+# 다만 이 정책은 공백의 **간격**을 2분에서 1분으로 좁힐 뿐, 서버가 응답을 아예 안 주는
+# 구간 자체를 없애지는 못한다. 그 구간을 사람이 알게 하는 건 notify.track_blackout이다.
+FAST_FAIL_POLICY = RetryPolicy(
+    timeout_seconds=15.0,
+    max_attempts=2,
+    backoff_seconds=(1.5,),
+)
+
 MIN_REQUEST_SPACING_SECONDS = 1.0  # 실측: 0.3초 간격은 부족했다. 모의투자 한도는 초당 2건(2026-08-19)
 
 # 용량 거부(= 다시 보내면 통과할 수 있는 "지금 바빠서 안 됨")를 가리는 기준.
@@ -145,7 +192,7 @@ def get_access_token() -> str | None:
                     "appkey": os.getenv("KIS_APP_KEY", ""),
                     "appsecret": os.getenv("KIS_APP_SECRET", ""),
                 },
-                timeout=REQUEST_TIMEOUT_SECONDS,
+                timeout=DEFAULT_POLICY.timeout_seconds,
             )
             data = response.json()
         except (requests.RequestException, ValueError) as exc:
@@ -172,11 +219,6 @@ def _throttle() -> None:
         _last_request_at = time.monotonic()
 
 
-def _backoff_seconds(attempt: int) -> float:
-    """attempt번째 시도 직후 쉴 시간. 표를 넘어가면 마지막 값을 계속 쓴다."""
-    return RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS)) - 1]
-
-
 def _is_capacity_rejection(data: dict) -> bool:
     """다시 보내면 통과할 수 있는 용량 거부인가.
 
@@ -200,6 +242,7 @@ def _kis_request(
     params: dict | None = None,
     body: dict | None = None,
     idempotent: bool = True,
+    policy: RetryPolicy = DEFAULT_POLICY,
 ) -> dict | None:
     """공통 KIS 요청(GET/POST).
 
@@ -229,18 +272,18 @@ def _kis_request(
     if body is not None:
         headers["custtype"] = "P"
 
-    max_attempts = MAX_ATTEMPTS if idempotent else 1
+    max_attempts = policy.max_attempts if idempotent else 1
     last_error: Exception | str | None = None
     for attempt in range(1, max_attempts + 1):
         _throttle()
         try:
             if method == "GET":
                 response = requests.get(
-                    f"{BASE_URL}{path}", headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS
+                    f"{BASE_URL}{path}", headers=headers, params=params, timeout=policy.timeout_seconds
                 )
             else:
                 response = requests.post(
-                    f"{BASE_URL}{path}", headers=headers, data=json.dumps(body), timeout=REQUEST_TIMEOUT_SECONDS
+                    f"{BASE_URL}{path}", headers=headers, data=json.dumps(body), timeout=policy.timeout_seconds
                 )
             data = response.json()
         except (requests.RequestException, ValueError) as exc:
@@ -250,7 +293,7 @@ def _kis_request(
             last_error = exc
             logger.warning("kis_fetch_failed path=%s attempt=%d error=%s", path, attempt, exc)
             if attempt < max_attempts:
-                time.sleep(_backoff_seconds(attempt))
+                time.sleep(policy.backoff_for(attempt))
             continue
 
         if data.get("rt_cd") == "0":
@@ -264,7 +307,7 @@ def _kis_request(
                 "kis_rate_limited path=%s attempt=%d msg_cd=%s msg=%s", path, attempt, msg_cd, msg1
             )
             if attempt < max_attempts:
-                time.sleep(_backoff_seconds(attempt))
+                time.sleep(policy.backoff_for(attempt))
             continue
 
         # msg_cd를 반드시 함께 남긴다 — 이게 없으면 새로운 용량 거부가 나타나도
@@ -276,8 +319,8 @@ def _kis_request(
     return None
 
 
-def _kis_get(path: str, tr_id: str, params: dict) -> dict | None:
-    return _kis_request("GET", path, tr_id, params=params)
+def _kis_get(path: str, tr_id: str, params: dict, *, policy: RetryPolicy = DEFAULT_POLICY) -> dict | None:
+    return _kis_request("GET", path, tr_id, params=params, policy=policy)
 
 
 def _kis_post(path: str, tr_id: str, body: dict) -> dict | None:
@@ -333,10 +376,13 @@ def fetch_daily_ohlcv(ticker: str, lookback_days: int = 60) -> list[OHLCVBar] | 
     return bars[-lookback_days:]
 
 
-def fetch_current_price(ticker: str) -> float | None:
-    """실시간 현재가. 갭 체크(장 시작가 vs 전일 종가)와 주문 수량 계산에 쓴다."""
+def fetch_current_price(ticker: str, *, policy: RetryPolicy = DEFAULT_POLICY) -> float | None:
+    """실시간 현재가. 갭 체크(장 시작가 vs 전일 종가)와 주문 수량 계산에 쓴다.
+
+    매분 도는 손절 체크만 policy=FAST_FAIL_POLICY로 부른다 — 이유는 그 상수 주석 참고.
+    """
     params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}
-    data = _kis_get(CURRENT_PRICE_PATH, CURRENT_PRICE_TR_ID, params)
+    data = _kis_get(CURRENT_PRICE_PATH, CURRENT_PRICE_TR_ID, params, policy=policy)
     if data is None:
         return None
 

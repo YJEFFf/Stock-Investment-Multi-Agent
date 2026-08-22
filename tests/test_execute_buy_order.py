@@ -85,7 +85,7 @@ def test_skips_when_gate_not_approved(monkeypatch):
 
 def test_skips_when_gap_too_large(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 110.0)  # +10%, 문턱(3%) 초과
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 110.0)  # +10%, 문턱(3%) 초과
 
     def fail(*a, **k):
         raise AssertionError("갭이 크면 잔고 조회까지 가면 안 된다")
@@ -109,7 +109,7 @@ def test_skips_when_gap_too_large(monkeypatch, tmp_path):
 
 def test_skips_when_price_data_unavailable(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: None)
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 100.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 100.0)
 
     portfolio = PortfolioState()
     log_path = tmp_path / "trade_journal.jsonl"
@@ -126,7 +126,7 @@ def test_skips_when_price_data_unavailable(monkeypatch, tmp_path):
 
 def test_skips_when_balance_unavailable(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 101.0)
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: None)
 
     portfolio = PortfolioState()
@@ -144,7 +144,7 @@ def test_skips_when_balance_unavailable(monkeypatch, tmp_path):
 
 def test_skips_when_order_rejected(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 101.0)
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
     monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: None)
 
@@ -163,7 +163,7 @@ def test_skips_when_order_rejected(monkeypatch, tmp_path):
 
 def test_opens_new_position_with_fill_price(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(230000.0))
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 231000.0)  # 갭 ~0.4%, 문턱 이내
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 231000.0)  # 갭 ~0.4%, 문턱 이내
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
 
     captured_qty = {}
@@ -205,7 +205,7 @@ def test_opens_new_position_with_fill_price(monkeypatch, tmp_path):
 
 def test_falls_back_to_current_price_when_fill_price_unavailable(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 101.0)
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
     monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: "ODNO123")
     monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, order_date: None)
@@ -227,7 +227,7 @@ def test_falls_back_to_current_price_when_fill_price_unavailable(monkeypatch, tm
 
 def test_adds_to_existing_position_with_weighted_average_entry_price(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(200.0))
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 200.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 200.0)
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
     monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: "ODNO456")
     monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, order_date: 200.0)
@@ -271,7 +271,7 @@ def _plan(stop_loss_pct=-0.06) -> ExitPlan:
 
 def _wire_successful_buy(monkeypatch):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 101.0)
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
     monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: "order-1")
     monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, day: 101.0)
@@ -372,7 +372,7 @@ def _wire_buy_with_prices(monkeypatch, fill_price, position_avg, bracket=None):
     `bracket`은 (주문전, 주문후) 누적 체결 집계 튜플이며 None이면 조회 불가로 둔다.
     """
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)  # 주문 직전 호가
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 101.0)  # 주문 직전 호가
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
     monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: "order-1")
     monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, day: fill_price)
@@ -473,7 +473,7 @@ def test_records_position_when_order_response_lost_but_fill_appears(monkeypatch,
     손절·익절 평가 대상에서 통째로 빠진다.
     """
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 101.0)
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
     monkeypatch.setattr(kis, "place_market_buy_order", _raise_response_lost)
 
@@ -499,7 +499,7 @@ def test_records_position_when_order_response_lost_but_fill_appears(monkeypatch,
 def test_skips_when_order_response_lost_and_no_fill(monkeypatch, tmp_path):
     """응답 유실 + 원장에 체결 흔적 없음 = 주문이 안 나갔다고 본다. 재전송하지 않는다."""
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker: 101.0)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 101.0)
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
 
     order_calls = {"n": 0}

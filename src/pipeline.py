@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -53,6 +53,10 @@ DEFAULT_SELL_LOG_PATH = Path("logs/sell.jsonl")
 # 근거 전체(분석가 의견·토론·매니저 사유)를 사람이 읽을 수 있는 형태로 남긴다. 나중에
 # 노션 매매일지 동기화가 이 파일 하나만 읽으면 되도록 하는 게 목적(2026-08-09).
 DEFAULT_TRADE_JOURNAL_LOG_PATH = Path("logs/trade_journal.jsonl")
+
+# 시세 공백(보유 종목 전멸) 구간을 세는 키. notify의 하루 1회 알림 마커와 같은 키를
+# 써서 "같은 사건"임을 한눈에 보이게 한다 — 마커는 .txt, 공백 상태는 .blackout.json.
+BLACKOUT_CONTEXT = "holdings_all_prices_unavailable"
 
 # 정량 사전 필터 절대 문턱값 (docs/PLAN.md §5, 2026-08-08 확정). 관행값으로 시작하고
 # 나중에 필터 통과율 로그를 보고 조정한다 — 과거 수익률에 맞춰 역산하지 않는다.
@@ -232,7 +236,11 @@ async def execute_buy_order(
         return portfolio
 
     ticker = decision.ticker
-    today = datetime.now(timezone.utc).date()
+    # UTC 날짜가 아니라 KRX 주문일자다. 이 값은 매매일지의 day로도 들어가고 일일
+    # 리포트가 그 day로 필터링하므로, 09:01(=00:01 UTC)보다 조금이라도 이른 시각에
+    # 돌면 그날 기록이 통째로 하루 전으로 밀린다 — _kst_today docstring의 832fb8b와
+    # 같은 버그다. 같은 함수가 원장 조회에는 이미 _kst_today()를 쓰고 있었다.
+    today = _kst_today()
 
     prev_bars, current_price = await asyncio.gather(
         asyncio.to_thread(kis.fetch_daily_ohlcv, ticker, 2),
@@ -745,8 +753,13 @@ async def evaluate_holdings(
     if not portfolio.positions:
         return portfolio
 
+    # 이 경로만 FAST_FAIL_POLICY다 — 매분 도는 크론이 곧 재시도 루프라 회차 안에서
+    # 오래 버틸수록 다음 분이 락에 막혀 공백만 길어진다(kis.FAST_FAIL_POLICY 주석).
     price_results = await asyncio.gather(
-        *(asyncio.to_thread(kis.fetch_current_price, p.ticker) for p in portfolio.positions),
+        *(
+            asyncio.to_thread(kis.fetch_current_price, p.ticker, policy=kis.FAST_FAIL_POLICY)
+            for p in portfolio.positions
+        ),
         return_exceptions=True,
     )
 
@@ -773,10 +786,25 @@ async def evaluate_holdings(
             notify.format_error_alert(
                 "보유 종목 시세를 하나도 못 받아 손절/익절 판정을 못 했습니다 (이 회차)",
                 f"보유 {len(portfolio.positions)}종목 전부 시세 조회 실패 — KIS 장애 의심. "
-                "복구될 때까지 매분 체크가 계속 헛돕니다(오늘 이 알림은 1회만).",
+                "복구될 때까지 매분 체크가 계속 헛돕니다(공백이 길어지면 다시 알립니다).",
             ),
         )
 
+    # 하루 1회 알림은 "시작됐다"까지만 알린다. 얼마나 길어지고 있는지는 따로 센다 —
+    # 2026-08-21에 13:02 알림 하나로 하루치를 써버려 15:07~15:29의 23분 공백이
+    # 무알림으로 지나갔다(notify.track_blackout 주석).
+    blackout = notify.track_blackout(BLACKOUT_CONTEXT, not price_by_ticker)
+    if blackout is not None:
+        if blackout.kind == "escalated":
+            logger.error("evaluate_holdings_blackout_escalated minutes=%.1f", blackout.minutes)
+            notify.send_telegram_alert(
+                notify.format_blackout_escalation_alert(blackout.minutes, len(portfolio.positions))
+            )
+        else:
+            logger.info("evaluate_holdings_blackout_recovered minutes=%.1f", blackout.minutes)
+            notify.send_telegram_alert(notify.format_blackout_recovery_alert(blackout.minutes))
+
+    sells = 0
     for ticker, current_price in price_by_ticker.items():
         position = next(p for p in portfolio.positions if p.ticker == ticker)
         position = sell.update_peak_price(position, current_price)
@@ -807,7 +835,18 @@ async def evaluate_holdings(
         portfolio = await finalize_sell(
             portfolio, action, position, current_price, day, sell_execute_fn, log_path, trade_journal_log_path
         )
+        sells += 1
 
+    # 성공한 회차도 한 줄 남긴다. 이게 없으면 "문턱을 안 넘어서 조용한 회차"와
+    # "아예 안 돈 회차"가 로그에서 완전히 같은 모양이다 — 2026-08-21 장애를
+    # 사후 분석할 때 실패 로그의 *부재*로 성공을 역추정해야 했다. 매분 한 줄씩
+    # 늘지만(하루 약 390줄) 안전장치가 실제로 돌았다는 유일한 증거다.
+    logger.info(
+        "evaluate_holdings_done positions=%d priced=%d sells=%d",
+        len(portfolio.positions),
+        len(price_by_ticker),
+        sells,
+    )
     return portfolio
 
 

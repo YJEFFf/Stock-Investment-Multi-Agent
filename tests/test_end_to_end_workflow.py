@@ -97,7 +97,7 @@ def test_full_daily_workflow_sell_then_buy_end_to_end(monkeypatch, tmp_path):
     fake_bars = _flat_bars()
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days=60: fake_bars)
 
-    def fake_current_price(ticker):
+    def fake_current_price(ticker, policy=None):
         return 89.0 if ticker == HELD_TICKER else 70000.0  # 보유종목은 -11%(손절), 신규후보는 무갭
 
     monkeypatch.setattr(kis, "fetch_current_price", fake_current_price)
