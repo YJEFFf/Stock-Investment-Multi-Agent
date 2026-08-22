@@ -439,8 +439,9 @@ def test_sync_daily_report_creates_one_page_summarizing_the_day(monkeypatch, tmp
 
     captured = {}
 
-    def fake_request(method, path, body=None):
-        captured["body"] = body
+    def fake_request(method, path, body=None, notion_version=None):
+        if path == "/pages":
+            captured["body"] = body
         return {"id": "report-page-1"}
 
     monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
@@ -939,3 +940,121 @@ def test_update_replaces_the_body_instead_of_appending_to_it(monkeypatch, tmp_pa
     asyncio.run(notion_sync.sync_trade_journal(log_path, "db-1", state_path=state_path))
 
     assert deleted == ["/blocks/old-block-1", "/blocks/old-block-2"]
+
+
+# --- 일일 리포트 표 정렬: 최신이 맨 위 (사용자 요청 2026-08-23) ---
+
+
+def _record_view_requests(monkeypatch, list_result=None):
+    """/views 호출만 기록하는 가짜 _notion_request. 나머지 요청은 성공으로 흘린다."""
+    calls = []
+
+    def fake_request(method, path, body=None, notion_version=None):
+        if path.startswith("/views"):
+            calls.append({"method": method, "path": path, "body": body, "version": notion_version})
+            if method == "GET":
+                return list_result if list_result is not None else {"results": [{"id": "view-1"}]}
+        return {"id": "x"}
+
+    monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
+    return calls
+
+
+def test_sort_database_newest_first_sorts_every_view_by_date_descending(monkeypatch):
+    calls = _record_view_requests(monkeypatch, {"results": [{"id": "view-1"}, {"id": "view-2"}]})
+
+    assert notion_sync.sort_database_newest_first("db-1") is True
+
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["path"] == "/views?database_id=db-1"
+    assert [c["path"] for c in calls[1:]] == ["/views/view-1", "/views/view-2"]
+    for patch_call in calls[1:]:
+        assert patch_call["method"] == "PATCH"
+        assert patch_call["body"] == {"sorts": [{"property": "날짜", "direction": "descending"}]}
+
+
+def test_view_sort_requests_use_the_newer_api_version(monkeypatch):
+    """뷰 API는 2025-09-03부터 열렸다 — 모듈 기본값(2022-06-28)으로 보내면 404다."""
+    calls = _record_view_requests(monkeypatch)
+
+    notion_sync.sort_database_newest_first("db-1")
+
+    assert calls, "뷰 요청이 아예 나가지 않았다"
+    for call in calls:
+        assert call["version"] == "2025-09-03"
+
+
+def test_notion_request_sends_the_version_override_in_the_header(monkeypatch):
+    sent = {}
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        sent["headers"] = headers
+        return _FakeResponse(200, {"ok": True})
+
+    monkeypatch.setattr(notion_sync.requests, "request", fake_request)
+
+    notion_sync._notion_request("GET", "/views?database_id=db-1", None, notion_version="2025-09-03")
+    assert sent["headers"]["Notion-Version"] == "2025-09-03"
+
+    notion_sync._notion_request("POST", "/pages", {})
+    assert sent["headers"]["Notion-Version"] == notion_sync.NOTION_VERSION
+
+
+def test_sort_database_newest_first_reports_failure_without_raising(monkeypatch):
+    monkeypatch.setattr(notion_sync, "_notion_request", lambda *a, **k: None)
+    assert notion_sync.sort_database_newest_first("db-1") is False
+
+    monkeypatch.setattr(notion_sync, "_notion_request", lambda *a, **k: {"results": []})
+    assert notion_sync.sort_database_newest_first("db-1") is False
+
+
+def test_create_daily_report_database_sorts_the_new_table_newest_first(monkeypatch):
+    calls = _record_view_requests(monkeypatch)
+
+    assert notion_sync.create_daily_report_database("parent-1") == "x"
+
+    assert [c["method"] for c in calls] == ["GET", "PATCH"]
+    assert calls[1]["body"] == {"sorts": [{"property": "날짜", "direction": "descending"}]}
+
+
+def test_sync_daily_report_fixes_the_view_sort_before_adding_todays_row(monkeypatch, tmp_path):
+    """이미 만들어진 DB(정렬 없이 생성된)도 다음 리포트 때 스스로 고쳐진다 —
+    EC2에서 손으로 정렬을 걸어두는(=git에 안 남는) 조치가 필요 없게."""
+    calls = _record_view_requests(monkeypatch)
+
+    created = asyncio.run(
+        notion_sync.sync_daily_report(
+            "2026-08-23",
+            PortfolioState(),
+            "report-db-1",
+            pipeline_log_path=tmp_path / "missing.jsonl",
+            trade_journal_log_path=tmp_path / "missing2.jsonl",
+            state_path=tmp_path / "state.json",
+        )
+    )
+
+    assert created is True
+    assert calls[0]["path"] == "/views?database_id=report-db-1"
+    assert calls[1]["body"] == {"sorts": [{"property": "날짜", "direction": "descending"}]}
+
+
+def test_sync_daily_report_still_written_when_the_view_sort_fails(monkeypatch, tmp_path):
+    def fake_request(method, path, body=None, notion_version=None):
+        if path.startswith("/views"):
+            return None
+        return {"id": "report-page-1"}
+
+    monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
+
+    created = asyncio.run(
+        notion_sync.sync_daily_report(
+            "2026-08-23",
+            PortfolioState(),
+            "report-db-1",
+            pipeline_log_path=tmp_path / "missing.jsonl",
+            trade_journal_log_path=tmp_path / "missing2.jsonl",
+            state_path=tmp_path / "state.json",
+        )
+    )
+
+    assert created is True

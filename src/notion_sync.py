@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
+# 뷰(정렬)는 2025-09-03 버전에서 처음 열린 API다. 이 두 요청(/views)만 새 버전으로
+# 보내고 나머지는 2022-06-28 그대로 둔다 — 새 버전은 database/data_source 모델이
+# 통째로 달라서 모듈 전체를 올리면 매매일지·리포트 생성 코드를 다시 써야 한다.
+NOTION_VIEWS_API_VERSION = "2025-09-03"
 REQUEST_TIMEOUT_SECONDS = 15
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2.0
@@ -68,22 +72,24 @@ def _display_name(ticker: str) -> str:
     return (names or {}).get(ticker, ticker)
 
 
-def _headers() -> dict:
+def _headers(notion_version: str | None = None) -> dict:
     return {
         "Authorization": f"Bearer {os.environ.get('NOTION_API_KEY', '')}",
-        "Notion-Version": NOTION_VERSION,
+        "Notion-Version": notion_version or NOTION_VERSION,
         "Content-Type": "application/json",
     }
 
 
-def _notion_request(method: str, path: str, body: dict | None = None) -> dict | None:
+def _notion_request(
+    method: str, path: str, body: dict | None = None, notion_version: str | None = None
+) -> dict | None:
     url = f"{NOTION_API_BASE}{path}"
     last_error: Exception | str | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = requests.request(
-                method, url, headers=_headers(), json=body, timeout=REQUEST_TIMEOUT_SECONDS
+                method, url, headers=_headers(notion_version), json=body, timeout=REQUEST_TIMEOUT_SECONDS
             )
         except requests.RequestException as exc:
             last_error = exc
@@ -853,6 +859,43 @@ async def sync_trade_journal_if_configured(log_path: Path) -> dict | None:
 # --- 일일 리포트 (장마감 후 그날 하루 요약) ---
 
 
+def sort_database_newest_first(database_id: str, date_property: str = "날짜") -> bool:
+    """데이터베이스의 뷰를 날짜 내림차순으로 고정한다 — 페이지를 열었을 때 오늘
+    리포트가 맨 위에 오게(사용자 요청, 2026-08-23). API로 만든 행은 항상 표 맨
+    아래에 붙고, 정렬이 없는 뷰는 그 순서를 그대로 보여준다 — 생성 순서를 바꿀 수
+    있는 API는 없으므로 뷰 정렬로 뒤집는다.
+
+    해당 DB의 뷰 전부에 같은 정렬을 건다(API로 만든 DB는 "Default view" 하나뿐이다).
+    실패해도 False를 돌려줄 뿐 예외를 올리지 않는다 — 정렬은 보기 편하자고 하는
+    것이라 이것 때문에 리포트 자체가 안 올라가면 안 된다.
+    """
+    listed = _notion_request(
+        "GET", f"/views?database_id={database_id}", None, notion_version=NOTION_VIEWS_API_VERSION
+    )
+    if listed is None:
+        logger.warning("notion_view_sort_failed database_id=%s reason=list_views", database_id)
+        return False
+
+    views = listed.get("results", [])
+    if not views:
+        logger.warning("notion_view_sort_failed database_id=%s reason=no_views", database_id)
+        return False
+
+    sorts = [{"property": date_property, "direction": "descending"}]
+    ok = True
+    for view in views:
+        patched = _notion_request(
+            "PATCH", f"/views/{view['id']}", {"sorts": sorts}, notion_version=NOTION_VIEWS_API_VERSION
+        )
+        if patched is None:
+            logger.warning("notion_view_sort_failed database_id=%s view_id=%s", database_id, view["id"])
+            ok = False
+
+    if ok:
+        logger.info("notion_view_sorted database_id=%s property=%s views=%d", database_id, date_property, len(views))
+    return ok
+
+
 def create_daily_report_database(parent_page_id: str) -> str | None:
     body = {
         "parent": {"type": "page_id", "page_id": parent_page_id},
@@ -867,7 +910,10 @@ def create_daily_report_database(parent_page_id: str) -> str | None:
         },
     }
     result = _notion_request("POST", "/databases", body)
-    return result["id"] if result else None
+    if result is None:
+        return None
+    sort_database_newest_first(result["id"])
+    return result["id"]
 
 
 def _read_jsonl_for_day(log_path: Path, day: str) -> list[dict]:
@@ -1035,6 +1081,11 @@ async def sync_daily_report(
     if day in synced_days:
         logger.info("notion_daily_report_skipped day=%s reason=already_synced", day)
         return False
+
+    # 오늘치를 올리기 전에 뷰 정렬을 맞춰둔다 — 명령어로 한 번 고치는 대신 매일
+    # 확인하는 이유는 이 설정이 EC2에만 있는 상태가 되지 않게 하기 위해서다(CLAUDE.md 서두의
+    # 2026-08-19 크론탭 사건과 같은 모양). 하루에 한 번, 요청 2개라 비용도 없다.
+    sort_database_newest_first(database_id)
 
     decisions_today = _read_jsonl_for_day(pipeline_log_path, day)
     trades_today = _read_jsonl_for_day(trade_journal_log_path, day)
