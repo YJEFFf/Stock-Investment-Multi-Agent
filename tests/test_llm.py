@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 
 import anthropic
 import httpx
@@ -198,3 +199,49 @@ def test_call_log_day_is_kst_not_utc(monkeypatch, tmp_path):
     entry = json.loads(log_path.read_text().strip())
     assert entry["timestamp"].startswith("2026-08-19T23:35")  # 순간은 UTC 그대로
     assert entry["day"] == "2026-08-20"  # 집계 단위는 장이 도는 날짜
+
+
+def test_call_structured_retries_on_truncation_and_logs_it_distinctly(monkeypatch, tmp_path, caplog):
+    """절단(stop_reason=max_tokens)은 스키마 위반과 다른 로그로 남아야 한다.
+
+    둘이 같은 `llm_call_validation_failed`로 찍히던 탓에 8/21 장애를 사후 분석할 때
+    "응답이 잘린 회차"와 "모델이 스키마를 어긴 회차"를 로그만으로는 못 갈랐다
+    (2026-08-24 CHANGELOG). 재시도 자체는 기존과 같은 등급으로 유지한다.
+    """
+    calls = {"n": 0}
+
+    async def fake_create(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # 상한을 꽉 채우고 문자열 한가운데서 끊긴 모양
+            return _Response('{"value": 4', stop_reason="max_tokens")
+        return _Response(json.dumps({"value": 42}))
+
+    monkeypatch.setattr(llm._client.messages, "create", fake_create)
+
+    with caplog.at_level(logging.WARNING, logger=llm.logger.name):
+        assert asyncio.run(_call(tmp_path / "llm_calls.jsonl")) == _DummyModel(value=42)
+
+    assert calls["n"] == 2
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("llm_call_truncated" in m for m in messages)
+    assert not any("llm_call_validation_failed" in m for m in messages)
+
+
+def test_call_structured_sends_default_max_tokens(monkeypatch, tmp_path):
+    """분석가 응답이 1024에서 잘리던 문제(2026-08-24)의 재발 방지.
+
+    상한을 다시 낮추면 `reasoning`이 긴 회차가 또 잘린다. `reasoning` 제거는 A/B로
+    기각됐으므로(분석가가 강세 쪽으로 +0.03 편향) 상한 쪽이 유일한 방어선이다.
+    """
+    seen = {}
+
+    async def fake_create(**kwargs):
+        seen.update(kwargs)
+        return _Response(json.dumps({"value": 1}))
+
+    monkeypatch.setattr(llm._client.messages, "create", fake_create)
+    asyncio.run(_call(tmp_path / "llm_calls.jsonl"))
+
+    assert seen["max_tokens"] == llm._DEFAULT_MAX_TOKENS
+    assert llm._DEFAULT_MAX_TOKENS >= 2048

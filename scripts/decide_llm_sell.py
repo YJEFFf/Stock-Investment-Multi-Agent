@@ -145,6 +145,16 @@ async def main() -> None:
         [a["ticker"] for a in actions],
     )
 
+    # CLAUDE.md "감시 지표"를 하루 한 번 남긴다. 장 마감 작업이 그날의 마지막
+    # 크론이라 여기가 제자리다. 노션 동기화보다 **앞에** 둔다 — 뒤에 두면 노션이
+    # 실패한 날 지표까지 같이 사라진다.
+    # 읽기 전용이고 매매 판단에 되먹이지 않지만, 그래도 예외로 매도 경로를 죽이지는
+    # 않게 감싼다. 지표 집계 실패가 장 마감 처리를 막을 이유는 없다.
+    try:
+        pipeline.log_monitoring_summary()
+    except Exception:
+        logger.exception("monitoring_summary_failed")
+
     # 매매일지를 일일 리포트보다 먼저 올린다. 장중 매도(check_stop_loss는 1분마다
     # 돈다)는 09:00 동기화 이후에 나므로, 여기서 한 번 더 돌려야 그날 안에 보인다.
     # 안 그러면 오늘 판 종목이 내일 아침에야 매매일지에 나타난다(2026-08-18 실측).

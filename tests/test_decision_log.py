@@ -81,3 +81,69 @@ def test_missing_exit_plan_is_logged_as_null_not_omitted(tmp_path):
     for e in entries:
         assert "exit_plan" in e
         assert e["exit_plan"] is None
+
+
+def _analysts_fn(agents: list[str]):
+    """지정한 분석가들만 의견을 내는 AnalystFn — 일부 분석가가 빠진 상황을 만든다."""
+
+    async def _fn(ticker: str, sector: str, day: datetime) -> list[AnalystOpinion]:
+        return [
+            AnalystOpinion(
+                agent=agent, ticker=ticker, score=0.1, confidence=0.5,
+                evidence=[f"prompt:{agent}@test"], as_of=day,
+            )
+            for agent in agents
+        ]
+
+    return _fn
+
+
+def _judge_echo(degraded: bool):
+    async def judge(opinions: list[AnalystOpinion], total_expected_analysts: int) -> Decision | None:
+        if not opinions:
+            return None
+        return Decision(
+            ticker=opinions[0].ticker, action="HOLD", reason="테스트용 관망",
+            inputs=opinions, degraded=degraded,
+        )
+
+    return judge
+
+
+def _run_with(tmp_path, analyst_fn, judge_fn):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    log_path = tmp_path / "pipeline.jsonl"
+    asyncio.run(
+        run_day(
+            UNIVERSE, DAY, PortfolioState(), RiskGateConfig(),
+            analyst_fn, judge_fn, execute_simulated, log_path=log_path,
+        )
+    )
+    return [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+
+
+def test_contributing_analysts_are_logged(tmp_path):
+    """어떤 분석가가 그 판단에 기여했는지가 결정 로그에 남아야 한다.
+
+    이 필드가 없어서 2026-08-24 점검 때 "매수 판단이 정상으로 돌고 있는가"에
+    답하려고 분석가 커버리지를 llm_calls.jsonl 타임스탬프로 역산해야 했다.
+    분석가가 조용히 빠지기 시작하면 결정 로그만 봐서는 알 수 없다.
+    """
+    rows = _run_with(tmp_path, _analysts_fn(["news", "chart"]), _judge_echo(degraded=False))
+
+    assert rows, "판단이 하나도 안 남았다"
+    for row in rows:
+        assert row["analysts"] == ["chart", "news"]  # 정렬해서 남긴다
+
+
+def test_degraded_flag_is_logged(tmp_path):
+    """분석가가 빠진 채 나온 판단인지가 로그에 남아야 한다 (스키마 계약의 degraded)."""
+    degraded_rows = _run_with(tmp_path / "a", _analysts_fn(["chart"]), _judge_echo(degraded=True))
+    healthy_rows = _run_with(
+        tmp_path / "b", _analysts_fn(["chart", "news", "disclosure"]), _judge_echo(degraded=False)
+    )
+
+    assert all(r["degraded"] is True for r in degraded_rows)
+    assert all(r["degraded"] is False for r in healthy_rows)
+    assert all(r["analysts"] == ["chart"] for r in degraded_rows)
+

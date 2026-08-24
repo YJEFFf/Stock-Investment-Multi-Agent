@@ -12,7 +12,7 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 # 잡히지만, 스크립트 직접 실행은 그 메커니즘을 안 탄다) — 레포 루트를 명시적으로 추가.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import judgment, kis, llm, notify, notion_sync, pipeline, sell  # noqa: E402
+from src import judgment, kis, notify, notion_sync, pipeline, sell  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.portfolio_store import load_portfolio as _load_portfolio  # noqa: E402
 from src.portfolio_store import save_portfolio as _save_portfolio  # noqa: E402
@@ -34,8 +34,6 @@ KST = ZoneInfo("Asia/Seoul")
 
 # CLAUDE.md "감시 지표" 창. 20영업일 ≈ 달력일 30일(주말+공휴일 감안 여유치) — 이 숫자는
 # 판단에 쓰이는 문턱이 아니라 리포트 조회창일 뿐이라 정밀할 필요가 없다.
-MONITORING_WINDOW_TRADING_DAYS = 20
-MONITORING_WINDOW_CALENDAR_DAYS = 30
 
 # NOTE(2026-08-11): 이 스크립트는 더 이상 cron에 안 걸려 있다. 하루 파이프라인이
 # A(decide_buys, 07:00) / B(execute_open, 09:00) / C(check_stop_loss, 1분마다) /
@@ -113,7 +111,7 @@ async def main() -> None:
         len(portfolio.positions),
     )
 
-    _log_monitoring_summary()
+    pipeline.log_monitoring_summary()
     await _sync_notion(today_kst, portfolio)
 
 
@@ -142,32 +140,6 @@ async def _sync_notion(today_kst, portfolio: PortfolioState) -> None:
         logger.exception("notion_sync_failed")
         notify.send_telegram_alert(notify.format_error_alert("노션 동기화 실패 (매매 자체엔 영향 없음)", repr(exc)))
 
-
-def _log_monitoring_summary() -> None:
-    """CLAUDE.md "감시 지표"를 매일 cron 로그에 남긴다 — 읽기 전용 리포트, 판단 로직
-    어디에도 이 결과를 되먹임하지 않는다(사람이 보라고 남기는 숫자다)."""
-    signal_summary = pipeline.summarize_recent_trading_days(
-        pipeline.DEFAULT_LOG_PATH, MONITORING_WINDOW_TRADING_DAYS
-    )
-    logger.info(
-        "monitoring_signal_rate days=%d signal_days=%d signal_day_ratio=%.3f rejected_by=%s",
-        signal_summary["total_days"],
-        signal_summary["signal_days"],
-        signal_summary["signal_day_ratio"],
-        signal_summary["rejected_by_counts"],
-    )
-
-    since = datetime.now(timezone.utc) - timedelta(days=MONITORING_WINDOW_CALENDAR_DAYS)
-    llm_summary = pipeline.summarize_llm_calls(llm.DEFAULT_LLM_CALL_LOG_PATH, since=since)
-    for label, stats in sorted(llm_summary.items()):
-        logger.info(
-            "monitoring_llm_calls label=%s calls=%d failure_rate=%.3f input_tokens=%d output_tokens=%d",
-            label,
-            stats["calls"],
-            stats["failure_rate"],
-            stats["input_tokens"],
-            stats["output_tokens"],
-        )
 
 
 if __name__ == "__main__":

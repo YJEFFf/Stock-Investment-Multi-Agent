@@ -19,11 +19,14 @@ import scripts.run_daily as rd
 from src import portfolio_store
 from src.schemas import Decision, GateResult, PortfolioState, Position
 
-# _isolate 픽스처가 테스트 전체에서 rd._sync_notion/_log_monitoring_summary를
-# no-op으로 덮어쓰기 때문에, 그 함수들 자체의 동작을 검증하는 테스트는 몽키패치가
-# 걸리기 전의 실제 함수를 붙잡아뒀다가 그걸 직접 호출해야 한다.
+# _isolate 픽스처가 테스트 전체에서 rd._sync_notion과 감시 지표 집계를 no-op으로
+# 덮어쓰기 때문에, 그 함수들 자체의 동작을 검증하는 테스트는 몽키패치가 걸리기 전의
+# 실제 함수를 붙잡아뒀다가 그걸 직접 호출해야 한다.
+#
+# 감시 지표는 src/pipeline.py로 옮겼다 — run_daily.py에만 있던 탓에 스크립트를
+# 쪼갠 뒤로 크론 어디에서도 안 불렸다(2026-08-24 CHANGELOG).
 _real_sync_notion = rd._sync_notion
-_real_log_monitoring_summary = rd._log_monitoring_summary
+_real_log_monitoring_summary = rd.pipeline.log_monitoring_summary
 
 
 def _decision(ticker="005930", action="BUY", approved=True):
@@ -47,7 +50,7 @@ async def _noop_sync_notion(today, portfolio):
 def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(portfolio_store, "PORTFOLIO_STATE_PATH", tmp_path / "portfolio_state.json")
     monkeypatch.setattr(rd, "is_krx_trading_day", lambda day: True)
-    monkeypatch.setattr(rd, "_log_monitoring_summary", lambda: None)
+    monkeypatch.setattr(rd.pipeline, "log_monitoring_summary", lambda: None)
     monkeypatch.setattr(rd, "_sync_notion", _noop_sync_notion)
     monkeypatch.setattr(rd.notify, "send_telegram_alert", lambda message: True)
 
@@ -67,7 +70,9 @@ def test_main_skips_everything_on_non_trading_day(monkeypatch):
 
     monkeypatch.setattr(rd.pipeline, "evaluate_holdings", fail_evaluate)
     monkeypatch.setattr(rd.pipeline, "run_daily", fail_run_daily)
-    monkeypatch.setattr(rd, "_log_monitoring_summary", lambda: calls.__setitem__("monitoring", calls["monitoring"] + 1))
+    monkeypatch.setattr(
+        rd.pipeline, "log_monitoring_summary", lambda: calls.__setitem__("monitoring", calls["monitoring"] + 1)
+    )
 
     async def fake_sync_notion(today, portfolio):
         calls["notion"] += 1
@@ -102,7 +107,9 @@ def test_main_happy_path_runs_all_stages_in_order(monkeypatch):
 
     monitoring_calls = []
     notion_calls = []
-    monkeypatch.setattr(rd, "_log_monitoring_summary", lambda: (order.append("monitoring"), monitoring_calls.append(True)))
+    monkeypatch.setattr(
+        rd.pipeline, "log_monitoring_summary", lambda: (order.append("monitoring"), monitoring_calls.append(True))
+    )
 
     async def fake_sync_notion(today, portfolio):
         order.append("notion")
@@ -222,6 +229,6 @@ def test_sync_notion_sends_error_alert_on_failure(monkeypatch):
 
 def test_log_monitoring_summary_handles_missing_logs_without_crashing(tmp_path, monkeypatch):
     monkeypatch.setattr(rd.pipeline, "DEFAULT_LOG_PATH", tmp_path / "pipeline.jsonl")
-    monkeypatch.setattr(rd.llm, "DEFAULT_LLM_CALL_LOG_PATH", tmp_path / "llm_calls.jsonl")
+    monkeypatch.setattr(rd.pipeline.llm, "DEFAULT_LLM_CALL_LOG_PATH", tmp_path / "llm_calls.jsonl")
 
     _real_log_monitoring_summary()  # 로그 파일이 아예 없어도 예외 없이 끝나야 한다

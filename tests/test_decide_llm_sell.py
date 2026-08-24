@@ -278,3 +278,40 @@ def test_no_blackout_report_when_the_day_was_clean(monkeypatch, tmp_path):
     dls._report_unresolved_blackout()
 
     assert alerts == []
+
+
+def test_main_logs_the_monitoring_summary(monkeypatch, tmp_path):
+    """감시 지표가 매일 실제로 남아야 한다.
+
+    이 집계는 원래 run_daily.py 안에만 있었고, 스크립트를 쪼갤 때 딸려가지 않아
+    크론 어디에서도 안 불렸다 — 2026-08-24까지 cron.log에 monitoring_signal_rate가
+    0회였다. 장 마감 작업이 그날 마지막 크론이라 여기가 제자리다.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
+    portfolio_store.save_portfolio(PortfolioState(cash_weight=1.0))
+
+    called = []
+    monkeypatch.setattr(dls.pipeline, "log_monitoring_summary", lambda: called.append(True))
+
+    asyncio.run(dls.main())
+
+    assert called == [True]
+
+
+def test_monitoring_summary_failure_does_not_break_the_sell_path(monkeypatch, tmp_path):
+    """지표 집계가 터져도 장 마감 처리는 끝나야 한다 — 읽기 전용 리포트일 뿐이다."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
+    portfolio_store.save_portfolio(PortfolioState(cash_weight=1.0))
+
+    def boom():
+        raise RuntimeError("집계 실패")
+
+    monkeypatch.setattr(dls.pipeline, "log_monitoring_summary", boom)
+
+    asyncio.run(dls.main())  # 예외가 새어나오면 안 된다
+
+    payload = json.loads(dls.PENDING_SELLS_PATH.read_text())
+    assert payload["actions"] == []
+

@@ -22,6 +22,12 @@ DEFAULT_EFFORT = "low"  # 채점형 판단이라 깊은 추론까지는 불필�
 # max_retries만큼 재시도하므로, 여기서는 "응답은 왔는데 우리 스키마와 안 맞는" 경우만 다룬다.
 MAX_STRUCTURED_RETRIES = 2
 
+# 분석가 응답의 정상 길이는 120~190토큰인데, `reasoning`이 유일하게 길이 제한 없는
+# 필드라 이따금 1024를 꽉 채우고 잘렸다(1638콜 중 22콜, 2026-08-24 CHANGELOG).
+# 여유를 준다. max_tokens는 모델에게 보이지 않으므로 이 값을 올려도 채점은 안 바뀐다
+# — 프롬프트를 건드리는 쪽은 점수를 움직인다는 걸 A/B로 확인했다(같은 항목).
+_DEFAULT_MAX_TOKENS = 2048
+
 # CLAUDE.md "감시 지표" — 분석가별(label) 호출수·실패율·토큰사용량 집계용 원본 로그.
 # pipeline.py의 DEFAULT_LOG_PATH/DEFAULT_SELL_LOG_PATH와 같은 패턴(호출부에서 override 가능).
 DEFAULT_LLM_CALL_LOG_PATH = Path("logs/llm_calls.jsonl")
@@ -67,7 +73,7 @@ async def call_structured(
     response_model: type[T],
     json_schema: dict[str, Any],
     model: str = DEFAULT_MODEL,
-    max_tokens: int = 1024,
+    max_tokens: int = _DEFAULT_MAX_TOKENS,
     effort: str = DEFAULT_EFFORT,
     label: str = "unknown",
     log_path: Path = DEFAULT_LLM_CALL_LOG_PATH,
@@ -77,6 +83,8 @@ async def call_structured(
     output_config.format으로 JSON 형태 자체는 API가 보장하지만, score/confidence의
     수치 범위 같은 의미적 제약은 pydantic이 검증한다. 그 검증에 실패했을 때만(=파싱
     실패와 동급) 재시도한다 — "점수가 마음에 안 들어서" 재시도하는 경로는 없다.
+    `stop_reason=max_tokens`(응답 절단)도 같은 등급으로 재시도하되, 파싱 실패와는
+    다른 로그(`llm_call_truncated`)를 남긴다.
 
     `label`은 이 호출이 어떤 분석가/판단 단계에서 왔는지("chart", "news",
     "debate_bull", "portfolio_manager_buy" 등) 식별하는 태그다 — 이 함수는 모든
@@ -131,6 +139,20 @@ async def call_structured(
                 ),
             )
             raise RuntimeError(f"LLM refused the request: {response.stop_reason}")
+
+        # 잘린 응답은 스키마 위반이 아니라 절단이다. 여기서 안 걸러내면 아래
+        # json.loads가 "Unterminated string"을 내고, 진짜 스키마 위반과 로그에서
+        # 구분이 안 된다 — 8/24까지 매일 나오던 그 로그다.
+        if response.stop_reason == "max_tokens":
+            last_error = RuntimeError(f"response truncated at max_tokens={max_tokens}")
+            logger.warning(
+                "llm_call_truncated label=%s attempt=%d max_tokens=%d output_tokens=%d",
+                label,
+                attempt,
+                max_tokens,
+                response.usage.output_tokens,
+            )
+            continue
 
         try:
             text = next(b.text for b in response.content if b.type == "text")

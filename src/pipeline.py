@@ -2,11 +2,11 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from src import collectors, kis, notify, sell, translate
+from src import collectors, kis, llm, notify, sell, translate
 from src.analysts import chart_analyst, disclosure_analyst, dummy_analyst, news_analyst
 from src.schemas import (
     AnalystOpinion,
@@ -48,6 +48,15 @@ TRADE_WEIGHT = 0.08
 GAP_SKIP_THRESHOLD_PCT = 0.03
 
 DEFAULT_LOG_PATH = Path("logs/pipeline.jsonl")
+
+# CLAUDE.md "감시 지표" 창. 신호율은 영업일 기준, LLM 호출 집계는 달력일 기준이다.
+MONITORING_WINDOW_TRADING_DAYS = 20
+MONITORING_WINDOW_CALENDAR_DAYS = 30
+
+# 운영 트래픽이 아닌 일회성 진단·실험 호출의 label 접두사. 감시 지표에서 제외한다 —
+# 2026-08-24 reasoning A/B 90건이 분석가 호출수·토큰 집계에 섞였다. 앞으로 실험용
+# 호출은 이 접두사를 쓴다. 그래야 원본 로그에는 남기면서 지표는 오염시키지 않는다.
+NON_PRODUCTION_LABEL_PREFIX = "ab_"
 DEFAULT_SELL_LOG_PATH = Path("logs/sell.jsonl")
 # 매수/매도 "판단"(위 두 파일)과는 별개로, 실제 체결 시점의 원본 사실 + 그 결정을 만든
 # 근거 전체(분석가 의견·토론·매니저 사유)를 사람이 읽을 수 있는 형태로 남긴다. 나중에
@@ -710,6 +719,12 @@ async def run_day(
                 "avg_score": avg_score,
                 "avg_confidence": avg_confidence,
                 "reason": decision.reason,
+                # 분석가가 빠진 채 나온 판단인가(스키마 계약의 Decision.degraded), 그리고
+                # 실제로 어떤 분석가가 기여했는가. 이 두 필드가 없어서 2026-08-24 점검 때
+                # "매수 판단이 정상인가"에 답하려고 분석가 커버리지를 llm_calls.jsonl
+                # 타임스탬프로 역산해야 했다 — 결정 로그만으로는 알 수 없었다.
+                "degraded": decision.degraded,
+                "analysts": sorted(o.agent for o in decision.inputs),
                 # HOLD에도 남긴다. 매니저는 매수 여부와 무관하게 출구 계획을 내는데
                 # (prompts/portfolio_manager.md), 지금까지 그 값은 매수가 성사된
                 # 종목에서만 기록됐다. 그래서 "LLM이 종목마다 손절폭을 실제로 다르게
@@ -1034,6 +1049,26 @@ def summarize_log(log_path: Path, total_days: int) -> dict:
     }
 
 
+def load_decision_entries(log_path: Path) -> list[dict]:
+    """pipeline.jsonl을 읽고 (day, ticker) 중복을 제거한다 — 나중 기록을 남긴다.
+
+    2026-08-12에 같은 37종목 유니버스가 두 번 완주해 74개 레코드가 남았다(그날
+    decide_buys가 UTC 날짜로 시작한 버그와 같은 시기다. 8/14부터 정상). 두 실행은
+    승인 종목까지 달랐고(298050 vs 282330), `decide_buys_done`과 매매일지는 **뒤쪽**
+    실행과 일치한다 — 실제로 집행된 쪽이다. 그래서 나중 기록을 남긴다.
+
+    원본 로그는 덮어쓰지 않는다. 그날 무슨 일이 있었는지는 이 파일이 유일한 기록이라
+    (CHANGELOG 2026-08-24) 지우지 않고 읽는 쪽에서 걸러낸다.
+    """
+    if not log_path.exists():
+        return []
+    entries = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    deduped: dict[tuple[str, str], dict] = {}
+    for e in entries:
+        deduped[(e["day"], e["ticker"])] = e
+    return list(deduped.values())
+
+
 def summarize_recent_trading_days(log_path: Path, n_days: int) -> dict:
     """cron이 매일 같은 파일에 계속 이어 쓰는 실환경용 래퍼.
 
@@ -1046,8 +1081,7 @@ def summarize_recent_trading_days(log_path: Path, n_days: int) -> dict:
     if not log_path.exists():
         return {"total_days": 0, "signal_days": 0, "signal_day_ratio": 0.0, "rejected_by_counts": {}}
 
-    lines = [line for line in log_path.read_text().splitlines() if line.strip()]
-    entries = [json.loads(line) for line in lines]
+    entries = load_decision_entries(log_path)
 
     distinct_days = sorted({e["day"] for e in entries})
     recent_days = set(distinct_days[-n_days:])
@@ -1084,6 +1118,7 @@ def summarize_llm_calls(log_path: Path, since: datetime | None = None) -> dict:
     entries = [json.loads(line) for line in lines]
     if since is not None:
         entries = [e for e in entries if datetime.fromisoformat(e["timestamp"]) >= since]
+    entries = [e for e in entries if not e["label"].startswith(NON_PRODUCTION_LABEL_PREFIX)]
 
     by_label: dict[str, dict] = {}
     for e in entries:
@@ -1100,3 +1135,47 @@ def summarize_llm_calls(log_path: Path, since: datetime | None = None) -> dict:
         stats["failure_rate"] = stats["failures"] / stats["calls"] if stats["calls"] else 0.0
 
     return by_label
+
+
+def log_monitoring_summary(
+    decision_log_path: Path | None = None,
+    llm_log_path: Path | None = None,
+) -> None:
+    """CLAUDE.md "감시 지표"를 하루 한 번 cron 로그에 남긴다.
+
+    읽기 전용 리포트다 — 판단 로직 어디에도 이 결과를 되먹이지 않는다. 되먹이는
+    순간 "신호가 적으니 기준을 낮추자"는 경로가 생기고, 그게 이전 버전을 무너뜨린
+    실패다(CLAUDE.md 서두).
+
+    이 집계는 원래 run_daily.py(마일스톤1 모놀리스) 안에만 있었다. 스크립트를
+    decide_buys/execute_open/check_stop_loss/decide_llm_sell로 쪼갤 때 딸려가지
+    않아, 크론 어디에서도 호출되지 않은 채 2026-08-24까지 **한 번도 실행된 적이
+    없었다**(cron.log에 monitoring_signal_rate 0회). 그래서 여기로 옮겨 장 마감
+    작업(decide_llm_sell)에서 부른다.
+    """
+    # 기본값을 인자 기본값으로 묶지 않는다 — 정의 시점에 고정돼서 테스트가
+    # 모듈 상수를 갈아끼워도 안 먹는다.
+    if decision_log_path is None:
+        decision_log_path = DEFAULT_LOG_PATH
+    if llm_log_path is None:
+        llm_log_path = llm.DEFAULT_LLM_CALL_LOG_PATH
+
+    signal = summarize_recent_trading_days(decision_log_path, MONITORING_WINDOW_TRADING_DAYS)
+    logger.info(
+        "monitoring_signal_rate days=%d signal_days=%d signal_day_ratio=%.3f rejected_by=%s",
+        signal["total_days"],
+        signal["signal_days"],
+        signal["signal_day_ratio"],
+        signal["rejected_by_counts"],
+    )
+
+    since = datetime.now(timezone.utc) - timedelta(days=MONITORING_WINDOW_CALENDAR_DAYS)
+    for label, stats in sorted(summarize_llm_calls(llm_log_path, since=since).items()):
+        logger.info(
+            "monitoring_llm_calls label=%s calls=%d failure_rate=%.3f input_tokens=%d output_tokens=%d",
+            label,
+            stats["calls"],
+            stats["failure_rate"],
+            stats["input_tokens"],
+            stats["output_tokens"],
+        )
