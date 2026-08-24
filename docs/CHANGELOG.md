@@ -16,6 +16,23 @@
 
 ## 2026-08-24 (장 마감 후 점검)
 
+### 배포 — `a392ef8` EC2 반영 (17:26 KST)
+
+`~/sima`에서 git pull. 장 마감 후(check_stop_loss는 15:30, decide_llm_sell은 15:35에
+끝남)라 크론과 겹치지 않는다. 배포 후 작업 트리 clean, 로컬 main과 같은 커밋.
+
+- EC2에서 테스트 재실행: **413 passed / 5 skipped**(로컬과 동일).
+- `deploy/crontab`은 안 건드렸다 — 스케줄 변경 없음. 감시 지표는 새 크론이 아니라
+  기존 `decide_llm_sell`(15:35) 안에서 불린다.
+- 배포된 코드로 `log_monitoring_summary()`를 직접 돌려 확인:
+  `monitoring_signal_rate days=8 signal_days=5 signal_day_ratio=0.625`,
+  `label=chart calls=547`(A/B 90건 제외 확인 — 제외 전이면 637이 나온다).
+- **첫 자동 실행은 8/25(화) 15:35다.** 그날 확인할 것:
+  - cron.log에 `monitoring_signal_rate`가 처음으로 찍히는지
+  - `pipeline.jsonl` 새 레코드에 `degraded`·`analysts` 필드가 들어가는지
+  - `llm_call_truncated`가 찍히는지 (안 찍히는 게 정상 — 상한을 2048로 올렸다)
+
+
 `db8c7c2`·`6716f8c`가 운영에서 **처음 실행된 날**이다(8/23은 일요일이라 크론이 안 돌았다).
 EC2 HEAD `f3a1a2a`, 작업 트리 clean. 크론 5개 전부 정상 발화.
 
