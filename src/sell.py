@@ -17,7 +17,7 @@ pipeline.py(신규 매수 오케스트레이션)와 분리한 이유: 보유 포
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from src import kis
@@ -91,6 +91,97 @@ def evaluate_deterministic_sell(position: Position, current_price: float) -> Sel
     return None
 
 
+def _threshold_crossed(position: Position, plan: ExitPlan, low: float, high: float) -> str | None:
+    """저가~고가 구간이 문턱을 지났는지. 지났으면 사유, 아니면 None.
+
+    **점 판정(현재가)과 구간 판정(당일 저가/고가)이 같은 함수를 쓴다** — low=high=현재가로
+    부르면 예전 동작 그대로다. 둘을 따로 구현하면 사후 판정이 실제 안전장치와 어긋나고,
+    그 어긋남은 "안 팔았어야 했는데 팔았다"로 나타나서 되돌릴 수가 없다.
+    손절이 익절보다 우선한다.
+    """
+    entry = position.entry_price
+    if entry is None:
+        return None
+
+    if (low - entry) / entry <= plan.stop_loss_pct:
+        return "stop_loss"
+
+    if position.take_profit_stage == 0:
+        if (high - entry) / entry >= plan.take_profit_pct:
+            return "take_profit"
+        return None
+
+    if position.peak_price is None:
+        return None
+    if (low - position.peak_price) / position.peak_price <= plan.trail_pct:
+        return "take_profit_trail"
+    return None
+
+
+def _action_for(position: Position, plan: ExitPlan, reason: str) -> SellAction:
+    if reason == "stop_loss":
+        return SellAction(ticker=position.ticker, reason="stop_loss", sell_fraction=1.0)
+    return SellAction(
+        ticker=position.ticker, reason="take_profit_trail", sell_fraction=plan.take_profit_fraction
+    )
+
+
+def evaluate_with_day_range(
+    position: Position, quote: kis.Quote, *, today: date | None = None
+) -> tuple[SellAction | None, bool]:
+    """현재가로 먼저 판정하고, 못 잡았으면 **당일 저가/고가로 되짚는다.**
+    돌려주는 두 번째 값은 "당일 범위로만 잡힌 것인가"다.
+
+    왜 필요한가 (2026-08-27): 안전장치는 매분 현재가를 한 번 찍는데 시장은 연속이라,
+    두 샘플 사이를 스쳐간 가격은 존재 자체를 모른다. 그날 192820의 저가 271,000은
+    09:01 분봉 안에서만 찍혔고(그 분은 280,000에 열려 278,000에 닫혔다) 트레일 라인
+    275,745를 지났는데도 매도가 나가지 않았다. 당일 저가/고가는 `inquire-price`
+    응답에 원래 같이 오던 값이라(kis.Quote) **추가 조회 없이** 그 구간을 복원한다.
+
+    **집행은 발견 시점의 현재가로 한다.** 꼬리 바닥(271,000)에 파는 게 아니라
+    "문턱에 닿았으니 지금 정리한다"이다 — 사용자 확정(2026-08-27). 되돌아온 가격에
+    파는 게 이상해 보일 수 있지만, 반대로 하면 이미 지나간 순간의 가격에 체결됐다고
+    가정하게 되고 그건 사실이 아니다.
+
+    반복 발동 방지: 당일 저가는 한 번 라인 아래로 내려가면 그날 내내 아래로 남는다.
+    트레일링은 부분 익절이라 포지션이 사라지지 않으므로, 막지 않으면 남은 회차마다
+    계속 팔아 하루에 전량이 나간다. 그래서 **구간으로 잡힌 트레일링은 종목당 하루
+    1회**로 묶는다(`Position.range_trigger_day`). 점 판정은 그대로 매분 돈다 —
+    진짜로 가격이 눌러앉으면 그쪽이 잡는다.
+
+    손절은 전량 매도라 포지션이 사라지고, 첫 익절은 stage가 올라가며 분기가 바뀌므로
+    둘 다 반복 위험이 없다 — 날짜 제한은 트레일링에만 건다.
+    """
+    action = evaluate_deterministic_sell(position, quote.price)
+    if action is not None:
+        return action, False
+
+    if position.entry_price is None or (quote.day_low is None and quote.day_high is None):
+        return None, False
+
+    today = today or datetime.now(KST).date()
+
+    # **진입 당일에는 구간 판정을 하지 않는다.** 당일 저가/고가는 하루 전체의 값이라
+    # 우리가 사기 *전에* 찍힌 가격을 포함한다. 오늘 고가 근처에서 산 종목은 오늘
+    # 아침의 저가만으로 손절 문턱을 넘은 것처럼 보이고, 그러면 보유한 적도 없는
+    # 구간을 근거로 진입 당일에 전량 청산된다. 점 판정은 그대로 도므로, 진짜로
+    # 진입 후에 문턱을 지나면 그쪽이 잡는다.
+    if position.entry_day == today:
+        return None, False
+
+    plan = plan_for(position)
+    reason = _threshold_crossed(
+        position, plan, quote.day_low or quote.price, quote.day_high or quote.price
+    )
+    if reason is None:
+        return None, False
+
+    if reason == "take_profit_trail" and position.range_trigger_day == today:
+        return None, False
+
+    return _action_for(position, plan, reason), True
+
+
 def threshold_crossed_in_bar(position: Position, bar: OHLCVBar) -> str | None:
     """이 포지션이 그날 **일봉 안에서** 문턱을 지났는지 사후 판정한다. 지났으면
     사유("stop_loss" | "take_profit" | "take_profit_trail"), 아니면 None.
@@ -113,30 +204,32 @@ def threshold_crossed_in_bar(position: Position, bar: OHLCVBar) -> str | None:
     """
     if position.entry_price is None:
         return None
-
-    plan = plan_for(position)
-
-    if (bar.low - position.entry_price) / position.entry_price <= plan.stop_loss_pct:
-        return "stop_loss"
-
-    if position.take_profit_stage == 0:
-        if (bar.high - position.entry_price) / position.entry_price >= plan.take_profit_pct:
-            return "take_profit"
-        return None
-
-    if position.peak_price is None:
-        return None
-    if (bar.low - position.peak_price) / position.peak_price <= plan.trail_pct:
-        return "take_profit_trail"
-    return None
+    return _threshold_crossed(position, plan_for(position), bar.low, bar.high)
 
 
-def update_peak_price(position: Position, current_price: float) -> Position:
+def update_peak_price(
+    position: Position,
+    current_price: float,
+    *,
+    day_high: float | None = None,
+    today: date | None = None,
+) -> Position:
     """그날 관측한 가격으로 고점을 갱신한다. evaluate_deterministic_sell보다 먼저
-    호출해 그날의 고점이 이미 반영된 상태에서 매도를 평가한다."""
+    호출해 그날의 고점이 이미 반영된 상태에서 매도를 평가한다.
+
+    day_high를 같이 받는 이유는 evaluate_with_day_range와 같다 — 분당 1회 샘플링은
+    고점도 놓친다. 2026-08-26에 192820의 실제 고가는 297,000이었는데 기록된 고점은
+    296,500이었다(시세 공백 구간에 찍혔다). 고점이 낮게 남으면 트레일 라인도 낮아져
+    매도가 늦어진다. 이것도 이미 받아오던 값이라 추가 조회가 없다."""
     if position.entry_price is None:
         return position
-    new_peak = max(position.peak_price or position.entry_price, current_price)
+    # 진입 당일의 당일 고가는 우리가 사기 전 구간을 포함한다 — 그걸 고점으로 잡으면
+    # 트레일 라인이 보유한 적 없는 가격 위에 서고, 첫날부터 트레일링이 걸린다
+    # (evaluate_with_day_range의 진입 당일 제외와 같은 이유).
+    if day_high is not None and position.entry_day == (today or datetime.now(KST).date()):
+        day_high = None
+    observed = max(current_price, day_high) if day_high is not None else current_price
+    new_peak = max(position.peak_price or position.entry_price, observed)
     if new_peak == position.peak_price:
         return position
     return position.model_copy(update={"peak_price": new_peak})

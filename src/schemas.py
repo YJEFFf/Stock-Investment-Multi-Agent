@@ -170,6 +170,10 @@ class Position(BaseModel):
     exit_plan: ExitPlan | None = None  # 진입 시 확정된 손절/익절 규칙. 보유 중에는 절대
     # 갱신하지 않는다(ExitPlan docstring 참고). None인 포지션(이 기능 이전에 열렸거나
     # 시뮬레이션 경로로 열린 것)은 sell.DEFAULT_EXIT_PLAN을 그대로 쓴다.
+    range_trigger_day: date | None = None  # 당일 저가/고가로만 잡힌 트레일링 익절이
+    # 실행된 날. 당일 저가는 한 번 라인 아래로 내려가면 그날 내내 아래로 남아서, 막지
+    # 않으면 남은 회차마다 계속 팔린다(sell.evaluate_with_day_range). 손절·첫 익절은
+    # 포지션이 사라지거나 stage가 올라가 분기가 바뀌므로 이 제한이 필요 없다.
     quantity: int | None = None  # 실제 보유 주수. pipeline.execute_buy_order가 실제
     # KIS 주문을 넣을 때만 채운다 — 브로커에 실주문을 낸 적 없는(순수 시뮬레이션
     # execute()로 연 포지션은 None으로 남는다. 실제 매도 주문 수량 계산에 쓴다

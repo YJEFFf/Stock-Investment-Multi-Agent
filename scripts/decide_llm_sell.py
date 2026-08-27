@@ -73,23 +73,6 @@ async def _sync_daily_report(today_kst, portfolio) -> None:
         notify.send_telegram_alert(notify.format_error_alert("노션 일일 리포트 동기화 실패 (매매 자체엔 영향 없음)", repr(exc)))
 
 
-async def _report_observation_gaps(portfolio, day) -> None:
-    """장 마감 후, 그날 관측한 가격 범위를 실제 일봉과 대조한다.
-
-    시세 공백 알림이 못 잡는 구멍을 메운다 — 공백은 "회차가 통째로 죽은" 경우만
-    잡지만, 회차가 391번 다 돌아도 분당 1회 샘플링이 장중 저가를 스쳐 지나갈 수
-    있다. 2026-08-27 192820이 그랬고, 그날은 사람이 분봉을 따로 받아서야 알아냈다.
-    """
-    try:
-        missed = await pipeline.audit_observation_gap(portfolio, day)
-    except Exception:  # noqa: BLE001 - 대조 실패가 매도 판단 경로를 막지 않는다
-        logger.exception("observation_gap_audit_failed")
-        return
-    if not missed:
-        return
-    notify.send_telegram_alert(notify.format_observation_gap_alert(missed))
-
-
 def _report_unresolved_blackout() -> None:
     """장중 시세 공백이 복구를 못 본 채 끝났으면 여기서 마무리 보고한다.
 
@@ -116,7 +99,6 @@ async def main() -> None:
     portfolio = load_portfolio()
 
     _report_unresolved_blackout()
-    await _report_observation_gaps(portfolio, day)
 
     actions: list[dict] = []
 

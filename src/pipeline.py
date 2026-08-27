@@ -68,15 +68,6 @@ DEFAULT_TRADE_JOURNAL_LOG_PATH = Path("logs/trade_journal.jsonl")
 # 써서 "같은 사건"임을 한눈에 보이게 한다 — 마커는 .txt, 공백 상태는 .blackout.json.
 BLACKOUT_CONTEXT = "holdings_all_prices_unavailable"
 
-# 그날 안전장치가 **실제로 본** 가격의 최저/최고. 매분 한 번 찍는 구조라, 두 샘플
-# 사이를 스쳐간 가격은 존재 자체가 기록되지 않는다 — 그래서 "문턱을 안 넘어서 조용한"
-# 것과 "넘었는데 그 순간을 안 본" 것이 로그에서 똑같이 조용하다. 이 파일이 그 둘을
-# 가른다: 장 마감 후 여기 담긴 관측 범위를 그날 일봉과 대조하면(audit_observation_gap)
-# 시장이 지난 문턱을 우리가 못 본 날이 매일 자동으로 드러난다.
-#
-# 2026-08-27에 실제로 그런 날이 있었다(192820, 09:01 저가 271,000 vs 트레일 275,745).
-# 그날은 사람이 분봉을 따로 받아서야 알아냈다 — 그 조사를 코드가 대신하게 한 것이다.
-DEFAULT_OBSERVED_RANGE_PATH = Path("logs/observed_range.json")
 
 # 정량 사전 필터 절대 문턱값 (docs/PLAN.md §5, 2026-08-08 확정). 관행값으로 시작하고
 # 나중에 필터 통과율 로그를 보고 조정한다 — 과거 수익률에 맞춰 역산하지 않는다.
@@ -748,122 +739,6 @@ async def run_day(
     return portfolio, results
 
 
-def record_observed_prices(
-    price_by_ticker: dict[str, float], *, path: Path | None = None
-) -> None:
-    """이번 회차에 실제로 관측한 가격으로 종목별 당일 최저/최고를 갱신한다.
-
-    날짜가 바뀌면 통째로 새로 시작한다 — 어제 관측 범위를 오늘 일봉과 대조하면
-    아무 의미가 없다(notify._read_blackout이 날짜 경계에서 이어붙이지 않는 것과
-    같은 이유). 기록 실패가 손절 판정을 막지 않는다.
-    """
-    path = path or DEFAULT_OBSERVED_RANGE_PATH
-    if not price_by_ticker:
-        return
-
-    today = _kst_today().isoformat()
-    try:
-        state = json.loads(path.read_text())
-        if state.get("day") != today:
-            state = {"day": today, "observed": {}}
-    except (OSError, ValueError):
-        state = {"day": today, "observed": {}}
-
-    observed = state.setdefault("observed", {})
-    for ticker, price in price_by_ticker.items():
-        seen = observed.get(ticker)
-        if seen is None:
-            observed[ticker] = {"min": price, "max": price, "rounds": 1}
-        else:
-            seen["min"] = min(seen["min"], price)
-            seen["max"] = max(seen["max"], price)
-            seen["rounds"] = seen.get("rounds", 0) + 1
-
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state))
-    except OSError as exc:
-        logger.warning("observed_range_write_failed path=%s error=%s", path, exc)
-
-
-def load_observed_range(*, path: Path | None = None) -> dict[str, dict]:
-    """오늘 것만 돌려준다. 날짜가 다르면 빈 dict — 낡은 관측으로 대조하면 안 된다."""
-    path = path or DEFAULT_OBSERVED_RANGE_PATH
-    try:
-        state = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
-    if state.get("day") != _kst_today().isoformat():
-        return {}
-    return state.get("observed") or {}
-
-
-async def audit_observation_gap(
-    portfolio: PortfolioState, day: datetime, *, path: Path | None = None
-) -> list[str]:
-    """장 마감 후 한 번. **시장은 문턱을 지났는데 우리는 그 순간을 못 본** 종목을 찾는다.
-
-    일봉이 문턱 통과라고 말하는데 그날 관측 범위로는 통과가 아니면, 그 문턱은
-    두 샘플 사이로 지나간 것이다. 이게 안전장치가 "조용했다"와 "못 봤다"를
-    가르는 마지막 조각이다 — 시세 공백(blackout)은 전멸한 회차를 잡지만, 이건
-    **회차가 정상으로 다 돈 날에도** 생기는 구멍이다.
-
-    관측 기록이 없는 종목은 판정하지 않는다. 오늘 산 종목이나 상태 파일이 날아간
-    경우인데, 둘 다 "안 넘었다"가 아니라 "모른다"다.
-    """
-    observed = load_observed_range(path=path)
-    if not observed:
-        return []
-
-    targets = [p for p in portfolio.positions if p.entry_price is not None and p.ticker in observed]
-    if not targets:
-        return []
-
-    bars_list = await asyncio.gather(
-        *(asyncio.to_thread(kis.fetch_daily_ohlcv, p.ticker, 1) for p in targets),
-        return_exceptions=True,
-    )
-
-    missed: list[str] = []
-    for position, bars in zip(targets, bars_list):
-        if isinstance(bars, BaseException) or not bars:
-            continue
-        bar = bars[-1]
-        if bar.date != day.date():
-            continue
-
-        by_market = sell.threshold_crossed_in_bar(position, bar)
-        if by_market is None:
-            continue
-
-        # 우리가 본 범위만으로 같은 판정을 다시 한다. 관측 범위가 이미 문턱을
-        # 넘었다면 안전장치는 볼 기회가 있었던 것이고(그래서 팔았거나, 그 회차에
-        # 판 뒤 stage가 올라갔거나다) 여기서 보고할 일이 아니다.
-        seen = observed[position.ticker]
-        seen_bar = OHLCVBar(
-            date=bar.date, open=seen["max"], high=seen["max"], low=seen["min"], close=seen["min"], volume=0
-        )
-        if sell.threshold_crossed_in_bar(position, seen_bar) is not None:
-            continue
-
-        label = notify.REASON_LABELS.get(by_market, by_market)
-        missed.append(f"{display_name(position.ticker)} {label}")
-        logger.error(
-            "observation_gap_missed_threshold ticker=%s reason=%s bar_low=%.0f bar_high=%.0f "
-            "seen_low=%.0f seen_high=%.0f rounds=%d",
-            position.ticker,
-            by_market,
-            bar.low,
-            bar.high,
-            seen["min"],
-            seen["max"],
-            seen.get("rounds", 0),
-        )
-
-    logger.info("observation_gap_audit_done checked=%d missed=%d", len(targets), len(missed))
-    return missed
-
-
 async def _audit_blackout_window(
     portfolio: PortfolioState, day: datetime
 ) -> tuple[int, int, list[str]]:
@@ -959,22 +834,24 @@ async def evaluate_holdings(
 
     # 이 경로만 FAST_FAIL_POLICY다 — 매분 도는 크론이 곧 재시도 루프라 회차 안에서
     # 오래 버틸수록 다음 분이 락에 막혀 공백만 길어진다(kis.FAST_FAIL_POLICY 주석).
-    price_results = await asyncio.gather(
+    # 현재가만이 아니라 **당일 고가/저가까지** 받는다(kis.Quote). 추가 호출이 아니라
+    # 원래 같은 응답에 들어 있던 필드다 — 2026-08-27까지 받아놓고 버렸다.
+    quote_results = await asyncio.gather(
         *(
-            asyncio.to_thread(kis.fetch_current_price, p.ticker, policy=kis.FAST_FAIL_POLICY)
+            asyncio.to_thread(kis.fetch_quote, p.ticker, policy=kis.FAST_FAIL_POLICY)
             for p in portfolio.positions
         ),
         return_exceptions=True,
     )
 
-    price_by_ticker: dict[str, float] = {}
-    for position, price in zip(portfolio.positions, price_results):
-        if isinstance(price, BaseException) or price is None:
+    quote_by_ticker: dict[str, kis.Quote] = {}
+    for position, quote in zip(portfolio.positions, quote_results):
+        if isinstance(quote, BaseException) or quote is None:
             logger.warning("evaluate_holdings_price_unavailable ticker=%s", position.ticker)
             continue
-        price_by_ticker[position.ticker] = price
+        quote_by_ticker[position.ticker] = quote
 
-    record_observed_prices(price_by_ticker)
+    price_by_ticker = {t: q.price for t, q in quote_by_ticker.items()}
 
     # 한 종목도 못 받았으면 이 회차는 손절·익절을 **아무것도 판정하지 않았다** —
     # 문턱을 넘지 않아서 조용한 것과 눈을 감아서 조용한 것은 전혀 다른데, 지금까지
@@ -1023,15 +900,32 @@ async def evaluate_holdings(
             )
 
     sells = 0
-    for ticker, current_price in price_by_ticker.items():
+    for ticker, quote in quote_by_ticker.items():
+        current_price = quote.price
         position = next(p for p in portfolio.positions if p.ticker == ticker)
-        position = sell.update_peak_price(position, current_price)
+        position = sell.update_peak_price(
+            position, current_price, day_high=quote.day_high, today=_kst_today()
+        )
+
+        # 현재가로 못 잡은 문턱을 당일 저가/고가로 되짚는다. 집행은 지금 가격으로 한다
+        # (sell.evaluate_with_day_range docstring).
+        action, from_day_range = sell.evaluate_with_day_range(position, quote, today=_kst_today())
+        if from_day_range:
+            position = position.model_copy(update={"range_trigger_day": _kst_today()})
+            logger.error(
+                "sell_trigger_from_day_range ticker=%s reason=%s day_low=%s day_high=%s price=%.0f "
+                "— 분당 샘플이 놓친 구간을 당일 범위로 잡았다",
+                ticker,
+                action.reason if action else "?",
+                quote.day_low,
+                quote.day_high,
+                current_price,
+            )
+
         portfolio = PortfolioState(
             positions=[position if p.ticker == ticker else p for p in portfolio.positions],
             cash_weight=portfolio.cash_weight,
         )
-
-        action = sell.evaluate_deterministic_sell(position, current_price)
 
         if action is None and analyst_fn is not None and judge_sell_fn is not None:
             try:

@@ -397,17 +397,3 @@ def test_open_run_also_evaluates_holdings(monkeypatch, tmp_path):
     asyncio.run(eo.main())
 
     assert [a.reason for a in sold] == ["take_profit_trail"]
-
-
-def test_open_run_records_what_it_observed(monkeypatch, tmp_path):
-    """09:01 회차의 관측도 당일 최저/최고에 들어가야 한다 — 그래야 장 마감 후
-    일봉 대조가 "이 가격은 봤다"고 말할 수 있다."""
-    monkeypatch.chdir(tmp_path)
-    portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))
-
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 271000.0)
-
-    asyncio.run(eo.main())
-
-    observed = eo.pipeline.load_observed_range()
-    assert observed["005930"]["min"] == 271000.0

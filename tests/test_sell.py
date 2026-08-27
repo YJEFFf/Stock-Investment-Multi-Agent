@@ -662,3 +662,136 @@ def test_bar_audit_respects_the_frozen_exit_plan_not_the_default():
 
     # 기본값(-10%)이었다면 안 걸릴 저가인데, 이 포지션의 문턱은 -5%다.
     assert sell.threshold_crossed_in_bar(position, _bar(low=94.0, high=101.0)) == "stop_loss"
+
+
+# --- 당일 저가/고가로 놓친 문턱 되짚기 (2026-08-27) ---
+
+
+TODAY = date(2026, 8, 27)
+
+
+def _quote(price, low=None, high=None):
+    return kis.Quote(price=price, day_low=low, day_high=high)
+
+
+def test_day_range_catches_the_dip_the_minute_samples_walked_past():
+    """2026-08-27 192820 그대로. 09:01 분봉은 280,000에 열려 278,000에 닫혔고
+    그 사이 271,000을 찍었다 — 트레일 라인 275,745를 지났는데 현재가 샘플로는
+    한 번도 안 잡혔다."""
+    position = _position(entry_price=232000.0, peak_price=296500.0, take_profit_stage=4)
+
+    action, from_range = sell.evaluate_with_day_range(
+        position, _quote(278000.0, low=271000.0, high=280000.0), today=TODAY
+    )
+
+    assert from_range is True
+    assert action.reason == "take_profit_trail"
+
+
+def test_day_range_trigger_executes_at_the_current_price_not_the_low():
+    """꼬리 바닥에 파는 게 아니라 "닿았으니 지금 정리"다 — SellAction은 가격을 담지
+    않고, 집행부가 넘겨받은 현재가로 판다(pipeline.finalize_sell)."""
+    position = _position(entry_price=232000.0, peak_price=296500.0, take_profit_stage=4)
+
+    action, _ = sell.evaluate_with_day_range(
+        position, _quote(278000.0, low=271000.0, high=280000.0), today=TODAY
+    )
+
+    assert action.sell_fraction == sell.DEFAULT_EXIT_PLAN.take_profit_fraction
+
+
+def test_a_point_trigger_is_not_reported_as_a_range_trigger():
+    """지금 가격이 이미 문턱 아래면 예전 경로 그대로다 — 하루 1회 제한이 붙으면 안 된다."""
+    position = _position(entry_price=100.0, peak_price=100.0)
+
+    action, from_range = sell.evaluate_with_day_range(position, _quote(85.0, low=85.0), today=TODAY)
+
+    assert from_range is False
+    assert action.reason == "stop_loss"
+
+
+def test_range_triggered_trailing_fires_once_a_day():
+    """당일 저가는 한 번 라인 아래로 내려가면 그날 내내 아래다. 막지 않으면 남은
+    회차마다 계속 팔려 하루에 전량이 나간다."""
+    position = _position(
+        entry_price=232000.0, peak_price=296500.0, take_profit_stage=4, range_trigger_day=TODAY
+    )
+
+    action, from_range = sell.evaluate_with_day_range(
+        position, _quote(278000.0, low=271000.0, high=280000.0), today=TODAY
+    )
+
+    assert action is None and from_range is False
+
+
+def test_yesterdays_range_trigger_does_not_block_today():
+    position = _position(
+        entry_price=232000.0,
+        peak_price=296500.0,
+        take_profit_stage=4,
+        range_trigger_day=date(2026, 8, 26),
+    )
+
+    action, from_range = sell.evaluate_with_day_range(
+        position, _quote(278000.0, low=271000.0, high=280000.0), today=TODAY
+    )
+
+    assert from_range is True and action is not None
+
+
+def test_range_stop_loss_is_not_limited_to_once_a_day():
+    """손절은 전량 매도라 포지션이 사라진다 — 반복될 수가 없어서 제한을 걸지 않는다."""
+    position = _position(entry_price=100.0, peak_price=100.0, range_trigger_day=TODAY)
+
+    action, from_range = sell.evaluate_with_day_range(position, _quote(95.0, low=88.0), today=TODAY)
+
+    assert from_range is True
+    assert action.reason == "stop_loss"
+
+
+def test_no_day_range_means_the_old_point_only_behaviour():
+    position = _position(entry_price=232000.0, peak_price=296500.0, take_profit_stage=4)
+
+    assert sell.evaluate_with_day_range(position, _quote(278000.0), today=TODAY) == (None, False)
+
+
+def test_peak_uses_the_days_high_not_just_the_sample():
+    """2026-08-26에 192820 실제 고가는 297,000인데 기록된 고점은 296,500이었다 —
+    고점이 낮게 남으면 트레일 라인도 낮아져 매도가 늦어진다."""
+    position = _position(entry_price=232000.0, peak_price=296500.0)
+
+    updated = sell.update_peak_price(position, 283000.0, day_high=297000.0)
+
+    assert updated.peak_price == 297000.0
+
+
+def test_entry_day_positions_are_exempt_from_range_evaluation():
+    """당일 저가/고가는 우리가 사기 *전* 구간을 포함한다. 오늘 고가 근처에서 산 종목이
+    오늘 아침 저가만으로 손절되면, 보유한 적도 없는 구간을 근거로 청산하는 것이다."""
+    position = _position(entry_day=TODAY, entry_price=300000.0, peak_price=300000.0)
+
+    action, from_range = sell.evaluate_with_day_range(
+        position, _quote(295000.0, low=265000.0, high=302000.0), today=TODAY
+    )
+
+    assert action is None and from_range is False
+
+
+def test_a_position_held_since_yesterday_is_evaluated_on_the_range():
+    position = _position(entry_day=date(2026, 8, 26), entry_price=300000.0, peak_price=300000.0)
+
+    action, from_range = sell.evaluate_with_day_range(
+        position, _quote(295000.0, low=265000.0, high=302000.0), today=TODAY
+    )
+
+    assert from_range is True
+    assert action.reason == "stop_loss"
+
+
+def test_entry_day_high_does_not_raise_the_peak():
+    """진입 전 고가를 고점으로 잡으면 트레일 라인이 보유한 적 없는 가격 위에 선다."""
+    position = _position(entry_day=TODAY, entry_price=280000.0, peak_price=280000.0)
+
+    updated = sell.update_peak_price(position, 281000.0, day_high=297000.0, today=TODAY)
+
+    assert updated.peak_price == 281000.0

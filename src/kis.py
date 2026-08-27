@@ -382,6 +382,49 @@ def fetch_daily_ohlcv(
     return bars[-lookback_days:]
 
 
+@dataclass(frozen=True)
+class Quote:
+    """시세 한 건. 현재가 + **당일 고가/저가**.
+
+    당일 고가/저가는 원래부터 `inquire-price` 응답에 같이 들어 있었는데
+    (`stck_hgpr`/`stck_lwpr`) 2026-08-27까지 버리고 `stck_prpr`만 썼다. 매분
+    390번씩 받아놓고 안 쓴 셈이다 — 그 두 숫자가 "분당 1회 샘플링이 스쳐 지나간
+    가격"을 복원하는 유일한 무료 단서다(sell.evaluate_deterministic_sell).
+    """
+
+    price: float
+    day_high: float | None = None
+    day_low: float | None = None
+
+
+def fetch_quote(ticker: str, *, policy: RetryPolicy = DEFAULT_POLICY) -> Quote | None:
+    """현재가와 당일 고가/저가를 한 번에. 추가 호출이 아니라 같은 응답의 다른 필드다."""
+    data = _kis_get(CURRENT_PRICE_PATH, CURRENT_PRICE_TR_ID, {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}, policy=policy)
+    if data is None:
+        return None
+
+    output = data.get("output") or {}
+    price_str = output.get("stck_prpr")
+    if not price_str:
+        logger.warning("kis_price_missing ticker=%s", ticker)
+        return None
+
+    def _optional(key: str) -> float | None:
+        raw = output.get(key)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        # 장 시작 전에는 0으로 온다 — 0을 저가로 믿으면 모든 손절이 발동한다.
+        return value if value > 0 else None
+
+    try:
+        return Quote(price=float(price_str), day_high=_optional("stck_hgpr"), day_low=_optional("stck_lwpr"))
+    except ValueError:
+        logger.warning("kis_price_unparseable ticker=%s raw=%s", ticker, price_str)
+        return None
+
+
 def fetch_current_price(ticker: str, *, policy: RetryPolicy = DEFAULT_POLICY) -> float | None:
     """실시간 현재가. 갭 체크(장 시작가 vs 전일 종가)와 주문 수량 계산에 쓴다.
 

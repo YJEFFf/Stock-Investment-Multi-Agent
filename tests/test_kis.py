@@ -50,7 +50,29 @@ def _fake_token_response(access_token="tok123", expires_in=86400):
     return FakeResponse()
 
 
-def test_get_access_token_fetches_and_caches(monkeypatch):
+# conftest의 _never_reach_the_real_broker가 get_access_token을 None으로 막아둔다.
+# 이 파일의 토큰 테스트는 그 함수 자체가 대상이라 진짜를 되돌려 놔야 한다 — 모듈
+# import 시점(픽스처보다 먼저)에 잡아두면 원본을 잃지 않는다.
+_REAL_GET_ACCESS_TOKEN = kis.get_access_token
+
+
+@pytest.fixture
+def real_access_token_fn(monkeypatch):
+    monkeypatch.setattr(kis, "get_access_token", _REAL_GET_ACCESS_TOKEN)
+
+
+# 같은 이유로 conftest의 _quote_follows_the_price_mock이 fetch_quote를 가린다.
+# 이 파일은 그 함수의 파싱을 검증하는 곳이라 진짜를 써야 한다 — 안 되돌리면
+# 목이 우연히 같은 답을 내는 케이스가 통과해버려서 테스트가 아무것도 안 지킨다.
+_REAL_FETCH_QUOTE = kis.fetch_quote
+
+
+@pytest.fixture
+def real_fetch_quote(monkeypatch):
+    monkeypatch.setattr(kis, "fetch_quote", _REAL_FETCH_QUOTE)
+
+
+def test_get_access_token_fetches_and_caches(monkeypatch, real_access_token_fn):
     calls = {"n": 0}
 
     def fake_post(*a, **k):
@@ -66,7 +88,7 @@ def test_get_access_token_fetches_and_caches(monkeypatch):
     assert json.loads(kis.TOKEN_CACHE_PATH.read_text())["access_token"] == "tok123"
 
 
-def test_get_access_token_reuses_valid_cache(monkeypatch):
+def test_get_access_token_reuses_valid_cache(monkeypatch, real_access_token_fn):
     expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
     kis.TOKEN_CACHE_PATH.write_text(json.dumps({"access_token": "cached-tok", "expires_at": expires_at.isoformat()}))
 
@@ -80,7 +102,7 @@ def test_get_access_token_reuses_valid_cache(monkeypatch):
     assert token == "cached-tok"
 
 
-def test_get_access_token_refetches_when_cache_expired(monkeypatch):
+def test_get_access_token_refetches_when_cache_expired(monkeypatch, real_access_token_fn):
     expired_at = datetime.now(timezone.utc) - timedelta(minutes=1)
     kis.TOKEN_CACHE_PATH.write_text(json.dumps({"access_token": "stale-tok", "expires_at": expired_at.isoformat()}))
 
@@ -91,7 +113,7 @@ def test_get_access_token_refetches_when_cache_expired(monkeypatch):
     assert token == "fresh-tok"
 
 
-def test_get_access_token_returns_none_on_network_failure(monkeypatch):
+def test_get_access_token_returns_none_on_network_failure(monkeypatch, real_access_token_fn):
     monkeypatch.setattr(
         kis.requests, "post", lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError("down"))
     )
@@ -558,3 +580,51 @@ def test_fetch_current_price_defaults_to_the_patient_policy(monkeypatch):
     kis.fetch_current_price("005930")
 
     assert seen["policy"] == kis.DEFAULT_POLICY
+
+
+# --- fetch_quote: 당일 고가/저가는 원래 같은 응답에 있었다 (2026-08-27) ---
+
+
+PRICE_RESPONSE = {
+    "rt_cd": "0",
+    "output": {"stck_prpr": "283000", "stck_oprc": "285000", "stck_hgpr": "287500", "stck_lwpr": "271000"},
+}
+
+
+def test_fetch_quote_carries_todays_high_and_low(monkeypatch, real_fetch_quote):
+    """추가 호출이 아니라 매분 받던 응답의 안 쓰던 필드다."""
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: PRICE_RESPONSE)
+
+    quote = kis.fetch_quote("192820")
+
+    assert quote.price == 283000
+    assert quote.day_high == 287500
+    assert quote.day_low == 271000
+
+
+def test_fetch_quote_treats_zero_range_as_absent(monkeypatch, real_fetch_quote):
+    """장 시작 전에는 고가/저가가 0으로 온다. 0을 저가로 믿으면 모든 포지션이
+    손절 문턱을 넘은 것으로 판정된다 — 전량 청산이다."""
+    payload = {"rt_cd": "0", "output": {"stck_prpr": "283000", "stck_hgpr": "0", "stck_lwpr": "0"}}
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: payload)
+
+    quote = kis.fetch_quote("192820")
+
+    assert quote.price == 283000
+    assert quote.day_high is None
+    assert quote.day_low is None
+
+
+def test_fetch_quote_survives_missing_range_fields(monkeypatch, real_fetch_quote):
+    payload = {"rt_cd": "0", "output": {"stck_prpr": "283000"}}
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: payload)
+
+    quote = kis.fetch_quote("192820")
+
+    assert quote == kis.Quote(price=283000.0, day_high=None, day_low=None)
+
+
+def test_fetch_quote_returns_none_when_request_fails(monkeypatch, real_fetch_quote):
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: None)
+
+    assert kis.fetch_quote("192820") is None
