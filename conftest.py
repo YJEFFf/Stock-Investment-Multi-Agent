@@ -34,14 +34,19 @@ def _isolate_alert_state(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_sell_judgment_log(monkeypatch, tmp_path):
-    """LLM 재량 매도의 종목별 판단 로그를 항상 tmp로 돌린다.
+def _isolate_default_state_paths(monkeypatch, tmp_path):
+    """호출부가 경로를 안 넘겼을 때 쓰이는 기본 상태/로그 경로를 전부 tmp로 돌린다.
 
-    _isolate_alert_state와 같은 이유다 — 기본값이 레포의 logs/sell_judgment.jsonl이라
-    막지 않으면 테스트 한 번에 가짜 판단 수십 건이 운영 기록에 섞인다. 이 로그는
-    "왜 안 팔았는가"를 사후에 보려고 만든 것이라(judgment.py 주석), 목킹된 줄이
-    섞이는 순간 목적을 잃는다.
+    _isolate_alert_state와 같은 이유이고, 같은 사고가 2026-08-27 하루에만 두 번 더
+    났다 — `sell_judgment.jsonl`과 `observed_range.json`이 각각 테스트 한 번에
+    운영 `logs/`로 새어 나갔다. 알림 마커(2026-08-20)까지 세 번째다.
+
+    **패턴이 분명하다: `Path("logs/...")` 기본값을 새로 만들면 여기 등록해야 한다.**
+    등록을 잊으면 조용히 운영 기록이 오염되고, 그 기록들은 하나같이 "사후에 무슨
+    일이 있었는지 보려고" 만든 것이라 가짜 줄이 섞이는 순간 목적을 잃는다.
+    개별 테스트가 명시적으로 경로를 넘기는 건 이 픽스처와 무관하게 그대로 동작한다.
     """
-    from src import judgment
+    from src import judgment, pipeline
 
     monkeypatch.setattr(judgment, "DEFAULT_SELL_JUDGMENT_LOG_PATH", tmp_path / "sell_judgment.jsonl")
+    monkeypatch.setattr(pipeline, "DEFAULT_OBSERVED_RANGE_PATH", tmp_path / "observed_range.json")

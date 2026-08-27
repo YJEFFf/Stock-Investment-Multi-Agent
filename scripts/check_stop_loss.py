@@ -45,8 +45,15 @@ async def main() -> None:
     day = datetime.now(timezone.utc)
 
     # 앞 회차가 아직 돌고 있으면 이번 분은 건너뛴다 — 기다리면 KIS 장애 때
-    # 매분 새 프로세스가 쌓인다(portfolio_lock docstring). 도는 회차가 같은
-    # 평가를 하므로 건너뛰어도 놓치는 게 없다.
+    # 매분 새 프로세스가 쌓인다(portfolio_lock docstring). 앞 회차가 같은 평가를
+    # 하고 있으므로 그 경우엔 건너뛰어도 놓치는 게 없다.
+    #
+    # **락을 쥔 게 execute_open(09:01)일 때는 그 전제가 성립하지 않는다** —
+    # 그 스크립트는 주문만 집행하고 손절/익절은 평가하지 않아서, 09:01 회차가
+    # 통째로 사라졌다. 2026-08-27에 192820의 당일 저가(09:01, 271,000)가 트레일
+    # 라인 275,745 아래였는데 매도가 나가지 않은 원인이다. 그래서 execute_open이
+    # 락을 놓기 전에 같은 평가를 한 번 돌리도록 고쳤다(execute_open.main 주석).
+    # 여기서 락을 기다리게 만들지 않은 이유는 위와 같다 — 장애 때 프로세스가 쌓인다.
     try:
         with portfolio_lock(blocking=False):
             portfolio = load_portfolio()

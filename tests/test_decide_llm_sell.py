@@ -335,3 +335,40 @@ def test_a_ticker_skipped_for_price_failure_still_appears_in_the_judgment_log(mo
         ("skipped", "price_unavailable", "005930")
     ]
     assert rows[0]["unrealized_pct"] is None  # 시세가 없으니 손익도 없다 — 0.0으로 지어내지 않는다
+
+
+def test_close_alerts_when_the_market_crossed_a_threshold_we_never_saw(monkeypatch, tmp_path):
+    """공백 알림이 못 잡는 구멍 — 회차가 다 돌아도 분당 1회 샘플링은 장중 저가를
+    스쳐 지나갈 수 있다. 2026-08-27 192820은 사람이 분봉을 받아서야 알아냈다."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
+    portfolio_store.save_portfolio(PortfolioState(cash_weight=1.0, positions=[]))
+
+    async def fake_audit(portfolio, day):
+        return ["코스맥스 익절"]
+
+    monkeypatch.setattr(dls.pipeline, "audit_observation_gap", fake_audit)
+
+    alerts = []
+    monkeypatch.setattr(dls.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    asyncio.run(dls.main())
+
+    gap_alerts = [a for a in alerts if "놓친 문턱" in a]
+    assert len(gap_alerts) == 1
+    assert "코스맥스 익절" in gap_alerts[0]
+
+
+def test_a_failing_observation_audit_does_not_break_the_sell_path(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
+    portfolio_store.save_portfolio(PortfolioState(cash_weight=1.0, positions=[]))
+
+    async def boom(portfolio, day):
+        raise RuntimeError("KIS 폭발")
+
+    monkeypatch.setattr(dls.pipeline, "audit_observation_gap", boom)
+
+    asyncio.run(dls.main())
+
+    assert json.loads(dls.PENDING_SELLS_PATH.read_text())["actions"] == []

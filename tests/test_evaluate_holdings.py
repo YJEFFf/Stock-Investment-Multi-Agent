@@ -769,3 +769,70 @@ def test_quiet_rounds_never_touch_the_daily_bar_api(monkeypatch, tmp_path):
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", fail)
 
     asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+
+# --- 관측 범위 기록과 장 마감 후 대조 (2026-08-27) ---
+
+
+def test_each_round_widens_the_observed_range(monkeypatch, tmp_path):
+    """매분 본 가격의 최저/최고를 남긴다 — 이게 있어야 "안 넘어서 조용한 것"과
+    "넘었는데 그 순간을 안 본 것"을 사후에 가릴 수 있다."""
+    path = tmp_path / "observed_range.json"
+    monkeypatch.setattr(pipeline, "DEFAULT_OBSERVED_RANGE_PATH", path)
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position()])
+
+    for price in (100.0, 94.0, 108.0):
+        monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None, p=price: p)
+        asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    observed = pipeline.load_observed_range(path=path)
+    assert observed["005930"]["min"] == 94.0
+    assert observed["005930"]["max"] == 108.0
+    assert observed["005930"]["rounds"] == 3
+
+
+def test_observed_range_from_another_day_is_not_reused(monkeypatch, tmp_path):
+    """어제 관측 범위를 오늘 일봉과 대조하면 아무 의미가 없다."""
+    path = tmp_path / "observed_range.json"
+    path.write_text(json.dumps({"day": "2020-01-01", "observed": {"005930": {"min": 1.0, "max": 2.0}}}))
+
+    assert pipeline.load_observed_range(path=path) == {}
+
+
+def test_audit_reports_a_threshold_the_sampling_walked_past(monkeypatch, tmp_path):
+    """2026-08-27 192820의 모양 그대로 — 일봉 저가는 트리거 아래인데, 매분 샘플은
+    한 번도 그 아래를 못 봤다. 회차가 다 돌아도 생기는 구멍이라 공백 알림은 못 잡는다."""
+    path = tmp_path / "observed_range.json"
+    path.write_text(
+        json.dumps({"day": pipeline._kst_today().isoformat(), "observed": {"005930": {"min": 95.0, "max": 101.0}}})
+    )
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position(entry_price=100.0, peak_price=100.0)])
+    _daily_bars(monkeypatch, low=88.0, high=101.0)  # 손절선(-10%) 아래를 찍었다
+
+    missed = asyncio.run(pipeline.audit_observation_gap(portfolio, DAY, path=path))
+
+    assert missed == ["005930 손절"]
+
+
+def test_audit_is_silent_when_we_actually_saw_the_threshold(monkeypatch, tmp_path):
+    """관측 범위가 이미 문턱을 넘었다면 안전장치는 볼 기회가 있었던 것이다 —
+    팔았든 안 팔았든 "못 본 문턱"으로 보고할 일이 아니다."""
+    path = tmp_path / "observed_range.json"
+    path.write_text(
+        json.dumps({"day": pipeline._kst_today().isoformat(), "observed": {"005930": {"min": 88.0, "max": 101.0}}})
+    )
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position(entry_price=100.0, peak_price=100.0)])
+    _daily_bars(monkeypatch, low=88.0, high=101.0)
+
+    assert asyncio.run(pipeline.audit_observation_gap(portfolio, DAY, path=path)) == []
+
+
+def test_audit_says_nothing_about_a_ticker_it_never_observed(monkeypatch, tmp_path):
+    """오늘 산 종목이나 상태 파일이 날아간 경우다 — "안 넘었다"가 아니라 "모른다"라,
+    판정 자체를 하지 않는다."""
+    path = tmp_path / "observed_range.json"
+    path.write_text(json.dumps({"day": pipeline._kst_today().isoformat(), "observed": {"000660": {"min": 1.0, "max": 2.0}}}))
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position(entry_price=100.0, peak_price=100.0)])
+    _daily_bars(monkeypatch, low=1.0, high=2.0)
+
+    assert asyncio.run(pipeline.audit_observation_gap(portfolio, DAY, path=path)) == []

@@ -117,6 +117,20 @@ def format_blackout_recovery_alert(
     return "\n".join(lines)
 
 
+def format_observation_gap_alert(missed: list[str]) -> str:
+    """시장은 문턱을 지났는데 매분 샘플링이 그 순간을 못 본 종목을 알린다.
+
+    시세 공백 알림과 다른 사건이다 — 저쪽은 회차가 통째로 죽은 경우고, 이건
+    **회차가 정상으로 다 돈 날에도** 생긴다. 둘을 같은 문구로 묶으면 원인이
+    섞여서, 고쳐야 할 곳이 KIS인지 우리 샘플링 주기인지가 흐려진다.
+    """
+    return (
+        f"🔴 [SIMA] 놓친 문턱\n"
+        f"{', '.join(missed)} — 오늘 일봉은 문턱을 지났는데 매분 시세로는 한 번도 안 잡혔습니다\n"
+        f"사유: 분당 1회 샘플링이라 두 샘플 사이를 스쳐간 가격은 보이지 않습니다."
+    )
+
+
 def format_blackout_unresolved_alert(minutes: float) -> str:
     return (
         f"🔴 [SIMA] 시세 공백인 채로 장 마감\n"

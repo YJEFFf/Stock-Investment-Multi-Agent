@@ -77,6 +77,14 @@ def _fixed_today(monkeypatch):
 
     monkeypatch.setattr(eo.pipeline.translate, "to_korean", _identity)
 
+    # execute_open은 락을 놓기 전에 손절/익절을 한 번 평가한다(09:01 사각지대 대응).
+    # 그 경로가 실제 KIS를 때리지 않게 막는다 — .env에 자격증명이 살아있는 머신에서는
+    # 진짜 시세가 돌아와, entry_price=100짜리 더미 포지션이 익절 문턱을 넘어버린다.
+    # 기본값은 "조회 불가"라 평가가 아무것도 하지 않는다. 평가가 실제로 도는지는
+    # test_open_run_also_evaluates_holdings에서 따로 건다.
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: None)
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days=60, **kw: None)
+
 
 def test_noop_when_neither_pending_file_exists(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
@@ -362,3 +370,44 @@ def test_executed_and_unavailable_sells_are_split(monkeypatch, tmp_path):
     assert sold == ["005930"]
     payload = json.loads(eo.PENDING_SELLS_PATH.read_text())
     assert [a["ticker"] for a in payload["actions"]] == ["000660"]
+
+
+# --- 09:01 사각지대 (2026-08-27) ---
+
+
+def test_open_run_also_evaluates_holdings(monkeypatch, tmp_path):
+    """execute_open이 락을 쥔 1분(09:01) 동안 check_stop_loss는 스스로 건너뛴다.
+    그 회차를 여기서 대신 돌지 않으면 **매 거래일 09:01이 안전장치의 사각지대**다 —
+    2026-08-27에 192820의 당일 저가가 정확히 그 분에 찍혔고 트레일링 익절이 안 나갔다."""
+    monkeypatch.chdir(tmp_path)
+    # stage>0이라 트레일링 감시 대상. 고점 200 대비 -7%면 186 아래에서 발동한다.
+    position = _position(entry_price=100.0, peak_price=200.0, take_profit_stage=1, quantity=9)
+    portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[position]))
+
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 180.0)
+
+    sold = []
+
+    async def fake_finalize(portfolio, action, *a, **k):
+        sold.append(action)
+        return portfolio
+
+    monkeypatch.setattr(eo.pipeline, "finalize_sell", fake_finalize)
+
+    asyncio.run(eo.main())
+
+    assert [a.reason for a in sold] == ["take_profit_trail"]
+
+
+def test_open_run_records_what_it_observed(monkeypatch, tmp_path):
+    """09:01 회차의 관측도 당일 최저/최고에 들어가야 한다 — 그래야 장 마감 후
+    일봉 대조가 "이 가격은 봤다"고 말할 수 있다."""
+    monkeypatch.chdir(tmp_path)
+    portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))
+
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 271000.0)
+
+    asyncio.run(eo.main())
+
+    observed = eo.pipeline.load_observed_range()
+    assert observed["005930"]["min"] == 271000.0

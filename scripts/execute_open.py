@@ -14,9 +14,15 @@
 바꾸지 않는다(게이트 재판정이 아니라 이미 승인된 결정의 순차 집행) — 단지 매도
 주문이 매수 주문보다 먼저 나갈 뿐이다.
 
+집행이 끝나면 락을 놓기 전에 손절/익절을 한 번 평가한다(3). 이 스크립트가 락을
+쥔 1분 동안 check_stop_loss가 스스로 건너뛰기 때문에, 이게 없으면 매 거래일
+09:01이 안전장치의 사각지대가 된다 — main() 안 주석 참고.
+
 logs/portfolio_state.json은 이 스크립트 실행 동안 계속 락을 쥐고 있는다 —
-매도·매수 둘 다 시장가 주문이라 오래 걸리지 않으므로(초 단위) 락을 오래
-들고 있는 게 문제되지 않는다.
+매도·매수 둘 다 시장가 주문이라 오래 걸리지 않고(초 단위), 뒤에 붙은 손절/익절
+평가도 FAST_FAIL_POLICY라 5종목 기준 최악 약 38초다. 정상일 때는 몇 초로 끝나
+09:02 회차를 밀지 않는다. KIS가 그만큼 느린 날이면 09:02도 어차피 시세를 못 받는
+회차라, 락 때문에 잃는 게 따로 없다.
 
 실행: uv run python scripts/execute_open.py (레포 루트에서)
 """
@@ -178,6 +184,21 @@ async def main() -> None:
 
         portfolio = await _execute_pending_sells(portfolio, day, today_kst)
         portfolio = await _execute_pending_buys(portfolio, today_kst)
+
+        # 락을 놓기 전에 손절/익절을 한 번 평가한다. 이게 없으면 **매 거래일 09:01이
+        # 통째로 안전장치의 사각지대**다: check_stop_loss는 매분 돌지만 이 스크립트가
+        # 그 1분 내내 포트폴리오 락을 쥐고 있어 09:01 회차가 스스로 건너뛴다
+        # (check_stop_loss.py의 PortfolioLockBusy 경로). 그 스킵이 무해하다는 근거는
+        # "도는 회차가 같은 평가를 하므로"였는데, 락을 쥔 게 이 스크립트일 때는
+        # 그 전제가 성립하지 않는다 — execute_open은 손절/익절을 평가하지 않는다.
+        #
+        # 하필 09:01은 하루 중 변동이 가장 큰 1분이고, 이 구멍은 운이 아니라 크론
+        # 구조상 **매일 같은 자리에** 생긴다. 2026-08-27에 실제로 대가를 치렀다:
+        # 192820의 그날 저가 271,000이 09:01 분봉에 찍혔고(트레일 라인 275,745),
+        # 그 회차가 스킵돼 트레일링 익절이 나가지 않았다.
+        #
+        # 방금 산 종목도 같이 평가되지만 진입가=고점이라 문턱에 닿을 수 없다.
+        portfolio = await pipeline.evaluate_holdings(portfolio, day, sell.execute_sell_order)
 
         save_portfolio(portfolio)
 
