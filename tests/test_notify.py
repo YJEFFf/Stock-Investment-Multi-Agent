@@ -205,3 +205,55 @@ def test_close_blackout_reports_a_window_that_never_recovered(tmp_path):
 
 def test_close_blackout_is_silent_when_nothing_was_open(tmp_path):
     assert notify.close_blackout(CTX, now=_at(15, 35), state_dir=tmp_path) is None
+
+
+# --- 복구 알림이 실은 확인 가능한 것을 "불가능"이라 말하던 문제 (2026-08-27) ---
+
+
+def test_recovery_alert_says_no_threshold_was_crossed_when_every_bar_checked_out():
+    message = notify.format_blackout_recovery_alert(77.7, total=5, checked=5, crossed=[])
+
+    assert "78분" in message
+    assert "일봉 대조(5/5종목)" in message
+    assert "문턱에 닿은 종목 없음" in message
+    # 예전 문구가 남아 있으면 안 된다 — 확인해놓고 확인 불가능이라고 말하게 된다.
+    assert "확인이 불가능" not in message
+
+
+def test_recovery_alert_names_the_ticker_that_crossed():
+    message = notify.format_blackout_recovery_alert(30.0, total=5, checked=5, crossed=["LG생활건강 손절"])
+
+    assert "⚠️" in message
+    assert "LG생활건강 손절" in message
+    assert "다음 회차 판정을 확인하세요" in message
+
+
+def test_recovery_alert_admits_it_verified_nothing_when_every_bar_lookup_failed():
+    """일봉 조회도 같은 KIS를 쓴다 — 복구 직후에 또 죽을 수 있다. 그때 "닿은 종목
+    없음"이라고 말하면 확인하지도 않은 것을 안전하다고 말하는 게 된다."""
+    message = notify.format_blackout_recovery_alert(30.0, total=5, checked=0, crossed=[])
+
+    assert "일봉 대조 실패" in message
+    assert "문턱에 닿은 종목 없음" not in message
+
+
+def test_recovery_alert_counts_the_positions_it_could_not_check():
+    message = notify.format_blackout_recovery_alert(30.0, total=5, checked=3, crossed=[])
+
+    assert "일봉 대조(3/5종목)" in message
+    assert "2종목은 일봉을 못 받아 확인 못 함" in message
+
+
+def test_send_telegram_alert_logs_the_title_on_success(monkeypatch, caplog):
+    """성공 로그가 없으면 "안 보냈다"와 "보냈는데 기록이 없다"가 로그에서 같은
+    모양이다 — 2026-08-26 알림 도착 여부를 사용자에게 물어서야 확인할 수 있었다."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
+    monkeypatch.setattr(notify.requests, "post", lambda url, json, timeout: _FakeResponse())
+
+    with caplog.at_level("INFO", logger="src.notify"):
+        assert notify.send_telegram_alert("🟡 [SIMA] 시세 공백 종료\n총 78분간 판정 없음") is True
+
+    assert "telegram_alert_sent" in caplog.text
+    assert "🟡 [SIMA] 시세 공백 종료" in caplog.text
+    assert "총 78분간 판정 없음" not in caplog.text  # 첫 줄만 남긴다

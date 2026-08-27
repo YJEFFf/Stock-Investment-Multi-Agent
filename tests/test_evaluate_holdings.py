@@ -1,11 +1,11 @@
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
 from src import kis, pipeline, sell
-from src.schemas import AnalystOpinion, ExitPlan, PortfolioState, Position, SellAction
+from src.schemas import AnalystOpinion, ExitPlan, OHLCVBar, PortfolioState, Position, SellAction
 
 
 def _position(**overrides) -> Position:
@@ -41,6 +41,19 @@ def _no_real_notify_or_name_lookup(monkeypatch, tmp_path):
     # 안 막으면 테스트가 실제 운영 마커를 써버린다 — EC2에서 테스트를 한 번
     # 돌리면 그날 진짜 장애 알림이 "이미 보냈다"로 묻힌다.
     monkeypatch.setattr(pipeline.notify, "ALERT_MARKER_DIR", tmp_path / "alert_markers")
+
+    # 시세 공백이 복구되면 _audit_blackout_window가 일봉을 받아 사후 판정한다 —
+    # 막지 않으면 그 경로를 지나는 테스트가 실제 KIS를 때린다. 기본값은 "조회 불가"라
+    # 감사는 checked=0으로 끝나고, 일봉이 필요한 테스트는 _daily_bars로 따로 건다.
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days=60, **kw: None)
+
+
+def _daily_bars(monkeypatch, low, high, bar_date=None):
+    """공백 사후 판정용 일봉을 건다. 기본 날짜는 DAY와 같은 날이라 판정 대상이 된다."""
+    bar = OHLCVBar(
+        date=bar_date or DAY.date(), open=high, high=high, low=low, close=low, volume=1
+    )
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days=60, **kw: [bar])
 
 
 def test_returns_unchanged_when_no_positions(monkeypatch):
@@ -657,3 +670,102 @@ def test_every_round_leaves_a_line_even_when_nothing_happens(monkeypatch, tmp_pa
         )
 
     assert "evaluate_holdings_done positions=1 priced=1 sells=0" in caplog.text
+
+
+# --- 복구 직후 일봉으로 공백 구간을 사후 판정한다 (2026-08-27) ---
+
+
+def _blackout_then_recover(monkeypatch, tmp_path, portfolio, alerts):
+    """공백 2회차(승격까지) 후 시세가 돌아온 회차까지 돌린다."""
+    monkeypatch.setattr(pipeline.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+    clock = _frozen_clock(monkeypatch, tmp_path, datetime(2026, 8, 26, 14, 7, tzinfo=pipeline.notify.KST))
+
+    _blind(monkeypatch)
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+    clock[0] = datetime(2026, 8, 26, 14, 13, tzinfo=pipeline.notify.KST)
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 100.0)
+    clock[0] = datetime(2026, 8, 26, 15, 25, tzinfo=pipeline.notify.KST)
+    return clock
+
+
+def test_recovery_alert_clears_the_window_with_the_daily_bar(monkeypatch, tmp_path):
+    """2026-08-26의 실제 결과 — 77분 공백이었지만 어느 포지션도 문턱을 안 지났다.
+    사람이 8/27에 손으로 확인한 것을 복구 알림이 스스로 하게 만든 것이다."""
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position(entry_price=100.0, peak_price=100.0)])
+    alerts = []
+    _blackout_then_recover(monkeypatch, tmp_path, portfolio, alerts)
+    _daily_bars(monkeypatch, low=95.0, high=108.0)
+
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    assert "공백 종료" in alerts[-1]
+    assert "일봉 대조(1/1종목)" in alerts[-1]
+    assert "문턱에 닿은 종목 없음" in alerts[-1]
+
+
+def test_recovery_alert_flags_a_threshold_the_blind_window_hid(monkeypatch, tmp_path):
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position(entry_price=100.0, peak_price=100.0)])
+    alerts = []
+    _blackout_then_recover(monkeypatch, tmp_path, portfolio, alerts)
+    _daily_bars(monkeypatch, low=88.0, high=101.0)  # 손절선(-10%) 아래를 찍었다
+
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    assert "⚠️" in alerts[-1]
+    assert "005930 손절" in alerts[-1]
+
+
+def test_recovery_alert_does_not_claim_safety_when_the_bar_lookup_also_failed(monkeypatch, tmp_path):
+    """일봉 조회도 같은 KIS다 — 복구 직후에 또 죽으면 "안 닿았다"고 말하면 안 된다."""
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position()])
+    alerts = []
+    _blackout_then_recover(monkeypatch, tmp_path, portfolio, alerts)
+    # 오토유즈 픽스처의 기본값이 그대로 — fetch_daily_ohlcv는 None을 준다.
+
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    assert "일봉 대조 실패" in alerts[-1]
+    assert "문턱에 닿은 종목 없음" not in alerts[-1]
+
+
+def test_recovery_alert_ignores_a_stale_bar(monkeypatch, tmp_path):
+    """전날 봉으로 재면 오늘 공백과 무관한 답이 나온다 — 판정하지 않은 것으로 센다."""
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position()])
+    alerts = []
+    _blackout_then_recover(monkeypatch, tmp_path, portfolio, alerts)
+    _daily_bars(monkeypatch, low=95.0, high=108.0, bar_date=date(2026, 8, 8))
+
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    assert "일봉 대조 실패" in alerts[-1]
+
+
+def test_recovery_alert_still_goes_out_when_the_audit_blows_up(monkeypatch, tmp_path):
+    """감사는 부가 정보다 — 실패해도 복구 알림 자체를 막으면 안 된다."""
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position()])
+    alerts = []
+    _blackout_then_recover(monkeypatch, tmp_path, portfolio, alerts)
+
+    def boom(ticker, lookback_days=60, **kw):
+        raise RuntimeError("KIS 폭발")
+
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", boom)
+
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    assert "공백 종료" in alerts[-1]
+
+
+def test_quiet_rounds_never_touch_the_daily_bar_api(monkeypatch, tmp_path):
+    """공백이 없었으면 감사도 없다 — 매분 도는 회차에 조회를 하나도 더 얹지 않는다."""
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position()])
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 100.0)
+
+    def fail(*a, **k):
+        raise AssertionError("공백이 없던 회차가 일봉을 조회했다")
+
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", fail)
+
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))

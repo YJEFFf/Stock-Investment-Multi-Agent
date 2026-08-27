@@ -84,12 +84,37 @@ def format_blackout_escalation_alert(minutes: float, positions: int) -> str:
     )
 
 
-def format_blackout_recovery_alert(minutes: float) -> str:
-    return (
-        f"🟡 [SIMA] 시세 공백 종료\n"
-        f"총 {minutes:.0f}분간 손절/익절 판정 없음 — 지금은 시세가 정상입니다\n"
-        f"사유: 그 구간에 문턱을 넘은 종목이 있었는지는 확인이 불가능합니다."
-    )
+def format_blackout_recovery_alert(
+    minutes: float, total: int = 0, checked: int = 0, crossed: list[str] | None = None
+) -> str:
+    """복구 알림. 공백 동안 문턱을 넘은 종목이 있었는지 **일봉으로 사후 판정한
+    결과**를 함께 싣는다(사용자 확정, 2026-08-27).
+
+    원래 이 알림은 "확인이 불가능합니다"라고 말했는데, 그건 사실이 아니었다 —
+    2026-08-26 장애를 사람이 8/27에 일봉 저가/고가로 확인했고, 그 방법이 그대로
+    자동화된다. 장중 어느 시각에 닿았는지는 일봉으로 알 수 없지만 "닿았는가"는
+    답이 나오고, 이 알림이 답해야 하는 질문이 정확히 그것이다.
+
+    `checked`를 `total`과 따로 받는 이유: 일봉 조회도 같은 KIS를 쓰므로 복구
+    직후에 또 실패할 수 있다. 그때 "문턱 넘은 종목 없음"이라고 말하면 안전하다는
+    거짓 확신을 준다 — 몇 종목을 실제로 확인했는지 숫자로 드러낸다.
+    """
+    lines = [
+        "🟡 [SIMA] 시세 공백 종료",
+        f"총 {minutes:.0f}분간 손절/익절 판정 없음 — 지금은 시세가 정상입니다",
+    ]
+    crossed = crossed or []
+    if checked == 0:
+        lines.append("일봉 대조 실패 — 그 구간에 문턱을 넘은 종목이 있었는지 확인하지 못했습니다.")
+        return "\n".join(lines)
+
+    unchecked = f" ({total - checked}종목은 일봉을 못 받아 확인 못 함)" if checked < total else ""
+    if crossed:
+        lines.append(f"일봉 대조({checked}/{total}종목): ⚠️ {', '.join(crossed)}{unchecked}")
+        lines.append("오늘 안에 문턱을 지났습니다 — 장중 시각은 일봉으로 알 수 없으니 다음 회차 판정을 확인하세요.")
+    else:
+        lines.append(f"일봉 대조({checked}/{total}종목): 문턱에 닿은 종목 없음{unchecked}")
+    return "\n".join(lines)
 
 
 def format_blackout_unresolved_alert(minutes: float) -> str:
@@ -136,6 +161,11 @@ def send_telegram_alert(message: str) -> bool:
             timeout=10,
         )
         response.raise_for_status()
+        # 성공도 남긴다. 실패만 로그가 있으면 "안 보냈다"와 "보냈는데 기록이 없다"가
+        # 로그에서 같은 모양이라, 2026-08-26 장애 때 알림 도착 여부를 사용자에게
+        # 물어서야 확인할 수 있었다(CHANGELOG 2026-08-27). 본문 첫 줄만 남긴다 —
+        # 어떤 알림인지 식별하는 데 그거면 충분하고, 전문은 길다.
+        logger.info("telegram_alert_sent title=%s", message.splitlines()[0] if message else "")
         return True
     except Exception:
         logger.exception("telegram_alert_failed")

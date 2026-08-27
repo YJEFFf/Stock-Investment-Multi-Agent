@@ -21,7 +21,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from src import kis
-from src.schemas import ExitPlan, FillRecord, PortfolioState, Position, SellAction
+from src.schemas import ExitPlan, FillRecord, OHLCVBar, PortfolioState, Position, SellAction
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,46 @@ def evaluate_deterministic_sell(position: Position, current_price: float) -> Sel
             ticker=position.ticker, reason="take_profit_trail", sell_fraction=plan.take_profit_fraction
         )
 
+    return None
+
+
+def threshold_crossed_in_bar(position: Position, bar: OHLCVBar) -> str | None:
+    """이 포지션이 그날 **일봉 안에서** 문턱을 지났는지 사후 판정한다. 지났으면
+    사유("stop_loss" | "take_profit" | "take_profit_trail"), 아니면 None.
+
+    시세 공백 구간을 사람이 사후 확인할 때 쓰던 방법을 코드로 옮긴 것이다
+    (2026-08-26 장애를 8/27에 이렇게 확인했다). 매분 시세를 못 받은 구간은
+    "문턱을 안 넘어서 조용했는지" "눈을 감아서 조용했는지"가 구분되지 않는데,
+    일봉의 저가/고가는 그 구간을 포함한 하루 전체의 상한·하한이므로 **최소한
+    "넘지 않았다"는 확실히 증명된다.** 넘었다면 "하루 중 어딘가에서 닿았다"까지만
+    말할 수 있다 — 장중 시각은 일봉으로 복원되지 않는다.
+
+    evaluate_deterministic_sell과 같은 순서·같은 문턱을 쓴다(손절 우선). 다르게
+    두면 사후 판정이 실제 안전장치와 어긋나서 오히려 사람을 헷갈리게 한다.
+
+    한계 하나: 트레일링은 `position.peak_price`(지금 기록된 고점)를 기준으로 재는데,
+    공백 동안 갱신되지 못한 고점이 실제보다 낮을 수 있다. 그러면 트레일 라인도
+    낮게 잡혀 "안 닿았다"가 나오기 쉬운 쪽으로 기운다. 문턱을 다시 정하는 게
+    아니라 **그 시점에 실제로 적용되던 문턱**으로 재는 것이라 이대로 둔다 —
+    가상의 고점으로 재면 실제로는 발동하지 않았을 매도를 놓쳤다고 알리게 된다.
+    """
+    if position.entry_price is None:
+        return None
+
+    plan = plan_for(position)
+
+    if (bar.low - position.entry_price) / position.entry_price <= plan.stop_loss_pct:
+        return "stop_loss"
+
+    if position.take_profit_stage == 0:
+        if (bar.high - position.entry_price) / position.entry_price >= plan.take_profit_pct:
+            return "take_profit"
+        return None
+
+    if position.peak_price is None:
+        return None
+    if (bar.low - position.peak_price) / position.peak_price <= plan.trail_pct:
+        return "take_profit_trail"
     return None
 
 

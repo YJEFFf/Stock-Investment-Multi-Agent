@@ -1,12 +1,77 @@
 import asyncio
 import hashlib
+import json
+import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 
 from src import llm
 from src.schemas import AnalystOpinion, DebateArgument, Decision, ExitPlan, SellAction
+
+logger = logging.getLogger(__name__)
+
+KST = ZoneInfo("Asia/Seoul")
+
+# 보유 종목 재평가(LLM 재량 매도)의 **종목별** 판단 기록.
+#
+# 왜 필요한가: 매수 쪽은 종목마다 score·reason·analysts를 pipeline.jsonl에 남기는데
+# 매도 쪽은 HOLD가 None으로 반환돼 사라졌고, decide_llm_sell.py는 집계 한 줄
+# (`decided=0 tickers=[]`)만 찍었다. 그래서 2026-08-12~08-27의 11거래일 연속
+# 매도 0건에 대해 **"왜 안 팔았는가"를 사후에 볼 방법이 아예 없었다**
+# (CHANGELOG 2026-08-27). 지금은 매도가 0건이라 티가 안 나지만, 재량 매도가 실제로
+# 발동하기 시작하면 근거를 추적할 수 없는 구간이 된다.
+#
+# llm.py의 DEFAULT_LLM_CALL_LOG_PATH와 같은 패턴이다 — 자기 계층이 아는 것을
+# 자기가 남긴다. 반환 계약(SellAction | None)은 건드리지 않는다.
+DEFAULT_SELL_JUDGMENT_LOG_PATH = Path("logs/sell_judgment.jsonl")
+
+
+def _append_sell_judgment(log_path: Path | None, entry: dict) -> None:
+    """기록 실패가 판단을 막지 않는다 — 로그 한 줄 때문에 매도 판정을 잃는 건
+    앞뒤가 바뀐 것이다(alert_once_per_day가 마커 실패를 삼키는 것과 같은 이유).
+
+    기본 경로를 인자 기본값이 아니라 **여기서** 푸는 이유: 파이썬은 기본값을
+    def 시점에 한 번 평가하므로 `log_path = DEFAULT_...`로 두면 테스트가
+    모듈 상수를 monkeypatch해도 안 먹는다. 그러면 테스트가 운영 logs/에 쓴다 —
+    conftest가 알림 마커를 tmp로 돌리는 것과 같은 사고를 이 파일만 비켜갈 이유가 없다.
+    """
+    path = log_path or DEFAULT_SELL_JUDGMENT_LOG_PATH
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(json.dumps(entry, default=str, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning("sell_judgment_log_failed path=%s error=%s", path, exc)
+
+
+def log_sell_skip(
+    ticker: str, reason: str, unrealized_pct: float | None = None, *, log_path: Path | None = None
+) -> None:
+    """재평가까지 못 간 보유 종목을 같은 파일에 남긴다(시세 조회 실패·분석가 실패 등).
+
+    이게 없으면 sell_judgment.jsonl에 그 종목만 통째로 빠져서, 읽는 사람이 "판단하고
+    안 팔았다"와 "아예 판단을 못 했다"를 파일의 *부재*로 역추정해야 한다 —
+    evaluate_holdings가 성공 회차를 굳이 한 줄씩 남기는 것과 같은 이유다.
+    """
+    _append_sell_judgment(log_path, _sell_judgment_entry(ticker, "skipped", unrealized_pct, reason=reason))
+
+
+def _sell_judgment_entry(ticker: str, outcome: str, unrealized_pct: float | None, **fields) -> dict:
+    """day는 KST다 — llm_calls.jsonl이 UTC라 하루씩 밀렸던 버그(2026-08-20)와
+    같은 실수를 반복하지 않는다. 매도 판단 cron은 15:35 KST라 UTC로도 같은 날에
+    떨어지지만, 경계를 장이 도는 시간대로 통일해두는 편이 안전하다."""
+    return {
+        "day": datetime.now(KST).date().isoformat(),
+        "ticker": ticker,
+        "outcome": outcome,
+        "unrealized_pct": round(unrealized_pct, 4) if unrealized_pct is not None else None,
+        **fields,
+    }
+
 
 BULL_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "debate_bull.md"
 BEAR_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "debate_bear.md"
@@ -262,6 +327,8 @@ async def portfolio_manager_sell(
     stay: DebateArgument,
     exit_case: DebateArgument,
     unrealized_pct: float,
+    *,
+    log_path: Path | None = None,
 ) -> SellAction | None:
     """보유 종목 재평가 — portfolio_manager(매수용)와 대칭이지만 Decision이 아니라
     SellAction을 반환한다("매도는 별도 경로", Decision.action 주석). 이 판단은
@@ -290,16 +357,54 @@ async def portfolio_manager_sell(
         label="portfolio_manager_sell",
     )
 
+    # HOLD도 SELL과 똑같이 남긴다. 반환값은 계약대로 HOLD면 None이지만, 그 None에
+    # 도달한 근거는 여기서만 보인다 — 위 계층에는 애초에 전달되지 않는다.
+    _append_sell_judgment(
+        log_path,
+        _sell_judgment_entry(
+            ticker,
+            result.action,
+            unrealized_pct,
+            reasoning=result.reasoning,
+            analysts=sorted(o.agent for o in opinions),
+            avg_score=sum(o.score for o in opinions) / len(opinions),
+            avg_confidence=sum(o.confidence for o in opinions) / len(opinions),
+            stay_strength=stay.strength,
+            exit_strength=exit_case.strength,
+            evidence=[f"prompt:manager_sell@{version}"],
+        ),
+    )
+    logger.info(
+        "sell_judgment ticker=%s outcome=%s unrealized=%+.1f%%", ticker, result.action, unrealized_pct * 100
+    )
+
     if result.action == "HOLD":
         return None
     return SellAction(ticker=ticker, reason="llm_discretionary", sell_fraction=1.0, reasoning=result.reasoning)
 
 
-async def judge_sell(ticker: str, opinions: list[AnalystOpinion], unrealized_pct: float) -> SellAction | None:
+async def judge_sell(
+    ticker: str,
+    opinions: list[AnalystOpinion],
+    unrealized_pct: float,
+    *,
+    log_path: Path | None = None,
+) -> SellAction | None:
     """evaluate_holdings가 기대하는 형태. 의견이 하나도 없으면(분석 실패) 판단
-    자체를 안 한다 — judge()와 같은 패턴("판단 불가" != "판단했으나 기각")."""
+    자체를 안 한다 — judge()와 같은 패턴("판단 불가" != "판단했으나 기각").
+
+    반환값은 두 경우 모두 None이지만 **로그에서는 갈라진다**(`no_opinions` vs
+    `HOLD`). 스키마 계약이 구분하라고 요구하는 그 구분이고, 로그에서까지 뭉개지면
+    "분석이 죽어서 조용한 날"과 "판단하고 안 판 날"을 사후에 못 가린다.
+    """
     if not opinions:
+        _append_sell_judgment(
+            log_path, _sell_judgment_entry(ticker, "no_opinions", unrealized_pct, analysts=[])
+        )
+        logger.warning("sell_judgment ticker=%s outcome=no_opinions — 재평가 불가", ticker)
         return None
 
     stay, exit_case = await debate_holding(ticker, opinions, unrealized_pct)
-    return await portfolio_manager_sell(ticker, opinions, stay, exit_case, unrealized_pct)
+    return await portfolio_manager_sell(
+        ticker, opinions, stay, exit_case, unrealized_pct, log_path=log_path
+    )

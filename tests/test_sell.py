@@ -1,8 +1,10 @@
+from datetime import date
+
 import pytest
 from pydantic import ValidationError
 
 from src import kis, sell
-from src.schemas import ExitPlan, FillRecord, PortfolioState, Position, SellAction
+from src.schemas import ExitPlan, FillRecord, OHLCVBar, PortfolioState, Position, SellAction
 
 
 @pytest.fixture(autouse=True)
@@ -606,3 +608,57 @@ def test_execute_sell_order_keeps_position_when_response_lost_and_no_fill(monkey
 
     assert updated == portfolio
     assert fill is None
+
+
+# --- 시세 공백 사후 판정 (일봉 대조, 2026-08-27) ---
+
+
+def _bar(low: float, high: float) -> OHLCVBar:
+    return OHLCVBar(date=date(2026, 8, 26), open=high, high=high, low=low, close=low, volume=1)
+
+
+def test_bar_audit_reports_nothing_when_the_day_stayed_inside_the_thresholds():
+    position = _position(entry_price=100.0, peak_price=100.0)
+    assert sell.threshold_crossed_in_bar(position, _bar(low=95.0, high=115.0)) is None
+
+
+def test_bar_audit_catches_a_stop_loss_the_blind_window_could_have_hidden():
+    """이 판정이 존재하는 이유 — 2026-08-26에 77분간 시세를 하나도 못 받았고,
+    그 구간에 문턱을 지났는지를 사람이 일봉으로 확인해야 했다."""
+    position = _position(entry_price=100.0, peak_price=100.0)
+    assert sell.threshold_crossed_in_bar(position, _bar(low=89.0, high=101.0)) == "stop_loss"
+
+
+def test_bar_audit_catches_a_take_profit_trigger():
+    position = _position(entry_price=100.0, peak_price=100.0)
+    assert sell.threshold_crossed_in_bar(position, _bar(low=99.0, high=121.0)) == "take_profit"
+
+
+def test_bar_audit_uses_the_trailing_line_once_a_take_profit_already_fired():
+    """stage>0이면 진입가가 아니라 고점 기준이다 — evaluate_deterministic_sell과
+    같은 분기를 타야 사후 판정이 실제 안전장치와 어긋나지 않는다."""
+    position = _position(entry_price=100.0, peak_price=200.0, take_profit_stage=1)
+
+    assert sell.threshold_crossed_in_bar(position, _bar(low=190.0, high=200.0)) is None
+    assert sell.threshold_crossed_in_bar(position, _bar(low=185.0, high=200.0)) == "take_profit_trail"
+
+
+def test_bar_audit_prefers_stop_loss_when_both_ends_crossed():
+    """손절 우선 — evaluate_deterministic_sell과 같은 순서."""
+    position = _position(entry_price=100.0, peak_price=100.0)
+    assert sell.threshold_crossed_in_bar(position, _bar(low=85.0, high=125.0)) == "stop_loss"
+
+
+def test_bar_audit_declines_to_judge_a_position_without_an_entry_price():
+    """진입가가 없으면 판정 자체를 안 한다 — "안 닿았다"로 답하면 확인하지 않은 것을
+    안전하다고 말하는 게 된다(AnalystOpinion | None과 같은 구분)."""
+    position = _position(entry_price=None, peak_price=None)
+    assert sell.threshold_crossed_in_bar(position, _bar(low=1.0, high=999.0)) is None
+
+
+def test_bar_audit_respects_the_frozen_exit_plan_not_the_default():
+    plan = ExitPlan(stop_loss_pct=-0.05, take_profit_pct=0.10, take_profit_fraction=0.3, trail_pct=-0.04)
+    position = _position(entry_price=100.0, peak_price=100.0, exit_plan=plan)
+
+    # 기본값(-10%)이었다면 안 걸릴 저가인데, 이 포지션의 문턱은 -5%다.
+    assert sell.threshold_crossed_in_bar(position, _bar(low=94.0, high=101.0)) == "stop_loss"

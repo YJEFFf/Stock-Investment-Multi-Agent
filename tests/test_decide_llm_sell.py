@@ -315,3 +315,23 @@ def test_monitoring_summary_failure_does_not_break_the_sell_path(monkeypatch, tm
     payload = json.loads(dls.PENDING_SELLS_PATH.read_text())
     assert payload["actions"] == []
 
+
+
+def test_a_ticker_skipped_for_price_failure_still_appears_in_the_judgment_log(monkeypatch, tmp_path):
+    """빠진 종목이 파일에 아예 없으면, 읽는 사람이 "판단하고 안 팔았다"와 "판단을
+    못 했다"를 기록의 *부재*로 역추정해야 한다."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
+    portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))
+
+    log_path = tmp_path / "sell_judgment.jsonl"
+    monkeypatch.setattr(dls.judgment, "DEFAULT_SELL_JUDGMENT_LOG_PATH", log_path)
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: None)
+
+    asyncio.run(dls.main())
+
+    rows = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    assert [(r["outcome"], r["reason"], r["ticker"]) for r in rows] == [
+        ("skipped", "price_unavailable", "005930")
+    ]
+    assert rows[0]["unrealized_pct"] is None  # 시세가 없으니 손익도 없다 — 0.0으로 지어내지 않는다

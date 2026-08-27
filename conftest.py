@@ -31,3 +31,17 @@ def _isolate_alert_state(monkeypatch, tmp_path):
 
     monkeypatch.setattr(notify, "ALERT_MARKER_DIR", tmp_path / "alert_markers")
     monkeypatch.setattr(notify, "BLACKOUT_STATE_DIR", tmp_path / "alert_markers")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_sell_judgment_log(monkeypatch, tmp_path):
+    """LLM 재량 매도의 종목별 판단 로그를 항상 tmp로 돌린다.
+
+    _isolate_alert_state와 같은 이유다 — 기본값이 레포의 logs/sell_judgment.jsonl이라
+    막지 않으면 테스트 한 번에 가짜 판단 수십 건이 운영 기록에 섞인다. 이 로그는
+    "왜 안 팔았는가"를 사후에 보려고 만든 것이라(judgment.py 주석), 목킹된 줄이
+    섞이는 순간 목적을 잃는다.
+    """
+    from src import judgment
+
+    monkeypatch.setattr(judgment, "DEFAULT_SELL_JUDGMENT_LOG_PATH", tmp_path / "sell_judgment.jsonl")

@@ -737,6 +737,68 @@ async def run_day(
     return portfolio, results
 
 
+async def _audit_blackout_window(
+    portfolio: PortfolioState, day: datetime
+) -> tuple[int, int, list[str]]:
+    """시세 공백이 끝난 직후, 그 구간에 문턱을 넘은 종목이 있었는지 일봉으로 판정한다.
+
+    돌려주는 것은 (판정 대상 수, 실제로 확인한 수, 닿은 종목 설명)이다. 확인한
+    수를 따로 세는 이유는 일봉 조회도 같은 KIS를 쓰기 때문이다 — 복구 직후라 또
+    실패할 수 있고, 그때 "닿은 종목 없음"이라고 알리면 확인하지도 않은 것을
+    안전하다고 말하는 게 된다. 공백 알림이 존재하는 이유가 바로 그 혼동을 없애는
+    것이라(evaluate_holdings 주석), 여기서 같은 실수를 하면 안 된다.
+
+    조회는 FAST_FAIL_POLICY로 짧게 끝낸다. 이 함수는 매분 도는 회차 안에서 돌고,
+    회차가 길어지면 다음 분이 락에 막혀 공백이 오히려 늘어난다.
+    """
+    targets = [p for p in portfolio.positions if p.entry_price is not None]
+    if not targets:
+        return 0, 0, []
+
+    results = await asyncio.gather(
+        *(
+            asyncio.to_thread(kis.fetch_daily_ohlcv, p.ticker, 1, policy=kis.FAST_FAIL_POLICY)
+            for p in targets
+        ),
+        return_exceptions=True,
+    )
+
+    checked = 0
+    crossed: list[str] = []
+    for position, bars in zip(targets, results):
+        if isinstance(bars, BaseException) or not bars:
+            logger.warning("blackout_audit_bar_unavailable ticker=%s", position.ticker)
+            continue
+        bar = bars[-1]
+        # 오늘 일봉이 아직 안 잡혔으면 그 종목은 판정하지 않는다 — 전날 봉으로
+        # 재면 오늘 공백과 무관한 답이 나온다.
+        if bar.date != day.date():
+            logger.warning(
+                "blackout_audit_stale_bar ticker=%s bar_date=%s day=%s",
+                position.ticker,
+                bar.date,
+                day.date(),
+            )
+            continue
+        checked += 1
+        reason = sell.threshold_crossed_in_bar(position, bar)
+        if reason is not None:
+            label = notify.REASON_LABELS.get(reason, reason)
+            crossed.append(f"{display_name(position.ticker)} {label}")
+            logger.error(
+                "blackout_audit_threshold_crossed ticker=%s reason=%s low=%.0f high=%.0f",
+                position.ticker,
+                reason,
+                bar.low,
+                bar.high,
+            )
+
+    logger.info(
+        "blackout_audit_done total=%d checked=%d crossed=%d", len(targets), checked, len(crossed)
+    )
+    return len(targets), checked, crossed
+
+
 async def evaluate_holdings(
     portfolio: PortfolioState,
     day: datetime,
@@ -817,7 +879,19 @@ async def evaluate_holdings(
             )
         else:
             logger.info("evaluate_holdings_blackout_recovered minutes=%.1f", blackout.minutes)
-            notify.send_telegram_alert(notify.format_blackout_recovery_alert(blackout.minutes))
+            # 복구 직후에 바로 일봉을 받아 사후 판정한다(사용자 확정, 2026-08-27).
+            # 감사가 통째로 실패해도 복구 알림 자체는 반드시 나가야 한다 — 알림을
+            # 잃는 것이 알림 내용이 부실한 것보다 나쁘다.
+            try:
+                audit_total, audit_checked, audit_crossed = await _audit_blackout_window(portfolio, day)
+            except Exception as exc:  # noqa: BLE001 - 감사 실패로 복구 알림을 막지 않는다
+                logger.warning("blackout_audit_failed error=%s", exc)
+                audit_total, audit_checked, audit_crossed = len(portfolio.positions), 0, []
+            notify.send_telegram_alert(
+                notify.format_blackout_recovery_alert(
+                    blackout.minutes, audit_total, audit_checked, audit_crossed
+                )
+            )
 
     sells = 0
     for ticker, current_price in price_by_ticker.items():

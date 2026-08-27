@@ -115,12 +115,14 @@ async def main() -> None:
             current_price = await asyncio.to_thread(kis.fetch_current_price, position.ticker)
             if current_price is None:
                 logger.warning("decide_llm_sell_skipped ticker=%s reason=price_unavailable", position.ticker)
+                judgment.log_sell_skip(position.ticker, "price_unavailable")
                 continue
 
             try:
                 opinions = await analyst_fn(position.ticker, position.sector, day)
             except Exception as exc:  # noqa: BLE001 - 재평가 실패는 그 종목만 스킵
                 logger.warning("decide_llm_sell_analysis_failed ticker=%s error=%s", position.ticker, exc)
+                judgment.log_sell_skip(position.ticker, "analysis_failed")
                 continue
 
             unrealized_pct = (

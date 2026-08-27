@@ -348,11 +348,17 @@ def _parse_daily_chart(data: dict) -> list[OHLCVBar]:
     return bars
 
 
-def fetch_daily_ohlcv(ticker: str, lookback_days: int = 60) -> list[OHLCVBar] | None:
+def fetch_daily_ohlcv(
+    ticker: str, lookback_days: int = 60, *, policy: RetryPolicy = DEFAULT_POLICY
+) -> list[OHLCVBar] | None:
     """KIS 일별시세 API에서 최근 lookback_days 거래일치 일봉을 가져온다.
 
     조회 기간을 얼마나 넓게 잡아도 KIS가 최근 100거래일로 캡핑하는 걸 실측으로
     확인했다 — 그래서 넉넉한 고정폭 창을 요청하고 뒤에서 lookback_days만큼 자른다.
+
+    policy를 받는 이유는 fetch_current_price와 같다: 시세 공백 복구 직후의 사후
+    판정(pipeline._audit_blackout_window)은 매분 도는 회차 안에서 도는 조회라
+    FAST_FAIL_POLICY로 짧게 끝내야 다음 분이 락에 막히지 않는다.
     """
     end_date = datetime.now(timezone.utc).date()
     begin_date = end_date - timedelta(days=400)
@@ -366,7 +372,7 @@ def fetch_daily_ohlcv(ticker: str, lookback_days: int = 60) -> list[OHLCVBar] | 
         "FID_ORG_ADJ_PRC": "1",
     }
 
-    data = _kis_get(DAILY_CHART_PATH, DAILY_CHART_TR_ID, params)
+    data = _kis_get(DAILY_CHART_PATH, DAILY_CHART_TR_ID, params, policy=policy)
     if data is None:
         return None
 
