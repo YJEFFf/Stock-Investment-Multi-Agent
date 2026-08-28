@@ -16,20 +16,36 @@
 판정이 어느 값 기준이었는지 헷갈리게 된다. 장 마감 후에 돌리는 게 안전하다.
 """
 
+import logging
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import kis, notify, reconcile  # noqa: E402
+from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.pipeline import _kst_today  # noqa: E402
 from src.portfolio_store import load_portfolio, portfolio_lock, save_portfolio  # noqa: E402
+
+# 크론(--alert)에서 도는 스크립트라 다른 크론 스크립트와 같은 형식으로 남긴다.
+# 이게 없으면 notify의 telegram_alert_sent(INFO)가 통째로 사라져서, 알림을 보냈는지
+# 로그로 확인할 수 없다 — 2026-08-26 장애 때 도착 여부를 사용자에게 물어서야 알 수
+# 있었던 것과 같은 문제다(CHANGELOG 2026-08-27).
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("reconcile")
 
 APPLY = "--apply" in sys.argv
 ALERT = "--alert" in sys.argv
 
 
 def main() -> int:
+    # 크론은 평일에만 돌지만 평일에도 휴장일이 있다. 휴장일엔 체결이 없어 새 드리프트가
+    # 생길 수 없고, 남아 있는 드리프트는 다음 거래일에 어차피 다시 잡힌다 — 굳이 그날
+    # 알림을 한 번 더 보내면 배경 소음만 는다.
+    if ALERT and not is_krx_trading_day(_kst_today()):
+        logger.info("not_a_trading_day day=%s — skip", _kst_today().isoformat())
+        return 0
+
     holdings = kis.fetch_holdings()
     if holdings is None:
         print("브로커 잔고 조회 실패 — 아무것도 바꾸지 않았습니다.")
