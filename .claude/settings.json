@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(aws ec2 authorize-security-group-ingress *)",
-      "Bash(aws ec2 revoke-security-group-ingress *)"
-    ]
-  }
-}

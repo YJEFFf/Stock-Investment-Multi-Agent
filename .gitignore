@@ -5,6 +5,9 @@ __pycache__/
 logs/
 .DS_Store
 .env
+# Claude Code 개인 설정. settings.json(공유용)과 달리 이쪽은 커밋하지 않는다 —
+# 이 저장소는 공개라, 권한 허용목록을 올려서 얻을 게 없다(2026-08-28).
+.claude/settings.local.json
 .kis_token_cache.json
 .kospi200_sector_cache.json
 .kospi200_ticker_name_cache.json
