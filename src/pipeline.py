@@ -322,7 +322,14 @@ async def execute_buy_order(
         return portfolio
 
     fill_price = fill.price if fill is not None else None
-    entry_price_source = "fill"
+    # 체결 조회가 주문 수량을 다 따라잡았는지로 갈라 적는다. 부분 체결이어도 평균가는
+    # 실제 체결의 일부라 호가보다 훨씬 낫지만, 여러 단가로 나뉜 주문의 앞부분만 본
+    # 값이라 오차가 포지션 수명 내내 진입가에 남는다 — 그 사실을 라벨에 남기지 않으면
+    # 나중에 매매일지만 보고는 어떤 진입가가 전체 평균이고 어떤 게 앞부분 몇 %짜리인지
+    # 구분할 수 없다. 2026-08-28 300720이 488주 중 95주(19.5%)만 잡힌 채 "fill"로
+    # 기록됐고, 실제 전량 평균과 -0.04% 어긋난 걸 마감 후 reconcile로야 알았다.
+    # 매도 경로(finalize_sell)는 처음부터 이렇게 갈라 적고 있었다.
+    entry_price_source = "fill" if fill is None or fill.complete else "fill_partial"
     if fill_price is None:
         # 전후 집계 차를 못 구한 경우(조회 실패 등) — 그날 매수 집계 평균으로 물러선다.
         # 같은 날 추가매수가 있으면 섞이지만, 호가보다는 훨씬 낫다.
@@ -385,10 +392,12 @@ async def execute_buy_order(
             "sector": sector,
             "quantity": quantity,
             "entry_price": entry_price,
-            # 진입가를 어디서 얻었는지 — "fill"(일별체결 집계) / "position_avg"(잔고
-            # 매입평균가) / "quote_fallback"(둘 다 실패해 호가로 근사). 마지막 것은
-            # 손절·익절 기준이 실제 원가와 다를 수 있다는 뜻이라 반드시 구분해서
-            # 남긴다(2026-08-15, 192820 오익절 건 이후).
+            # 진입가를 어디서 얻었는지 — "fill"(일별체결 집계, 주문 수량 전부 확인)
+            # / "fill_partial"(같은 집계지만 타임아웃까지 일부만 잡힘) / "daily_avg"
+            # (그날 매수 집계 평균) / "position_avg"(잔고 매입평균가) /
+            # "quote_fallback"(전부 실패해 호가로 근사). 뒤쪽일수록 손절·익절 기준이
+            # 실제 원가와 어긋날 여지가 크므로 반드시 구분해서 남긴다
+            # (2026-08-15 192820 오익절 건, 2026-08-28 300720 부분 체결 건).
             "entry_price_source": entry_price_source,
             "order_no": order_no,
             "gap_pct": round(gap_pct, 4),

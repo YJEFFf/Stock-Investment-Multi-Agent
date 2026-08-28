@@ -442,6 +442,11 @@ async def _buy_row_children(entry: dict) -> list[dict]:
             argument_ko = await translate.to_korean(d["argument"], label="translate_debate_argument")
             blocks.append(_bulleted(f"[{d['stance']}] (강도 {d['strength']:.2f}) {_truncate(argument_ko, 500)}"))
 
+    entry_note = _entry_source_note(entry)
+    if entry_note:
+        blocks.append(_heading("진입가 출처", level=3))
+        blocks.append(_paragraph(entry_note))
+
     return blocks
 
 
@@ -555,6 +560,22 @@ def _fill_source_note(entry: dict) -> str | None:
         "fill_partial": "체결 조회가 주문 수량을 다 따라잡지 못해, 관측된 평균 체결가에 실제 매도 수량을 곱해 매도금액을 되세웠다.",
     }
     return notes.get(entry.get("exit_price_source"))
+
+
+def _entry_source_note(entry: dict) -> str | None:
+    """진입가가 어디서 온 값인지. 브로커 체결 원본(전량 확인)이면 굳이 안 적는다.
+
+    진입가는 손절·익절 판정의 유일한 기준점이라(2026-08-15 192820) 근사치가 섞인
+    건은 일지에서 바로 보여야 한다. 그 전까지는 부분 체결도 "fill"로만 남아
+    logs/cron.log의 kis_fill_incomplete 경고를 따로 대조해야만 알 수 있었다.
+    """
+    notes = {
+        "fill_partial": "체결 조회가 주문 수량을 다 따라잡지 못해, 그때까지 잡힌 일부 체결의 평균가를 진입가로 적었다 — 전량 평균과 다를 수 있다.",
+        "daily_avg": "주문 단위 체결 내역을 못 구해 그날 이 종목 매수 집계의 평균가로 적었다 — 같은 날 추가매수가 있었다면 섞인 값이다.",
+        "position_avg": "체결 집계 대신 잔고의 매입평균가로 적었다.",
+        "quote_fallback": "체결가를 끝내 못 구해 주문 직전 호가로 근사했다 — 손절·익절 기준이 실제 원가와 다를 수 있다.",
+    }
+    return notes.get(entry.get("entry_price_source"))
 
 
 async def _sell_row_children(entry: dict) -> list[dict]:

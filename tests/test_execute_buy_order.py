@@ -365,18 +365,40 @@ def test_buy_journal_records_the_exit_plan(monkeypatch, tmp_path):
 # --- 진입가 출처 체인 (2026-08-15, 192820 오익절 건 이후) ---
 
 
-def _wire_buy_with_prices(monkeypatch, fill_price, position_avg, bracket=None):
+def _wire_buy_with_prices(monkeypatch, fill_price, position_avg, bracket=None, fill=None):
     """진입가 폴백 체인을 단계별로 확인한다.
 
     체인: 전후 집계 브래킷 -> 그날 매수 집계 평균 -> 잔고 매입평균가 -> 호가.
     `bracket`은 (주문전, 주문후) 누적 체결 집계 튜플이며 None이면 조회 불가로 둔다.
+    `fill`은 (단가, 주문수량 대비 체결 비율) — 주문 수량은 잔고에서 계산돼 테스트가
+    미리 알 수 없으므로, "전량 체결"을 수량을 안 박고 표현하려면 이쪽을 쓴다.
     """
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 101.0)  # 주문 직전 호가
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
-    monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: "order-1")
     monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, day: fill_price)
     monkeypatch.setattr(kis, "fetch_position_avg_price", lambda ticker: position_avg)
+
+    ordered: list[int] = []
+
+    def _place(ticker, qty):
+        ordered.append(qty)
+        return "order-1"
+
+    monkeypatch.setattr(kis, "place_market_buy_order", _place)
+
+    if fill is not None:
+        unit_price, filled_ratio = fill
+        before = (100, 9_000.0)
+
+        def _totals(ticker, day, side):
+            if not ordered:  # 주문 직전 조회
+                return before
+            filled = int(ordered[0] * filled_ratio)
+            return (before[0] + filled, before[1] + filled * unit_price)
+
+        monkeypatch.setattr(kis, "fetch_daily_fill_totals", _totals)
+        return
 
     totals = iter(bracket if bracket is not None else [None, None])
     monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: next(totals))
@@ -395,19 +417,41 @@ def _run_buy(tmp_path):
 
 def test_entry_price_prefers_this_orders_own_fill(monkeypatch, tmp_path):
     """주문 전후 누적 체결 집계의 차 = 이 주문 하나의 체결가. 같은 날 이미 다른
-    체결(100주/9,000원)이 있어도 섞이지 않고 이번 20주분(2,240원 -> 주당 112원)만
-    잡혀야 한다."""
+    체결(100주/9,000원)이 있어도 섞이지 않고 이번 주문분(주당 112원)만 잡혀야 한다."""
     _wire_buy_with_prices(
         monkeypatch,
         fill_price=999.0,  # 그날 집계 평균 — 섞인 값이라 쓰면 안 된다
         position_avg=888.0,
-        bracket=[(100, 9_000.0), (120, 11_240.0)],
+        fill=(112.0, 1.0),  # 주문 수량 전부 체결
     )
 
     portfolio, entry = _run_buy(tmp_path)
 
     assert portfolio.positions[0].entry_price == pytest.approx(112.0)
     assert entry["entry_price_source"] == "fill"
+
+
+def test_entry_price_marks_partial_fill_distinctly(monkeypatch, tmp_path):
+    """체결 조회가 주문 수량을 다 못 따라잡았으면 "fill"이 아니라 "fill_partial"이다.
+
+    2026-08-28 300720: 488주 주문 중 12초 안에 95주(19.5%)만 잡힌 채 타임아웃됐는데
+    매매일지엔 "fill"로 남아, 그 진입가가 전량 평균인지 앞부분 19%짜리인지 일지만
+    보고는 알 수 없었다(실제로 전량 평균과 -0.04% 어긋나 있었다). 값은 그대로 쓰되
+    — 부분 체결 평균가도 호가보다는 훨씬 낫다 — 근사치라는 사실을 라벨로 남긴다.
+    매도 경로(finalize_sell)는 처음부터 이렇게 구분하고 있었다.
+    """
+    _wire_buy_with_prices(
+        monkeypatch,
+        fill_price=999.0,
+        position_avg=888.0,
+        fill=(112.0, 0.195),  # 주문 수량의 19.5%만 잡힘
+    )
+
+    portfolio, entry = _run_buy(tmp_path)
+
+    # 폴백으로 넘어가지 않는다 — 부분 체결 평균가가 여전히 최선의 출처다.
+    assert portfolio.positions[0].entry_price == pytest.approx(112.0)
+    assert entry["entry_price_source"] == "fill_partial"
 
 
 def test_entry_price_falls_back_to_daily_average_when_bracket_unavailable(monkeypatch, tmp_path):

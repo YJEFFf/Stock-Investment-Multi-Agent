@@ -302,6 +302,30 @@ def test_buy_row_properties_and_children():
     assert any("종합 판단 근거" in b["paragraph"]["rich_text"][0]["text"]["content"] for b in paragraphs)
 
 
+def test_buy_row_flags_an_approximated_entry_price():
+    """진입가가 근사치인 건은 일지에서 바로 보여야 한다 — 그 전까지는 부분 체결도
+    "fill"로만 남아 logs/cron.log의 kis_fill_incomplete를 대조해야만 알 수 있었다
+    (2026-08-28 300720)."""
+    partial = asyncio.run(notion_sync._buy_row_children(_buy_entry() | {"entry_price_source": "fill_partial"}))
+    text = json.dumps(partial, ensure_ascii=False)
+    assert "진입가 출처" in text
+    assert "전량 평균과 다를 수 있다" in text
+
+    quote = asyncio.run(notion_sync._buy_row_children(_buy_entry() | {"entry_price_source": "quote_fallback"}))
+    assert "호가로 근사했다" in json.dumps(quote, ensure_ascii=False)
+
+
+def test_buy_row_stays_quiet_when_entry_price_is_a_full_broker_fill():
+    """브로커 체결 원본(전량 확인)이면 굳이 안 적는다 — 정상 건마다 주석이 붙으면
+    진짜 근사치 건이 묻힌다."""
+    for source in ("fill", None):
+        entry = _buy_entry()
+        if source is not None:
+            entry["entry_price_source"] = source
+        text = json.dumps(asyncio.run(notion_sync._buy_row_children(entry)), ensure_ascii=False)
+        assert "진입가 출처" not in text
+
+
 def test_sell_row_properties_rounds_realized_pnl_to_two_decimal_percent():
     entry = _sell_entry()
     entry["realized_pnl_pct"] = 0.14523809523809525
