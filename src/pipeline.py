@@ -357,11 +357,27 @@ async def execute_buy_order(
     positions = [p.model_copy() for p in portfolio.positions]
     existing = next((p for p in positions if p.ticker == ticker), None)
     if existing is not None:
-        old_basis = (existing.entry_price or entry_price) * existing.weight
-        new_basis = entry_price * trade_weight
-        new_weight = existing.weight + trade_weight
-        existing.entry_price = (old_basis + new_basis) / new_weight
-        existing.weight = new_weight
+        old_price = existing.entry_price or entry_price
+        old_quantity = existing.quantity
+        if old_quantity and quantity:
+            # 평균 원가는 **주식수 가중**이다. 비중으로 가중하면 안 되는 이유:
+            # `weight`는 매수 시점 원가 기준 비중이라(src/reconcile.py docstring)
+            # `weight ∝ 수량 x 단가`다. 그걸로 단가를 가중하면 단가가 제곱으로
+            # 들어가 비싼 쪽 매수로 평균이 끌려간다 — 100주 @1,000원에 50주
+            # @2,000원을 더하면 정답 1,333.33원 대신 1,500원이 나왔다(+12.5%,
+            # 2026-08-28 실제 코드 경로로 재현). 진입가가 부풀면 손절은 일찍,
+            # 익절은 늦게 발동한다(2026-08-15 192820 오익절과 같은 부류).
+            # 브로커 매입평균가가 애초에 주식수 가중이라, 이 식이 그것과 일치한다.
+            existing.entry_price = (old_price * old_quantity + entry_price * quantity) / (
+                old_quantity + quantity
+            )
+        else:
+            # 주식수를 추적하지 않는 경로(시뮬레이션 등) — 비중으로 물러선다.
+            # 위 식보다 부정확하지만 여기서는 수량 자체가 없어 달리 방법이 없다.
+            old_basis = old_price * existing.weight
+            new_basis = entry_price * trade_weight
+            existing.entry_price = (old_basis + new_basis) / (existing.weight + trade_weight)
+        existing.weight = existing.weight + trade_weight
         existing.peak_price = max(existing.peak_price or entry_price, entry_price)
         existing.quantity = (existing.quantity or 0) + quantity
         # entry_day는 최초 진입일 그대로 둔다 — 추가매수로 갱신하면 보유기간이 매번 리셋된다.

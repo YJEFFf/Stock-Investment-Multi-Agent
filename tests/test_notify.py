@@ -257,3 +257,46 @@ def test_send_telegram_alert_logs_the_title_on_success(monkeypatch, caplog):
     assert "telegram_alert_sent" in caplog.text
     assert "🟡 [SIMA] 시세 공백 종료" in caplog.text
     assert "총 78분간 판정 없음" not in caplog.text  # 첫 줄만 남긴다
+
+
+# --- 브로커 대조 드리프트 알림 (2026-08-28, reconcile을 크론에 올리면서) ---
+
+
+def _drift(ticker="005930", field="entry_price", local=100.0, broker=112.0):
+    from src.reconcile import Drift
+
+    return Drift(ticker=ticker, field=field, local=local, broker=broker, corrected=True)
+
+
+def test_reconcile_alert_shows_each_drift_with_its_relative_size():
+    message = notify.format_reconcile_drift_alert("2026-08-28", [_drift()])
+
+    assert "어긋난 곳 1건" in message
+    assert "005930 entry_price" in message
+    assert "+12.00%" in message  # 112/100 - 1
+    # 교정하지 않았다는 사실이 알림에 남아야 한다 — 안 그러면 이미 고쳐진 줄 안다.
+    assert "교정 안 함" in message
+
+
+def test_reconcile_alert_spells_out_the_two_missing_cases():
+    """수량 드리프트와 달리 이쪽은 사람이 판단해야 하는 건이라 문장으로 적는다."""
+    message = notify.format_reconcile_drift_alert(
+        "2026-08-28",
+        [
+            _drift(ticker="111111", field="missing_at_broker", local=10.0, broker=None),
+            _drift(ticker="222222", field="missing_locally", local=None, broker=7.0),
+        ],
+    )
+
+    assert "111111: 상태 파일엔 있는데 브로커 잔고엔 없음" in message
+    assert "222222: 브로커는 7주 보유 중인데 상태 파일엔 없음" in message
+
+
+def test_reconcile_alert_survives_a_zero_local_value():
+    """relative_diff가 None으로 떨어지는 경우(local이 0이거나 None) — 퍼센트 없이 나간다."""
+    message = notify.format_reconcile_drift_alert(
+        "2026-08-28", [_drift(field="quantity", local=None, broker=488.0)]
+    )
+
+    assert "005930 quantity" in message
+    assert "%" not in message

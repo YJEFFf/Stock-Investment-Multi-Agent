@@ -2,6 +2,11 @@
 
     uv run python scripts/reconcile_portfolio.py            # 대조만 (드라이런)
     uv run python scripts/reconcile_portfolio.py --apply    # 브로커 기준으로 교정
+    uv run python scripts/reconcile_portfolio.py --alert    # 드라이런 + 어긋나면 텔레그램
+
+`--alert`가 크론(장 마감 후)이 쓰는 모드다. 교정은 안 하고 보고만 한다 —
+2026-08-28까지 이 스크립트는 수동 실행뿐이라 아무도 안 돌리면 어긋난 진입가로
+손절·익절이 계속 판정됐다(docs/CHANGELOG.md 2026-08-28).
 
 왜 필요한지는 src/reconcile.py docstring 참고 — 요약하면 시장가 체결과 기록된
 진입가가 어긋나면 손절·익절이 틀린 기준으로 판정된다.
@@ -16,16 +21,23 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import kis, reconcile  # noqa: E402
+from src import kis, notify, reconcile  # noqa: E402
+from src.pipeline import _kst_today  # noqa: E402
 from src.portfolio_store import load_portfolio, portfolio_lock, save_portfolio  # noqa: E402
 
 APPLY = "--apply" in sys.argv
+ALERT = "--alert" in sys.argv
 
 
 def main() -> int:
     holdings = kis.fetch_holdings()
     if holdings is None:
         print("브로커 잔고 조회 실패 — 아무것도 바꾸지 않았습니다.")
+        if ALERT:
+            # 조회 실패도 알린다 — 조용하면 "어긋난 곳 없음"과 구분이 안 된다.
+            notify.send_telegram_alert(
+                notify.format_error_alert("브로커 대조", "잔고 조회 실패 — 대조하지 못했습니다")
+            )
         return 1
 
     with portfolio_lock():
@@ -49,6 +61,10 @@ def main() -> int:
 
         if not APPLY:
             print("\n(드라이런입니다. 실제로 교정하려면 --apply)")
+            if ALERT:
+                notify.send_telegram_alert(
+                    notify.format_reconcile_drift_alert(_kst_today().isoformat(), drifts)
+                )
             return 0
 
         save_portfolio(corrected)

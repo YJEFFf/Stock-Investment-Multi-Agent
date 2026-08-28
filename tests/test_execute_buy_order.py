@@ -225,7 +225,12 @@ def test_falls_back_to_current_price_when_fill_price_unavailable(monkeypatch, tm
     assert result.positions[0].entry_price == 101.0  # current_price로 근사
 
 
-def test_adds_to_existing_position_with_weighted_average_entry_price(monkeypatch, tmp_path):
+def test_adds_to_existing_position_falls_back_to_weight_when_shares_unknown(monkeypatch, tmp_path):
+    """주식수를 안 들고 있는 포지션(시뮬레이션 경로)에서는 비중 가중으로 물러선다.
+
+    정확하진 않지만 수량 자체가 없어 달리 방법이 없다. 수량이 있으면 아래
+    test_adds_to_existing_position_averages_by_shares 쪽 경로를 타야 한다.
+    """
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(200.0))
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 200.0)
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
@@ -251,10 +256,49 @@ def test_adds_to_existing_position_with_weighted_average_entry_price(monkeypatch
     assert len(result.positions) == 1
     pos = result.positions[0]
     assert pos.weight == pytest.approx(0.16)
-    # 가중평균: (100*0.08 + 200*0.08) / 0.16 = 150
+    # 기존 포지션에 수량이 없었으므로(existing.quantity is None) 비중 폴백을 탄다.
+    # 비중 가중: (100*0.08 + 200*0.08) / 0.16 = 150
     assert pos.entry_price == pytest.approx(150.0)
     assert pos.peak_price == 200.0  # 새 체결가가 기존 고점보다 높음
     assert pos.entry_day == date(2026, 1, 5)  # 추가매수해도 최초 진입일 유지
+
+
+def test_adds_to_existing_position_averages_by_shares(monkeypatch, tmp_path):
+    """평균 원가는 주식수 가중이다 — 비중 가중은 단가를 제곱으로 넣는 셈이라 틀린다.
+
+    `weight`는 매수 시점 원가 기준 비중이라 `weight ∝ 수량 x 단가`다. 그걸로 단가를
+    가중하면 비싼 쪽 매수로 평균이 끌려간다: 100주 @1,000원 + 50주 @2,000원이
+    정답 1,333.33원 대신 1,500원(+12.5%)이 됐다(2026-08-28 발견).
+
+    진입가가 부풀면 손절은 일찍, 익절은 늦게 발동한다 — 2026-08-15 192820 오익절과
+    같은 부류다. `position_limit`(0.15)이 온전한 0.08 포지션의 추가매수는 막지만
+    **부분 익절로 비중이 준 종목은 뚫리므로** 죽은 경로가 아니다.
+    """
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(2000.0))
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 2000.0)
+    monkeypatch.setattr(kis, "fetch_account_balance", lambda: 1_250_000.0)
+    monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: "ODNO789")
+    monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, order_date: 2000.0)
+
+    # 트림돼서 비중이 낮아진 포지션 — 실제로 게이트를 통과할 수 있는 모양이다.
+    existing = Position(
+        ticker=TICKER, sector="반도체", weight=0.02, entry_day=date(2026, 1, 5),
+        entry_price=1000.0, peak_price=1200.0, quantity=100,
+    )
+    portfolio = PortfolioState(positions=[existing], cash_weight=0.9)
+
+    result = asyncio.run(
+        pipeline.execute_buy_order(
+            _decision(), GateResult(approved=True, rejected_by=None), portfolio,
+            "반도체", 0.08, log_path=tmp_path / "trade_journal.jsonl",
+        )
+    )
+
+    pos = result.positions[0]
+    assert pos.quantity == 150  # 1,250,000 * 0.08 // 2,000 = 50주 추가
+    # 주식수 가중: (100*1000 + 50*2000) / 150 = 1333.33  (비중 가중이면 1,600원)
+    assert pos.entry_price == pytest.approx(1000 * 100 / 150 + 2000 * 50 / 150)
+    assert pos.entry_price == pytest.approx(1333.333333, rel=1e-6)
 
 
 # --- ExitPlan이 진입 시점에 포지션에 박히는가 (사용자 확정 2026-08-15) ---

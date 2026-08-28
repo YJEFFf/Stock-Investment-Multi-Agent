@@ -146,6 +146,32 @@ def format_sell_decision_alert(day: str, names: list[str]) -> str:
     )
 
 
+def format_reconcile_drift_alert(day: str, drifts: list) -> str:
+    """장 마감 후 브로커 대조에서 어긋난 곳이 나왔을 때. **어긋남이 있을 때만 보낸다.**
+
+    매수·매도 판단 알림(format_*_decision_alert)과 달리 "이상 없음"은 안 보낸다 —
+    저쪽은 크론이 돌았는지 자체가 궁금해서 0건도 보내지만, 이 대조는 이상 없는 날이
+    정상이자 대다수라 매일 보내면 알림이 배경 소음이 되고 진짜 드리프트가 묻힌다.
+    크론이 살아있는지는 08:30·15:35 알림이 이미 답한다.
+
+    교정은 하지 않는다(드라이런). 진입가는 손절·익절 판정의 유일한 기준점이라
+    상태 파일을 코드가 조용히 고치면 그 판정이 어느 값 기준이었는지 되짚기 어렵다 —
+    사람이 보고 `--apply`를 결정한다.
+    """
+    lines = [f"🟠 [SIMA] 브로커 대조 — 어긋난 곳 {len(drifts)}건 ({day})"]
+    for d in drifts:
+        if d.field == "missing_at_broker":
+            lines.append(f"⚠️ {d.ticker}: 상태 파일엔 있는데 브로커 잔고엔 없음")
+        elif d.field == "missing_locally":
+            lines.append(f"⚠️ {d.ticker}: 브로커는 {d.broker:.0f}주 보유 중인데 상태 파일엔 없음")
+        else:
+            diff = d.relative_diff
+            diff_str = f" ({diff:+.2%})" if diff is not None else ""
+            lines.append(f"• {d.ticker} {d.field}: {d.local} → {d.broker}{diff_str}")
+    lines.append("교정 안 함(드라이런). 필요하면 scripts/reconcile_portfolio.py --apply — 장중 금지.")
+    return "\n".join(lines)
+
+
 def send_telegram_alert(message: str) -> bool:
     """성공하면 True, 토큰/chat_id 미설정이거나 전송 실패면 False (예외를 던지지 않는다)."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
