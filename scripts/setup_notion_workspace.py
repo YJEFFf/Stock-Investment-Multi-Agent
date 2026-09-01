@@ -43,7 +43,12 @@ def main() -> None:
         print("랜딩/소개/매매일지는 이미 설정됨 — 건너뜀.")
         # DB 생성은 건너뛰지만 나중에 추가된 속성은 채워 넣어야 한다 — 없는 속성에
         # 값을 쓰면 노션이 400을 내서 매도 동기화가 통째로 실패한다.
-        print("매매일지 속성 최신화 중 (매도금액/줄인비중/잔여비중)...")
+        # 목록을 여기 적지 않는다 — 속성이 늘 때마다 이 문구가 낡는다.
+        # 실제 목록은 notion_sync._TRADE_JOURNAL_ADDED_PROPERTIES 하나뿐이다.
+        print(
+            "매매일지 속성 최신화 중: "
+            + ", ".join(notion_sync._TRADE_JOURNAL_ADDED_PROPERTIES)
+        )
         if notion_sync.ensure_trade_journal_properties(existing_journal_db_id):
             print("완료.")
         else:
