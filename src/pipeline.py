@@ -151,17 +151,28 @@ def check_gate(
     decision: Decision,
     portfolio: PortfolioState,
     config: RiskGateConfig,
-    sector: str,
     trade_weight: float,
 ) -> GateResult:
     """룰을 순서대로 확정 판정. 첫 위반에서 즉시 거부.
 
-    일일 손실 한도(`daily_loss_limit`) 룰은 2026-08-20에 폐기했다(사용자 확정).
-    두 가지가 겹쳤다: `daily_pnl_pct`를 production 경로에서 아무도 계산하지 않아
-    항상 0.0이었고, 애초에 이 게이트가 도는 시점이 08:30(개장 전)이라 "오늘 손익"은
-    정의상 0이다 — 하루 한 번 개장 직후에만 매수하는 지금 구조에서는 장중
-    서킷브레이커라는 개념이 성립하지 않는다. 계산만 채워 넣으면 살아나는 룰이
-    아니라 구조가 안 맞는 룰이라, 살아있는 척하게 두는 대신 걷어냈다.
+    폐기한 룰 두 개는 필드째로 지웠다 — 값만 남겨두면 게이트가 실제보다 촘촘한
+    것처럼 보이고, 그 착시가 정확히 위험한 방향이다(RiskGateConfig docstring).
+
+    **일일 손실 한도(`daily_loss_limit`)** — 2026-08-20 폐기(사용자 확정). 두 가지가
+    겹쳤다: `daily_pnl_pct`를 production 경로에서 아무도 계산하지 않아 항상 0.0이었고,
+    애초에 이 게이트가 도는 시점이 08:30(개장 전)이라 "오늘 손익"은 정의상 0이다 —
+    하루 한 번 개장 직후에만 매수하는 지금 구조에서는 장중 서킷브레이커라는 개념이
+    성립하지 않는다. 계산만 채워 넣으면 살아나는 룰이 아니라 구조가 안 맞는 룰이었다.
+
+    **섹터 집중도(`sector_concentration`, 40%)** — 2026-09-01 폐기(사용자 확정).
+    "한동안 특정 섹터가 계속 오르는 국면에서 수익을 극대화할 수 없다"는 판단이다.
+    이건 버그 수정이 아니라 **정책 변경**이라, 룰이 틀렸다는 뜻이 아니라 이 시스템이
+    받아들일 위험의 모양을 바꾼 것이다. 되돌리려면 이 함수와 RiskGateConfig 두 곳만
+    보면 된다.
+
+    남은 것은 종목당 비중(`position_limit`)과 총 노출(`total_exposure`) 둘뿐이다.
+    `sector`를 인자에서 뺀 것도 같은 이유다 — 안 쓰는 인자를 남겨두면 이 함수가
+    아직 섹터를 본다고 읽힌다. 업종 정보 자체는 계속 쓰인다(뉴스 분석가, Position.sector).
     """
     if decision.action != "BUY":
         return GateResult(approved=False, rejected_by=None)
@@ -170,10 +181,6 @@ def check_gate(
     existing_weight = existing.weight if existing else 0.0
     if existing_weight + trade_weight > config.position_limit:
         return GateResult(approved=False, rejected_by="position_limit")
-
-    sector_weight = sum(p.weight for p in portfolio.positions if p.sector == sector)
-    if sector_weight + trade_weight > config.sector_concentration_limit:
-        return GateResult(approved=False, rejected_by="sector_concentration")
 
     invested_weight = 1.0 - portfolio.cash_weight
     if invested_weight + trade_weight > config.total_exposure_limit:
@@ -415,6 +422,11 @@ async def execute_buy_order(
             # 실제 원가와 어긋날 여지가 크므로 반드시 구분해서 남긴다
             # (2026-08-15 192820 오익절 건, 2026-08-28 300720 부분 체결 건).
             "entry_price_source": entry_price_source,
+            # 이 주문에 붙은 위탁수수료(브로커 추정제비용을 주문 전후 차로 잰 조회값).
+            # 매도 쪽 순손익은 진입 시 수수료를 요율로 근사하는데(_trade_costs), 그건
+            # 이 값을 포지션에 안 들고 있어서다 — 여기 남겨두면 나중에 일지끼리
+            # 맞춰 실제 값으로 되짚을 수 있다. None이면 조회를 못 한 것이지 0원이 아니다.
+            "fee_amount": fill.fee if fill is not None else None,
             "order_no": order_no,
             "gap_pct": round(gap_pct, 4),
             # 이 포지션에 박힌 출구 규칙. None이면 고정 기본값(degraded 판단이거나
@@ -723,7 +735,7 @@ async def run_day(
             continue  # 의견이 없음 — 관망. score=0 등으로 대체하지 않는다.
 
         if decision.action == "BUY":
-            gate_result = check_gate(decision, portfolio, config, sector, TRADE_WEIGHT)
+            gate_result = check_gate(decision, portfolio, config, TRADE_WEIGHT)
         else:
             gate_result = GateResult(approved=False, rejected_by=None)
 
@@ -1004,6 +1016,68 @@ def _sell_amount(fill: FillRecord | None, shares_sold: int | None, current_price
     return None
 
 
+def _trade_costs(
+    fill: FillRecord | None,
+    shares_sold: int | None,
+    sell_amount: float | None,
+    entry_price: float | None,
+) -> dict:
+    """이 매도 한 건에 실제로 붙은 비용과, 그걸 뺀 순손익.
+
+    왜 필요한가 (2026-09-01): 매매일지의 `realized_pnl_pct`는 체결 단가만으로 낸
+    **가격 수익률**이라 계좌 증감과 다르다. 배포 이후 전 거래를 계좌와 맞춰보니
+    57,797원이 설명되지 않았고, 그게 정확히 위탁수수료 13,300원 + 매도 거래세
+    44,501원이었다. 실현손익을 계좌 증감으로 읽으면 안 되는 상태였다.
+
+    **어디까지가 조회고 어디부터가 계산인지 반드시 갈라 적는다** — 이 파일의 기존
+    관례다(`entry_price_source`, `sell_amount_source`). 세 조각의 성격이 다르다:
+
+    - 매도 수수료: 브로커의 추정제비용을 주문 전후 차로 잰 **조회값**이 1순위.
+      부분 체결이면 관측분만큼만 잡히므로 실제 매도 수량 비율로 되세운다.
+    - 매도 거래세: 브로커가 안 준다. `kis.SELL_TAX_RATE`로 낸 **계산값**이다.
+    - 매수 수수료: 진입 시점에 낸 비용 중 이번에 파는 몫. 그때 값을 포지션에
+      들고 있지 않으므로 `kis.BROKERAGE_FEE_RATE`로 낸 **계산값**이다.
+      (2026-09-01부터 매수 행에는 조회값이 남는다 — 그 뒤에 연 포지션은 나중에
+      일지끼리 맞춰보면 실제 값을 되짚을 수 있다.)
+
+    비용을 못 세우면 순손익 자체를 None으로 남긴다. 0원으로 채우면 "비용이 없었다"가
+    되어 순손익이 조용히 총손익과 같아진다 — 그게 지금 고치려는 바로 그 상태다.
+    """
+    empty = {
+        "fee_amount": None,
+        "fee_source": None,
+        "tax_amount": None,
+        "entry_fee_amount": None,
+        "net_pnl_amount": None,
+        "net_pnl_pct": None,
+    }
+    if not shares_sold or sell_amount is None or not entry_price:
+        return empty
+
+    if fill is not None and fill.fee is not None and fill.quantity:
+        if fill.complete:
+            fee, fee_source = fill.fee, "fill"
+        else:
+            # 관측된 수량 몫의 수수료만 잡혔다 — 실제 매도 수량으로 비례 확대한다.
+            # sell_amount를 되세우는 방식(_sell_amount)과 같은 논리다.
+            fee, fee_source = fill.fee * shares_sold / fill.quantity, "estimated"
+    else:
+        fee, fee_source = sell_amount * kis.BROKERAGE_FEE_RATE, "computed"
+
+    tax = sell_amount * kis.SELL_TAX_RATE
+    entry_fee = entry_price * shares_sold * kis.BROKERAGE_FEE_RATE
+    cost_basis = entry_price * shares_sold
+    net = (sell_amount - cost_basis) - fee - tax - entry_fee
+    return {
+        "fee_amount": round(fee, 2),
+        "fee_source": fee_source,
+        "tax_amount": round(tax, 2),
+        "entry_fee_amount": round(entry_fee, 2),
+        "net_pnl_amount": round(net, 2),
+        "net_pnl_pct": net / cost_basis,
+    }
+
+
 async def finalize_sell(
     portfolio: PortfolioState,
     action: SellAction,
@@ -1087,6 +1161,8 @@ async def finalize_sell(
         (exit_price - position.entry_price) / position.entry_price if position.entry_price else None
     )
     holding_days = (day.date() - position.entry_day).days if position.entry_day else None
+    sell_amount = _sell_amount(fill, shares_sold, current_price)
+    costs = _trade_costs(fill, shares_sold, sell_amount, position.entry_price)
     _append_log(
         trade_journal_log_path,
         {
@@ -1124,10 +1200,15 @@ async def finalize_sell(
             # 부분 체결이 여러 단가로 나뉘었을 때 어긋난다. 단, 조회가 주문 수량을
             # 다 못 따라잡았으면 그 총액은 실제보다 작으므로 쓰지 않고, 관측된
             # 평균 단가에 실제 매도 수량을 곱해 되세운다.
-            "sell_amount": _sell_amount(fill, shares_sold, current_price),
+            "sell_amount": sell_amount,
             "sell_amount_source": (
                 "fill" if fill_covers_order else ("estimated" if fill is not None else "quote_fallback")
             ),
+            # 위 realized_pnl_pct는 체결 단가만 쓴 **가격 수익률**이다. 아래는 실제로
+            # 계좌에서 빠져나간 비용까지 뺀 값 — 둘 다 남긴다(_trade_costs docstring).
+            # fee_source가 "fill"일 때만 수수료가 브로커 조회값이고, 세금과 매수
+            # 수수료는 언제나 계산값이다.
+            **costs,
             # 이 포지션에 실제로 적용된 출구 규칙 — LLM이 정한 값인지 고정 기본값인지
             # 나중에 성과를 갈라볼 때 필요하다.
             "exit_plan": position.exit_plan.model_dump(mode="json") if position.exit_plan else None,

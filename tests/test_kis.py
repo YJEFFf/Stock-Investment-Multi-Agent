@@ -274,15 +274,45 @@ def test_fetch_current_price_returns_none_when_request_fails(monkeypatch):
     assert kis.fetch_current_price("005930") is None
 
 
-# --- fetch_account_balance ---
+# --- fetch_account_snapshot / fetch_account_balance ---
+
+# 2026-09-01 실계좌 응답에서 옮긴 값이다.
+_BALANCE_ROW = {
+    "tot_evlu_amt": "100624343",
+    "dnca_tot_amt": "50308183",
+    "scts_evlu_amt": "50316160",
+}
+
+
+def test_fetch_account_snapshot_reads_all_three_amounts_from_broker(monkeypatch):
+    """예수금·유가증권 평가금액을 비중으로 역산하지 않고 응답에서 그대로 읽는다."""
+    monkeypatch.setattr(
+        kis, "_kis_get", lambda path, tr_id, params, policy=None: {"output2": [_BALANCE_ROW]}
+    )
+
+    snapshot = kis.fetch_account_snapshot()
+
+    assert snapshot.total == 100624343.0
+    assert snapshot.cash == 50308183.0
+    assert snapshot.securities == 50316160.0
+    # 총평가금액은 예수금 + 유가증권이다 — 셋이 서로 맞는지도 같이 확인한다.
+    assert snapshot.cash + snapshot.securities == snapshot.total
+
+
+def test_fetch_account_snapshot_returns_none_when_a_field_is_missing(monkeypatch):
+    """일부만 돌려주면 호출부가 나머지를 빼기로 만들어내게 된다 — 그게 걷어낸 계산이다."""
+    row = {k: v for k, v in _BALANCE_ROW.items() if k != "dnca_tot_amt"}
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: {"output2": [row]})
+
+    assert kis.fetch_account_snapshot() is None
 
 
 def test_fetch_account_balance_success(monkeypatch):
     monkeypatch.setattr(
-        kis, "_kis_get", lambda path, tr_id, params, policy=None: {"output2": [{"tot_evlu_amt": "100000000"}]}
+        kis, "_kis_get", lambda path, tr_id, params, policy=None: {"output2": [_BALANCE_ROW]}
     )
 
-    assert kis.fetch_account_balance() == 100000000.0
+    assert kis.fetch_account_balance() == 100624343.0
 
 
 def test_fetch_account_balance_returns_none_when_output_empty(monkeypatch):

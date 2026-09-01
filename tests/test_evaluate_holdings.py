@@ -857,3 +857,133 @@ def test_the_days_high_raises_the_peak(monkeypatch, tmp_path):
     )
 
     assert result.positions[0].peak_price == 297000.0
+
+
+# --- 비용과 순손익 (2026-09-01) ---
+#
+# 매매일지의 realized_pnl_pct는 체결 단가만 쓴 가격 수익률이라 계좌 증감과 다르다.
+# 배포 이후 전 거래를 계좌와 맞춰보니 57,797원이 설명되지 않았고, 그게 위탁수수료
+# 13,300원 + 매도 거래세 44,501원이었다(CHANGELOG 2026-09-01 발견 5).
+
+
+def _wire_sell_with_fill(monkeypatch, price, *, fee_before=0.0, fee_after=None, observed_qty=None):
+    """매도 체결 조회를 건다. 주문 전후 누적 집계를 흉내내 수수료 차까지 나오게 한다."""
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: price)
+    monkeypatch.setattr(kis, "fetch_quote", lambda ticker, policy=None: kis.Quote(price=price))
+    monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
+
+    calls = {"n": 0}
+
+    def totals(ticker, day, side):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return (0, 0.0, fee_before)
+        qty = observed_qty if observed_qty is not None else 10
+        return (qty, qty * price, fee_before if fee_after is None else fee_after)
+
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", totals)
+
+
+def test_journal_records_broker_fee_tax_and_net_pnl_on_sell(monkeypatch, tmp_path):
+    """수수료는 브로커 조회값, 거래세와 매수 수수료는 계산값 — 갈라서 남긴다."""
+    # 30주 보유, +20%로 1차 익절 -> 10주 매도. 체결가 120원, 매도금액 1,200원.
+    _wire_sell_with_fill(monkeypatch, 120.0, fee_before=5.0, fee_after=22.0, observed_qty=10)
+
+    position = _position(
+        entry_price=100.0, peak_price=100.0, weight=0.12, entry_day=DAY.date(), quantity=30
+    )
+    trade_journal_log_path = tmp_path / "trade_journal.jsonl"
+
+    asyncio.run(
+        pipeline.evaluate_holdings(
+            PortfolioState(positions=[position], cash_weight=0.88),
+            DAY,
+            sell.execute_sell_order,
+            log_path=tmp_path / "sell.jsonl",
+            trade_journal_log_path=trade_journal_log_path,
+        )
+    )
+
+    entry = json.loads(trade_journal_log_path.read_text().strip())
+    assert entry["shares_sold"] == 10
+    assert entry["sell_amount"] == pytest.approx(1200.0)
+
+    # 수수료는 주문 전후 누적 추정제비용의 차(22 - 5)이지 요율 계산이 아니다.
+    assert entry["fee_amount"] == pytest.approx(17.0)
+    assert entry["fee_source"] == "fill"
+    # 거래세는 브로커가 안 주므로 매도금액 x SELL_TAX_RATE.
+    assert entry["tax_amount"] == pytest.approx(1200.0 * kis.SELL_TAX_RATE, abs=0.01)
+    # 진입 시 낸 수수료 중 이번에 파는 몫(요율 근사).
+    # 금액은 전(0.01원) 단위로 반올림해 남긴다 — 픽스처가 원 단위라 오차 허용치를 준다.
+    assert entry["entry_fee_amount"] == pytest.approx(100.0 * 10 * kis.BROKERAGE_FEE_RATE, abs=0.01)
+
+    gross = 1200.0 - 100.0 * 10
+    expected_net = gross - entry["fee_amount"] - entry["tax_amount"] - entry["entry_fee_amount"]
+    assert entry["net_pnl_amount"] == pytest.approx(expected_net, abs=0.01)
+    assert entry["net_pnl_pct"] == pytest.approx(expected_net / 1000.0, abs=1e-5)
+    # 총손익(가격 수익률)은 그대로 남고, 순손익이 그보다 작다.
+    assert entry["realized_pnl_pct"] == pytest.approx(0.20)
+    assert entry["net_pnl_pct"] < entry["realized_pnl_pct"]
+
+
+def test_journal_scales_fee_up_when_fill_observation_is_partial(monkeypatch, tmp_path):
+    """부분 체결이면 관측된 수수료도 그만큼만 잡힌다 — 실제 매도 수량으로 되세운다."""
+    # 10주를 팔았는데 조회는 4주분(수수료 8원)까지만 따라잡았다.
+    _wire_sell_with_fill(monkeypatch, 120.0, fee_before=0.0, fee_after=8.0, observed_qty=4)
+    monkeypatch.setattr(kis, "FILL_POLL_TIMEOUT_S", 0.0)
+
+    position = _position(
+        entry_price=100.0, peak_price=100.0, weight=0.12, entry_day=DAY.date(), quantity=30
+    )
+    trade_journal_log_path = tmp_path / "trade_journal.jsonl"
+
+    asyncio.run(
+        pipeline.evaluate_holdings(
+            PortfolioState(positions=[position], cash_weight=0.88),
+            DAY,
+            sell.execute_sell_order,
+            log_path=tmp_path / "sell.jsonl",
+            trade_journal_log_path=trade_journal_log_path,
+        )
+    )
+
+    entry = json.loads(trade_journal_log_path.read_text().strip())
+    assert entry["shares_sold"] == 10
+    assert entry["fee_source"] == "estimated"
+    assert entry["fee_amount"] == pytest.approx(8.0 * 10 / 4)  # 4주분 8원 -> 10주분 20원
+
+
+def test_journal_falls_back_to_fee_rate_when_broker_fee_unavailable(monkeypatch, tmp_path):
+    """체결 조회 자체가 실패하면 수수료도 요율 계산으로 물러서되, 출처를 남긴다."""
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 120.0)
+    monkeypatch.setattr(kis, "fetch_quote", lambda ticker, policy=None: kis.Quote(price=120.0))
+    monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: None)
+
+    position = _position(
+        entry_price=100.0, peak_price=100.0, weight=0.12, entry_day=DAY.date(), quantity=30
+    )
+    trade_journal_log_path = tmp_path / "trade_journal.jsonl"
+
+    asyncio.run(
+        pipeline.evaluate_holdings(
+            PortfolioState(positions=[position], cash_weight=0.88),
+            DAY,
+            sell.execute_sell_order,
+            log_path=tmp_path / "sell.jsonl",
+            trade_journal_log_path=trade_journal_log_path,
+        )
+    )
+
+    entry = json.loads(trade_journal_log_path.read_text().strip())
+    assert entry["fee_source"] == "computed"
+    assert entry["fee_amount"] == pytest.approx(entry["sell_amount"] * kis.BROKERAGE_FEE_RATE, abs=0.01)
+    assert entry["net_pnl_amount"] is not None
+
+
+def test_net_pnl_is_none_when_entry_price_unknown(monkeypatch, tmp_path):
+    """비용을 못 세우면 순손익을 0으로 채우지 않고 없는 채로 둔다 — 0원으로 채우면
+    '비용이 없었다'가 되어 순손익이 조용히 총손익과 같아진다."""
+    costs = pipeline._trade_costs(None, shares_sold=10, sell_amount=1200.0, entry_price=None)
+    assert costs["net_pnl_amount"] is None
+    assert costs["fee_amount"] is None

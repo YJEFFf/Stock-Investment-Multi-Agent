@@ -1,9 +1,12 @@
 """장중(09:00-15:30 KST) 매분 도는 결정론적 손절/익절 체크 — LLM 없음, 코드만.
 
 pipeline.evaluate_holdings에 analyst_fn/judge_sell_fn을 안 넣으면 결정론적
-안전장치(src/sell.py의 손절 -10%/트레일링 익절 +20%)만 도는 모드가 이미
-구현되어 있다(src/pipeline.py:622-639) — 이 스크립트는 그 모드를 1분 간격으로
-부르기만 한다. 추가 LLM 비용 없음(사용자 확인) — KIS 시세 조회만 나간다.
+안전장치(src/sell.py)만 도는 모드가 이미 구현되어 있다 — 이 스크립트는 그 모드를
+1분 간격으로 부르기만 한다. 추가 LLM 비용 없음(사용자 확인) — KIS 시세 조회만 나간다.
+
+문턱 수치는 여기 없다. 진입 시점에 매니저가 종목별로 정해 포지션에 얼려둔 값
+(schemas.ExitPlan)을 쓰고, 그게 없는 포지션만 고정 기본값(-10%/+20%/1-3/-7%,
+sell.DEFAULT_EXIT_PLAN)으로 떨어진다.
 
 이전 프로젝트는 이 체크를 1분 간격으로 돌렸다: 하루 한 번만 체크하면 그 사이
 (최대 24시간) 손실이 -10% 문턱을 훨씬 넘어갈 수 있어 안전장치 취지가 무너진다.
@@ -16,7 +19,7 @@ pipeline.evaluate_holdings에 analyst_fn/judge_sell_fn을 안 넣으면 결정�
 import asyncio
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -42,7 +45,11 @@ async def main() -> None:
     if not is_krx_trading_day(today_kst):
         return  # 주말/공휴일 — 로그도 안 남긴다(매분 도는 잡이라 휴장일에 조용한 게 정상)
 
-    day = datetime.now(timezone.utc)
+    # KST다(UTC 아님). 이 값의 .date()가 매매일지의 `day`와 보유기간 계산으로
+    # 그대로 들어가므로, 하루의 경계는 장이 도는 시간대여야 한다 — pipeline._kst_today
+    # docstring의 832fb8b와 같은 버그다. 09:01 KST는 00:01 UTC라 지금까지는 우연히
+    # 같은 날짜였지만, 크론이 09:00보다 조금이라도 앞당겨지는 순간 하루가 밀린다.
+    day = datetime.now(KST)
 
     # 앞 회차가 아직 돌고 있으면 이번 분은 건너뛴다 — 기다리면 KIS 장애 때
     # 매분 새 프로세스가 쌓인다(portfolio_lock docstring). 앞 회차가 같은 평가를

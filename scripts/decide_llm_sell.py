@@ -23,7 +23,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -53,19 +53,22 @@ async def _sync_daily_report(today_kst, portfolio) -> None:
     decide_llm_sell 자체가 실패하면 안 된다.
 
     "총정리"(투자한 금액/남은 현금/총 금액)에 쓸 절대 원화 금액은
-    PortfolioState(비중만 있음)로는 못 만든다 — kis.fetch_account_balance()로
-    브로커의 실제 총평가금액을 조회해서 넘긴다. 조회 실패해도(None) 리포트
-    자체는 만든다 — 그 절만 생략된다(notion_sync.sync_daily_report 참고)."""
+    PortfolioState(비중만 있음)로는 못 만든다 — kis.fetch_account_snapshot()으로
+    브로커의 예수금·유가증권 평가금액·총평가금액을 그대로 조회해서 넘긴다.
+    비중으로 역산하면 안 되는 이유는 kis.AccountSnapshot docstring에 있다.
+    조회 실패해도(None) 리포트 자체는 만든다 — 그 절만 생략된다."""
     daily_report_db_id = os.environ.get("NOTION_DAILY_REPORT_DB_ID")
     if not daily_report_db_id:
         logger.info("notion_daily_report_sync_skipped reason=not_configured")
         return
 
-    total_value = kis.fetch_account_balance()
+    account = kis.fetch_account_snapshot()
+    if account is None:
+        logger.warning("notion_daily_report_account_unavailable — 금액 총정리 절만 생략된다")
 
     try:
         created = await notion_sync.sync_daily_report(
-            today_kst.isoformat(), portfolio, daily_report_db_id, total_value=total_value
+            today_kst.isoformat(), portfolio, daily_report_db_id, account=account
         )
         logger.info("notion_daily_report_synced=%s", created)
     except Exception as exc:
@@ -95,7 +98,11 @@ async def main() -> None:
         logger.info("not_a_trading_day day=%s — skip", today_kst.isoformat())
         return
 
-    day = datetime.now(timezone.utc)
+    # KST다(UTC 아님). 이 값의 .date()가 매매일지의 `day`와 보유기간 계산으로
+    # 그대로 들어가므로, 하루의 경계는 장이 도는 시간대여야 한다 — pipeline._kst_today
+    # docstring의 832fb8b와 같은 버그다. 09:01 KST는 00:01 UTC라 지금까지는 우연히
+    # 같은 날짜였지만, 크론이 09:00보다 조금이라도 앞당겨지는 순간 하루가 밀린다.
+    day = datetime.now(KST)
     portfolio = load_portfolio()
 
     _report_unresolved_blackout()

@@ -135,12 +135,16 @@ def test_sync_daily_report_called_when_configured(monkeypatch):
 
     from datetime import date
 
-    monkeypatch.setattr(dls.kis, "fetch_account_balance", lambda: 100_000_000.0)
+    monkeypatch.setattr(
+        dls.kis,
+        "fetch_account_snapshot",
+        lambda: dls.kis.AccountSnapshot(total=100_000_000.0, cash=30_000_000.0, securities=70_000_000.0),
+    )
 
     captured = {}
 
-    async def fake_sync(day, portfolio, db_id, total_value=None):
-        captured["args"] = (day, db_id, total_value)
+    async def fake_sync(day, portfolio, db_id, account=None):
+        captured["args"] = (day, db_id, account)
         return True
 
     monkeypatch.setattr(dls.notion_sync, "sync_daily_report", fake_sync)
@@ -148,20 +152,22 @@ def test_sync_daily_report_called_when_configured(monkeypatch):
     portfolio = PortfolioState(cash_weight=1.0)
     asyncio.run(dls._sync_daily_report(date(2026, 8, 12), portfolio))
 
-    assert captured["args"] == ("2026-08-12", "db-report", 100_000_000.0)
+    day, db_id, account = captured["args"]
+    assert (day, db_id) == ("2026-08-12", "db-report")
+    assert (account.total, account.cash, account.securities) == (100_000_000.0, 30_000_000.0, 70_000_000.0)
 
 
-def test_sync_daily_report_passes_none_total_value_when_balance_unavailable(monkeypatch):
+def test_sync_daily_report_passes_none_account_when_balance_unavailable(monkeypatch):
     monkeypatch.setenv("NOTION_DAILY_REPORT_DB_ID", "db-report")
 
     from datetime import date
 
-    monkeypatch.setattr(dls.kis, "fetch_account_balance", lambda: None)
+    monkeypatch.setattr(dls.kis, "fetch_account_snapshot", lambda: None)
 
     captured = {}
 
-    async def fake_sync(day, portfolio, db_id, total_value=None):
-        captured["args"] = (day, db_id, total_value)
+    async def fake_sync(day, portfolio, db_id, account=None):
+        captured["args"] = (day, db_id, account)
         return True
 
     monkeypatch.setattr(dls.notion_sync, "sync_daily_report", fake_sync)
@@ -177,9 +183,13 @@ def test_sync_daily_report_sends_error_alert_on_failure(monkeypatch):
 
     from datetime import date
 
-    monkeypatch.setattr(dls.kis, "fetch_account_balance", lambda: 100_000_000.0)
+    monkeypatch.setattr(
+        dls.kis,
+        "fetch_account_snapshot",
+        lambda: dls.kis.AccountSnapshot(total=100_000_000.0, cash=30_000_000.0, securities=70_000_000.0),
+    )
 
-    async def fail(day, portfolio, db_id, total_value=None):
+    async def fail(day, portfolio, db_id, account=None):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(dls.notion_sync, "sync_daily_report", fail)

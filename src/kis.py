@@ -441,12 +441,29 @@ def fetch_current_price(ticker: str, *, policy: RetryPolicy = DEFAULT_POLICY) ->
     return float(price_str)
 
 
-def fetch_account_balance() -> float | None:
-    """계좌 총평가금액(tot_evlu_amt). 비중(weight) 기반 주문 수량을 절대
-    원화·주수로 환산하려면 이 값이 필요하다 — PortfolioState는 비중만 들고
-    있고 절대 금액은 추적하지 않으므로, 매번 브로커(KIS)를 실제 잔고의
-    출처로 삼는다(자체 상태와 동기화 문제를 피하기 위해)."""
-    params = {
+@dataclass(frozen=True)
+class AccountSnapshot:
+    """계좌를 금액으로 본 한 장면. 전부 브로커가 준 값이다 — 계산이 없다.
+
+    왜 필요한가 (2026-09-01): 노션 일일 리포트의 "총정리"가 현금을
+    `총평가금액 x PortfolioState.cash_weight`로 만들고 있었다. `cash_weight`는
+    **매수 시점 원가 기준 장부 비중**이고 총평가금액은 **실시간 시장가치**라,
+    둘을 곱하면 현금도 투자금도 아닌 값이 나온다. 9/1 실측으로 현금이 823,891원
+    (+1.64%) 부풀어 있었고, 평가이익이 쌓일수록 더 벌어지는 한쪽 방향 오차였다
+    (cash_weight는 고정인데 총평가금액만 오르므로).
+
+    세 값 다 원래부터 같은 응답에 들어 있었다 — `tot_evlu_amt` 하나만 꺼내고
+    나머지를 버리고 있었다. 2026-08-27에 `stck_hgpr`/`stck_lwpr`을 매분 받아놓고
+    버리던 것과 같은 모양이라, 추가 호출이 전혀 없다.
+    """
+
+    total: float  # tot_evlu_amt — 총평가금액(예수금 + 유가증권 평가)
+    cash: float  # dnca_tot_amt — 예수금 총금액
+    securities: float  # scts_evlu_amt — 유가증권 평가금액
+
+
+def _balance_params() -> dict:
+    return {
         "CANO": os.getenv("KIS_ACCOUNT_NO", ""),
         "ACNT_PRDT_CD": ACCOUNT_PRODUCT_CODE,
         "AFHR_FLPR_YN": "N",
@@ -459,17 +476,43 @@ def fetch_account_balance() -> float | None:
         "CTX_AREA_FK100": "",
         "CTX_AREA_NK100": "",
     }
-    data = _kis_get(BALANCE_PATH, BALANCE_TR_ID, params)
+
+
+def fetch_account_snapshot() -> AccountSnapshot | None:
+    """계좌 총평가금액·예수금·유가증권 평가금액을 한 번에 (AccountSnapshot).
+
+    셋 중 하나라도 못 읽으면 통째로 None이다 — 일부만 돌려주면 호출부가 나머지를
+    빼기로 만들어내게 되고, 그게 지금 걷어내는 그 계산이다.
+    """
+    data = _kis_get(BALANCE_PATH, BALANCE_TR_ID, _balance_params())
     if data is None:
         return None
 
     rows = data.get("output2") or []
     if not rows:
         return None
-    amount_str = rows[0].get("tot_evlu_amt")
-    if not amount_str:
+    row = rows[0]
+    try:
+        return AccountSnapshot(
+            total=float(row["tot_evlu_amt"]),
+            cash=float(row["dnca_tot_amt"]),
+            securities=float(row["scts_evlu_amt"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        logger.warning("kis_account_snapshot_unparseable row_keys=%s", sorted(row))
         return None
-    return float(amount_str)
+
+
+def fetch_account_balance() -> float | None:
+    """계좌 총평가금액(tot_evlu_amt). 비중(weight) 기반 주문 수량을 절대
+    원화·주수로 환산하려면 이 값이 필요하다 — PortfolioState는 비중만 들고
+    있고 절대 금액은 추적하지 않으므로, 매번 브로커(KIS)를 실제 잔고의
+    출처로 삼는다(자체 상태와 동기화 문제를 피하기 위해).
+
+    주문 수량 계산에는 총평가금액만 있으면 되므로 이 얇은 창구를 남겨둔다 —
+    금액 세 개가 다 필요한 쪽(노션 일일 리포트)은 fetch_account_snapshot을 쓴다."""
+    snapshot = fetch_account_snapshot()
+    return snapshot.total if snapshot is not None else None
 
 
 def place_market_buy_order(ticker: str, quantity: int) -> str | None:
@@ -527,9 +570,27 @@ def place_market_sell_order(ticker: str, quantity: int) -> str | None:
 
 SIDE_CODES = {"buy": "02", "sell": "01"}
 
+# 매도 시 붙는 세금(증권거래세+농특세) 요율. **브로커가 안 주는 유일한 비용이라
+# 여기서만 계산값이다.**
+#
+# 2026-09-01 실측으로 뽑았다: 배포 이후 전 거래의 매도 체결액 22,250,550원과
+# 브로커가 준 추정제비용 13,300원을 계좌 실제 증감과 맞춰보니 44,501원이 남았고,
+# 그건 매도 체결액의 정확히 0.2000%였다. (1억 시작 - 실현손익 1,109,100 + 평가손익
+# 1,791,240 = 100,682,140 예상, 실제 100,624,343, 차이 57,797 ≈ 13,300 + 44,501.)
+#
+# **이건 KIS 모의투자가 적용하는 요율이다.** 실계좌(2026년 코스피 0.15%)와 다르므로
+# 실거래 전환 시 반드시 다시 잰다 — 규칙 7 해제 시 확인할 항목.
+SELL_TAX_RATE = 0.0020
 
-def fetch_daily_fill_totals(ticker: str, order_date: date, side: str) -> tuple[int, float] | None:
-    """그날 그 종목의 **누적** 체결 수량·금액 (side: "buy" | "sell").
+# 위탁수수료 요율. 정상 경로에서는 이 상수를 안 쓴다 — 브로커의 추정제비용
+# (prsm_tlex_smtl)을 주문 전후 차로 재는 게 1순위고(FillRecord.fee), 이 값은 그
+# 조회가 실패했거나 옛 포지션이라 기록이 없을 때의 근사용이다.
+# 2026-09-01 실측: 매수·매도 15건 전부 체결액의 0.0141~0.0142%로 같았다.
+BROKERAGE_FEE_RATE = 0.000142
+
+
+def fetch_daily_fill_totals(ticker: str, order_date: date, side: str) -> tuple[int, float, float] | None:
+    """그날 그 종목의 **누적** 체결 수량·금액·위탁수수료 (side: "buy" | "sell").
 
     주문 직전·직후로 두 번 불러 차를 내면 그 주문 하나의 정확한 체결 수량·금액이
     나온다(`fill_between`). 집계값만 보면 안 되는 이유: output2는 그날 전체를
@@ -568,20 +629,36 @@ def fetch_daily_fill_totals(ticker: str, order_date: date, side: str) -> tuple[i
     if qty_str is None or amount_str is None:
         return None
     try:
-        return int(qty_str), float(amount_str)
+        # 추정제비용(prsm_tlex_smtl)도 같은 응답에 들어 있다 — 추가 호출이 아니다.
+        # 이것도 누적값이라 수량·금액과 똑같이 주문 전후 차로 재야 이 주문 몫이 나온다.
+        # 없으면 0.0으로 둔다: 아직 아무 비용도 안 붙은 상태(전 값)와 같은 의미라
+        # 차를 내면 어차피 0이 되고, 진짜 "모른다"는 fill_between이 None으로 표현한다.
+        fee = float(output2.get("prsm_tlex_smtl") or 0.0)
+        return int(qty_str), float(amount_str), fee
     except ValueError:
         logger.warning("kis_fill_totals_unparseable ticker=%s qty=%r amt=%r", ticker, qty_str, amount_str)
         return None
 
 
+def _fee_of(totals: tuple | None) -> float | None:
+    """누적 집계에서 수수료 항목만. 원소가 2개뿐인 옛 형태(수수료 이전에 만들어진
+    테스트 픽스처 등)면 None — "수수료 0원"이 아니라 "안 재봤다"는 뜻이다."""
+    if totals is None or len(totals) < 3:
+        return None
+    return totals[2]
+
+
 def fill_between(
-    before: tuple[int, float] | None, after: tuple[int, float] | None
+    before: tuple | None, after: tuple | None
 ) -> FillRecord | None:
     """주문 전후 누적 체결 집계의 차 = 그 주문 하나의 체결 내역.
 
     어느 쪽이든 조회에 실패했거나(None) 수량이 안 늘었으면 None이다 — 후자는
     "주문이 체결되지 않았다"와 "애초에 실주문을 안 냈다(시뮬레이션 경로)"를 모두
     포함하며, 둘 다 체결 사실을 지어내면 안 되는 상황이라 같게 다룬다.
+
+    수수료도 같은 차로 뽑는다. 양쪽 중 하나라도 수수료를 안 들고 있으면 None으로
+    남긴다 — 0.0으로 채우면 "수수료가 0원이었다"가 되어 순손익이 조용히 부풀어 오른다.
     """
     if before is None or after is None:
         return None
@@ -589,7 +666,9 @@ def fill_between(
     amount = after[1] - before[1]
     if qty <= 0 or amount <= 0:
         return None
-    return FillRecord(quantity=qty, amount=amount)
+    before_fee, after_fee = _fee_of(before), _fee_of(after)
+    fee = None if before_fee is None or after_fee is None else max(after_fee - before_fee, 0.0)
+    return FillRecord(quantity=qty, amount=amount, fee=fee)
 
 
 FILL_POLL_TIMEOUT_S = 12.0
@@ -600,7 +679,7 @@ def fill_after_order(
     ticker: str,
     order_date: date,
     side: str,
-    before: tuple[int, float] | None,
+    before: tuple | None,
     expected_quantity: int,
     timeout_s: float | None = None,
     poll_interval_s: float | None = None,

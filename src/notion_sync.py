@@ -18,7 +18,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-from src import collectors, notify, translate
+from src import collectors, kis, notify, translate
 from src.schemas import PortfolioState
 
 load_dotenv()
@@ -214,7 +214,7 @@ class Decision(BaseModel):
 
 class GateResult(BaseModel):
     approved: bool
-    rejected_by: str | None          # "position_limit" | "sector_concentration" | ...
+    rejected_by: str | None          # "position_limit" | "total_exposure" | ...
 """
 
 
@@ -379,6 +379,11 @@ def create_trade_journal_database(parent_page_id: str) -> str | None:
             "잔여비중": {"number": {"format": "percent"}},
             "잔여수량": {"number": {"format": "number"}},
             "실현손익률": {"number": {"format": "percent"}},
+            # 위는 체결 단가만 쓴 가격 수익률이고, 아래는 수수료·거래세까지 뺀 값이다.
+            # 둘 다 둔다 — 신호의 예측력(마일스톤 3 IC)은 가격 수익률로 보고, 계좌가
+            # 실제로 얼마 늘었는지는 순손익으로 본다(2026-09-01).
+            "순손익률": {"number": {"format": "percent"}},
+            "순손익금액": {"number": {"format": "won"}},
             "보유일수": {"number": {"format": "number"}},
         },
     }
@@ -395,6 +400,8 @@ _TRADE_JOURNAL_ADDED_PROPERTIES = {
     "매도비중": {"number": {"format": "percent"}},
     "잔여비중": {"number": {"format": "percent"}},
     "잔여수량": {"number": {"format": "number"}},
+    "순손익률": {"number": {"format": "percent"}},
+    "순손익금액": {"number": {"format": "won"}},
 }
 
 
@@ -447,6 +454,12 @@ async def _buy_row_children(entry: dict) -> list[dict]:
         blocks.append(_heading("진입가 출처", level=3))
         blocks.append(_paragraph(entry_note))
 
+    # 소급 교정된 행은 그 사실이 본문에 남아야 한다 — 숫자만 조용히 바뀌면 나중에
+    # 원본과 대조할 수 없다(매도 행이 이미 같은 필드를 쓴다).
+    if entry.get("correction_note"):
+        blocks.append(_heading("교정 기록", level=3))
+        blocks.append(_paragraph(entry["correction_note"]))
+
     return blocks
 
 
@@ -496,6 +509,11 @@ def _sell_row_properties(entry: dict) -> dict:
         properties["매도비중"] = {"number": round(entry["position_fraction_sold"], 4)}
     if entry.get("position_fraction_remaining") is not None:
         properties["잔여비중"] = {"number": round(entry["position_fraction_remaining"], 4)}
+    # 비용까지 뺀 값. 2026-09-01 이전 행에는 없으므로 그냥 비운다.
+    if entry.get("net_pnl_pct") is not None:
+        properties["순손익률"] = {"number": round(entry["net_pnl_pct"], 4)}
+    if entry.get("net_pnl_amount") is not None:
+        properties["순손익금액"] = {"number": round(entry["net_pnl_amount"])}
     return properties
 
 
@@ -553,6 +571,41 @@ def _trigger_explanation(entry: dict) -> str | None:
     return None
 
 
+def _cost_note(entry: dict) -> str | None:
+    """이번 매도에 실제로 붙은 비용과, 그걸 뺀 순손익 한 문단. 값이 없으면 None.
+
+    실현손익률만 보면 계좌가 그만큼 늘었다고 읽게 된다. 2026-09-01에 배포 이후 전
+    거래를 계좌와 맞춰보니 57,797원이 설명되지 않았고, 그게 위탁수수료와 매도
+    거래세였다 — 그 뒤로 둘을 갈라 적는다. 어느 쪽이 조회값이고 어느 쪽이 계산값인지도
+    같이 적는다(pipeline._trade_costs).
+    """
+    net_amount = entry.get("net_pnl_amount")
+    if net_amount is None:
+        return None
+
+    fee, tax = entry.get("fee_amount"), entry.get("tax_amount")
+    entry_fee = entry.get("entry_fee_amount")
+    fee_origin = {
+        "fill": "브로커 조회",
+        "estimated": "브로커 조회(부분 체결분을 매도 수량으로 환산)",
+        "computed": "요율 계산 — 체결 조회 실패",
+    }.get(entry.get("fee_source"), "출처 미상")
+
+    parts = [f"매도 수수료 {fee:,.0f}원({fee_origin})"]
+    if tax is not None:
+        parts.append(f"매도 거래세 {tax:,.0f}원(계산)")
+    if entry_fee is not None:
+        parts.append(f"진입 시 수수료 중 이번 몫 {entry_fee:,.0f}원(계산)")
+
+    net_pct = entry.get("net_pnl_pct")
+    pct_text = f" ({net_pct:+.2%})" if net_pct is not None else ""
+    return (
+        f"비용 {' · '.join(parts)}. "
+        f"이걸 뺀 순손익은 {net_amount:,.0f}원{pct_text} — 위 실현손익률은 체결 단가만 쓴 "
+        "가격 수익률이라 계좌 증감과 다르다."
+    )
+
+
 def _fill_source_note(entry: dict) -> str | None:
     """체결가·매도금액이 어디서 온 값인지. 브로커 원본이면 굳이 안 적는다."""
     notes = {
@@ -574,6 +627,9 @@ def _entry_source_note(entry: dict) -> str | None:
         "daily_avg": "주문 단위 체결 내역을 못 구해 그날 이 종목 매수 집계의 평균가로 적었다 — 같은 날 추가매수가 있었다면 섞인 값이다.",
         "position_avg": "체결 집계 대신 잔고의 매입평균가로 적었다.",
         "quote_fallback": "체결가를 끝내 못 구해 주문 직전 호가로 근사했다 — 손절·익절 기준이 실제 원가와 다를 수 있다.",
+        # 소급 교정된 행. 값 자체는 브로커 원본이라 가장 정확하지만, 기록된 시점이
+        # 매수 당시가 아니라는 사실은 남겨야 한다 — 왜 바뀌었는지는 correction_note에.
+        "reconciled": "이 행은 나중에 브로커 체결 원본으로 교정됐다. 아래 교정 기록 참고.",
     }
     return notes.get(entry.get("entry_price_source"))
 
@@ -594,6 +650,11 @@ async def _sell_row_children(entry: dict) -> list[dict]:
         reasoning_ko = await translate.to_korean(entry["reasoning"], label="translate_sell_reasoning")
         blocks.append(_heading("판단 사유", level=3))
         blocks.append(_paragraph(_truncate(reasoning_ko)))
+
+    cost_note = _cost_note(entry)
+    if cost_note:
+        blocks.append(_heading("비용과 순손익", level=3))
+        blocks.append(_paragraph(cost_note))
 
     note = _fill_source_note(entry)
     if note:
@@ -957,7 +1018,7 @@ async def _daily_report_children(
     sells: list[dict],
     skips: list[dict],
     portfolio: PortfolioState,
-    total_value: float | None = None,
+    account: kis.AccountSnapshot | None = None,
 ) -> list[dict]:
     blocks = [_heading("오늘의 판단 요약", level=2)]
     if decisions_today:
@@ -1039,14 +1100,17 @@ async def _daily_report_children(
     blocks.append(_paragraph(f"현금 비중: {portfolio.cash_weight:.2%}"))
 
     blocks.append(_heading("총정리", level=2))
-    if total_value is not None:
-        cash_amount = total_value * portfolio.cash_weight
-        invested_amount = total_value - cash_amount
-        blocks.append(_bulleted(f"투자한 금액: {invested_amount:,.0f}원"))
-        blocks.append(_bulleted(f"남아있는 현금: {cash_amount:,.0f}원"))
-        blocks.append(_bulleted(f"총 금액: {total_value:,.0f}원"))
+    if account is not None:
+        # 셋 다 브로커가 준 값이다. 2026-09-01까지는 현금을
+        # `총평가금액 x portfolio.cash_weight`로 만들었는데, cash_weight는 매수 시점
+        # 원가 기준 장부 비중이고 총평가금액은 실시간 시장가치라 곱하면 현금도
+        # 투자금도 아닌 값이 나왔다(9/1 실측 +823,891원, +1.64%). 평가이익이 쌓일수록
+        # 벌어지는 한쪽 방향 오차였다 — kis.AccountSnapshot docstring.
+        blocks.append(_bulleted(f"투자한 금액: {account.securities:,.0f}원"))
+        blocks.append(_bulleted(f"남아있는 현금: {account.cash:,.0f}원"))
+        blocks.append(_bulleted(f"총 금액: {account.total:,.0f}원"))
     else:
-        blocks.append(_paragraph("계좌 총평가금액 조회 실패로 금액 총정리를 작성할 수 없다."))
+        blocks.append(_paragraph("계좌 잔고 조회 실패로 금액 총정리를 작성할 수 없다."))
 
     return blocks
 
@@ -1080,7 +1144,7 @@ async def sync_daily_report(
     pipeline_log_path: Path = DEFAULT_PIPELINE_LOG_PATH,
     trade_journal_log_path: Path = DEFAULT_TRADE_JOURNAL_LOG_PATH,
     state_path: Path = DEFAULT_DAILY_REPORT_STATE_PATH,
-    total_value: float | None = None,
+    account: kis.AccountSnapshot | None = None,
 ) -> bool:
     """하루에 한 번, 장 마감 뒤 그날의 판단·매수·매도·최종 보유 종목을 요약해
     노션에 한 페이지로 남긴다. logs/pipeline.jsonl(그날의 모든 판단)과
@@ -1089,11 +1153,11 @@ async def sync_daily_report(
     매매일지(sync_trade_journal)는 이벤트 이력이고 이건 "그날 하루" 단위
     요약이라 서로 다른 걸 보여준다.
 
-    total_value(계좌 총평가금액)는 호출부가 kis.fetch_account_balance()로 구해
+    account(계좌 잔고 스냅샷)는 호출부가 kis.fetch_account_snapshot()으로 구해
     넘긴다 — PortfolioState는 비중(weight)만 들고 절대 원화 금액을 모르므로,
     "총정리"(투자한 금액/남은 현금/총 금액) 절대 원화 표기는 이 값이 있어야만
-    가능하다. None이면(조회 실패) 그 절만 조용히 생략하고 리포트 나머지는 그대로
-    올라간다.
+    가능하다. 비중으로 역산하지 않는 이유는 kis.AccountSnapshot docstring에 있다.
+    None이면(조회 실패) 그 절만 조용히 생략하고 리포트 나머지는 그대로 올라간다.
 
     같은 날짜로 이미 만든 적 있으면(로컬 state 파일 기준) 다시 안 만든다 —
     run_daily.py가 같은 날 재실행돼도 중복 리포트가 안 생기게.
@@ -1117,7 +1181,7 @@ async def sync_daily_report(
     body = {
         "parent": {"database_id": database_id},
         "properties": _daily_report_properties(day, buys, sells, portfolio),
-        "children": await _daily_report_children(day, decisions_today, buys, sells, skips, portfolio, total_value),
+        "children": await _daily_report_children(day, decisions_today, buys, sells, skips, portfolio, account),
     }
     result = _notion_request("POST", "/pages", body)
     if result is None:

@@ -4,7 +4,7 @@ import json
 import pytest
 import requests
 
-from src import notion_sync
+from src import kis, notion_sync
 from src.schemas import PortfolioState, Position
 
 
@@ -532,8 +532,17 @@ def test_daily_report_shows_display_names_and_cash_weight_to_two_decimals(monkey
     assert "현금 비중: 87.65%" in all_text
 
 
-def test_daily_report_summary_section_uses_total_value_when_given():
+def test_daily_report_summary_section_uses_broker_amounts_not_cash_weight():
+    """총정리 금액은 브로커가 준 값 그대로다 — 장부 비중으로 역산하지 않는다.
+
+    이 테스트는 2026-09-01 전까지 **버그를 그대로 단언하고 있었다**: cash_weight 0.3에
+    총평가금액 1억을 곱한 3천만원을 "남아있는 현금"으로 기대했다. cash_weight는 매수
+    시점 원가 기준 장부 비중이라 그 곱은 실제 예수금이 아니다(kis.AccountSnapshot).
+    그래서 여기서는 **비중과 어긋나는** 스냅샷을 일부러 넣는다 — 옛 계산으로 돌아가면
+    3천만원이 나와서 깨진다.
+    """
     portfolio = PortfolioState(cash_weight=0.3)
+    account = kis.AccountSnapshot(total=100_000_000.0, cash=50_308_183.0, securities=49_691_817.0)
     blocks = asyncio.run(
         notion_sync._daily_report_children(
             "2026-08-10",
@@ -542,15 +551,16 @@ def test_daily_report_summary_section_uses_total_value_when_given():
             sells=[],
             skips=[],
             portfolio=portfolio,
-            total_value=100_000_000.0,
+            account=account,
         )
     )
     all_text = json.dumps(blocks, ensure_ascii=False)
 
     assert "총정리" in all_text
-    assert "투자한 금액: 70,000,000원" in all_text
-    assert "남아있는 현금: 30,000,000원" in all_text
+    assert "투자한 금액: 49,691,817원" in all_text
+    assert "남아있는 현금: 50,308,183원" in all_text
     assert "총 금액: 100,000,000원" in all_text
+    assert "30,000,000" not in all_text  # 비중으로 역산한 옛 값
 
 
 def test_daily_report_summary_section_omitted_when_total_value_unavailable():
@@ -654,7 +664,14 @@ def test_ensure_trade_journal_properties_patches_the_existing_db(monkeypatch):
     assert notion_sync.ensure_trade_journal_properties("db-1") is True
     assert captured["method"] == "PATCH"
     assert captured["path"] == "/databases/db-1"
-    assert set(captured["body"]["properties"]) == {"매도금액", "매도비중", "잔여비중", "잔여수량"}
+    assert set(captured["body"]["properties"]) == {
+        "매도금액",
+        "매도비중",
+        "잔여비중",
+        "잔여수량",
+        "순손익률",
+        "순손익금액",
+    }
 
 
 def test_ensure_trade_journal_properties_reports_failure(monkeypatch):
@@ -1082,3 +1099,52 @@ def test_sync_daily_report_still_written_when_the_view_sort_fails(monkeypatch, t
     )
 
     assert created is True
+
+
+# --- 소급 교정된 매수 행 (2026-09-01) ---
+
+
+def test_buy_row_body_shows_correction_note_and_reconciled_source():
+    """매수 진입가를 나중에 브로커 원본으로 고친 행은, 바뀐 숫자만이 아니라
+    '고쳤다'는 사실까지 노션에 보여야 한다. 2026-09-01 이전에는 매도 행만
+    correction_note를 실었고 매수 행은 조용히 값만 바뀌었다."""
+    entry = {
+        "event": "buy",
+        "day": "2026-08-12",
+        "ticker": "192820",
+        "sector": "화장품",
+        "quantity": 38,
+        "entry_price": 232000.0,
+        "entry_price_source": "reconciled",
+        "correction_note": "2026-09-01 교정: 210,000원 → 232,000원 (브로커 체결 원본).",
+        "decision": {"reason": "테스트", "inputs": [], "debate": []},
+    }
+
+    blocks = asyncio.run(notion_sync._buy_row_children(entry))
+    all_text = json.dumps(blocks, ensure_ascii=False)
+
+    assert "진입가 출처" in all_text
+    assert "브로커 체결 원본으로 교정" in all_text
+    assert "교정 기록" in all_text
+    assert "210,000원 → 232,000원" in all_text
+
+
+def test_buy_row_body_stays_quiet_for_a_clean_full_fill():
+    """전량 체결로 정상 기록된 행에는 아무 주석도 안 붙는다 — 정상 건마다 주석이
+    붙으면 진짜 근사치·교정 건이 묻힌다."""
+    entry = {
+        "event": "buy",
+        "day": "2026-08-28",
+        "ticker": "066970",
+        "sector": "전기제품",
+        "quantity": 60,
+        "entry_price": 130691.67,
+        "entry_price_source": "fill",
+        "decision": {"reason": "테스트", "inputs": [], "debate": []},
+    }
+
+    blocks = asyncio.run(notion_sync._buy_row_children(entry))
+    all_text = json.dumps(blocks, ensure_ascii=False)
+
+    assert "진입가 출처" not in all_text
+    assert "교정 기록" not in all_text

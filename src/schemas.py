@@ -100,6 +100,11 @@ class FillRecord(BaseModel):
     complete: bool = True  # 주문 수량만큼 다 잡혔는가. False면 체결이 더 있었는데
     # 조회가 못 따라잡은 것이라 quantity·amount가 실제보다 **작다** (kis.fill_after_order).
     # 이 값으로 판단하는 쪽은 수량을 상태 차이에서 다시 뽑아야 한다.
+    fee: float | None = None  # 이 주문의 위탁수수료(원). 브로커가 주는 값이라 조회 실패나
+    # 옛 경로에서는 None으로 남는다 — 0.0으로 채우면 "수수료가 없었다"와 "모른다"가
+    # 같은 모양이 된다(AnalystOpinion=None과 같은 패턴). 거래세는 여기 안 들어간다:
+    # 브로커 응답의 추정제비용(prsm_tlex_smtl)은 매수·매도 양쪽 같은 요율이라
+    # 수수료만 담고 있다(2026-09-01 15건 실측). 세금은 kis.SELL_TAX_RATE로 계산한다.
 
     @property
     def price(self) -> float:
@@ -143,15 +148,18 @@ class Decision(BaseModel):
 
 class GateResult(BaseModel):
     approved: bool
-    rejected_by: str | None  # "position_limit" | "sector_concentration" | ...
+    rejected_by: str | None  # "position_limit" | "total_exposure" | ...
 
 
 class RiskGateConfig(BaseModel):
-    """docs/PLAN.md §5에서 확정한 리스크 게이트 수치 (2026-08-08)."""
+    """docs/PLAN.md §5에서 확정한 리스크 게이트 수치 (2026-08-08).
+
+    폐기된 룰 두 개는 필드 자체를 지웠다 — 값만 남겨두면 게이트가 실제보다 촘촘한
+    것처럼 보인다(pipeline.check_gate docstring에 각각의 이유):
+    `daily_loss_limit`(2026-08-20), `sector_concentration_limit`(2026-09-01).
+    """
 
     position_limit: float = 0.15  # 종목당 최대 비중
-    sector_concentration_limit: float = 0.40  # 섹터 집중도 한도
-    # 일일 손실 한도(daily_loss_limit) 룰은 2026-08-20 폐기 — pipeline.check_gate docstring 참고.
     total_exposure_limit: float = 1.0  # 총 노출 한도 (현재는 개별 한도로만 통제)
 
 

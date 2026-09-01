@@ -1,4 +1,4 @@
-"""장 시작 직후(09:00 KST cron) 집행 전담 진입점 — 매도 먼저, 그다음 매수.
+"""장 시작 직후(09:01 KST cron) 집행 전담 진입점 — 매도 먼저, 그다음 매수.
 
 두 개의 "판단은 끝났지만 아직 집행 안 된" 결과를 실제 KIS 모의투자 주문으로
 집행한다:
@@ -6,11 +6,11 @@
    LLM이 재량으로 정한 매도. 장이 닫혀 있을 때는 주문을 넣을 수 없어 하루
    미뤄둔 것이다. 매도는 갭 체크 없이 그대로 집행한다(사용자 확정 — 매도는
    망설이지 않는다, src/sell.py 상단 주석과 같은 원칙).
-2. logs/pending_buys.json — 오늘 아침(scripts/decide_buys.py, 07:00) 판단해둔
+2. logs/pending_buys.json — 오늘 아침(scripts/decide_buys.py, 08:30) 판단해둔
    신규 매수. pipeline.execute_buy_order의 갭 체크(±3%)가 전일 데이터 기준
    판단과 오늘 시가 사이 시차를 처리한다.
 
-매도를 먼저 집행해서 생긴 현금 여유는 이미 07:00에 확정된 매수 결정 자체를
+매도를 먼저 집행해서 생긴 현금 여유는 이미 08:30에 확정된 매수 결정 자체를
 바꾸지 않는다(게이트 재판정이 아니라 이미 승인된 결정의 순차 집행) — 단지 매도
 주문이 매수 주문보다 먼저 나갈 뿐이다.
 
@@ -31,7 +31,7 @@ import asyncio
 import json
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -171,7 +171,11 @@ async def main() -> None:
         logger.info("not_a_trading_day day=%s — skip", today_kst.isoformat())
         return
 
-    day = datetime.now(timezone.utc)
+    # KST다(UTC 아님). 이 값의 .date()가 매매일지의 `day`와 보유기간 계산으로
+    # 그대로 들어가므로, 하루의 경계는 장이 도는 시간대여야 한다 — pipeline._kst_today
+    # docstring의 832fb8b와 같은 버그다. 09:01 KST는 00:01 UTC라 지금까지는 우연히
+    # 같은 날짜였지만, 크론이 09:00보다 조금이라도 앞당겨지는 순간 하루가 밀린다.
+    day = datetime.now(KST)
 
     with portfolio_lock():
         portfolio = load_portfolio()
