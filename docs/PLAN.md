@@ -166,8 +166,9 @@ IC(information coefficient)는 예측값과 실제 수익률의 순위상관이�
 `schemas.RiskGateConfig` 두 곳만 보면 된다.
 
 남은 게이트 룰은 `position_limit`과 `total_exposure` 둘뿐이라, 이 둘이 실제로
-발동 가능한 상태인지가 그만큼 중요해졌다 — `total_exposure`는 하루 여러 건이
-승인될 때 누적을 못 보는 문제가 있다(docs/CHANGELOG.md 2026-09-01 발견 1).
+발동 가능한 상태인지가 그만큼 중요해졌다. `total_exposure`가 하루 여러 건이 승인될 때
+누적을 못 보던 문제는 같은 날 고쳤다(docs/CHANGELOG.md 2026-09-01 3차) — 판단 경로가
+승인분을 메모리 안에서 포트폴리오에 얹어 다음 후보 판정에 넘긴다.
 
 ### 차트 분석가 입력 형태·시세 데이터 소스 (2026-08-08 확정)
 

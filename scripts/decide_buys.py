@@ -6,8 +6,9 @@
 집행(장 시작가) 사이 시차는 pipeline.execute_buy_order의 갭 체크(±3%)가 이미 상정하고
 있는 것과 같은 종류다.
 
-여기서 포트폴리오 상태를 쓰지 않는다(게이트 체크용으로 읽기만 함) — 이 시간대엔
-다른 스크립트가 돌지 않으므로 락이 필요 없다.
+포트폴리오 상태 파일은 **읽기만** 한다 — 이 시간대엔 다른 스크립트가 돌지 않으므로
+락이 필요 없다. 다만 게이트가 하루치 승인을 누적해서 보도록, 승인분은 메모리 안에서만
+포트폴리오에 얹어 다음 후보 판정에 넘긴다(_make_recording_execute_fn).
 
 실행: uv run python scripts/decide_buys.py (레포 루트에서)
 """
@@ -35,9 +36,31 @@ PENDING_BUYS_PATH = Path("logs/pending_buys.json")
 
 
 def _make_recording_execute_fn(recorded: list[dict]):
-    """run_day가 기대하는 ExecuteFn 형태를 따르되, 포트폴리오는 안 건드리고
-    승인된 BUY만 recorded 리스트에 남긴다. sector는 run_day 루프 안에서만
-    보이는 값이라 이 콜백을 통해서만 꺼낼 수 있다."""
+    """run_day가 기대하는 ExecuteFn 형태를 따르되, 실제 주문은 내지 않고 승인된
+    BUY만 recorded 리스트에 남긴다. sector는 run_day 루프 안에서만 보이는 값이라
+    이 콜백을 통해서만 꺼낼 수 있다.
+
+    **승인분은 반환 포트폴리오에 반영한다(`pipeline.execute`).** 이게 없으면
+    게이트의 누적 판정이 통째로 죽는다 — run_day는
+    `portfolio = await execute_fn(...)`로 받은 걸 다음 종목의 `check_gate` 입력으로
+    쓰는데, 여기서 받은 걸 그대로 돌려주면 그날 후보 **전부가 08:30 스냅샷 하나**를
+    상대로 독립 판정된다. 그러면 N건이 각자 한도 안이라는 이유로 다 통과하고,
+    합쳐서 넘는 건 아무도 안 본다(2026-09-01 발견, CHANGELOG "발견 1").
+
+    실측 재현 — 9/1 마감 상태(현금 50,308,183원, 보유 7종목)에서 같은 섹터 후보 8개가
+    전부 매니저 BUY를 받았다고 두면:
+
+        반영 안 함(옛 동작): 8건 승인   -> 주문 총액이 예수금을 넘는다
+        반영 함(지금):       6건 승인, 2건 rejected_by="total_exposure"
+
+    6건은 `int(예수금 / (총평가 x 0.08))`과 정확히 같다. `total_exposure_limit=1.0`은
+    사실상 "가진 현금 넘게 주문하지 마라"이고, 그 보장이 이 한 줄에 달려 있다.
+
+    **`execute()`이지 `execute_buy_order()`가 아니다.** 전자는 가격 개념이 없는 순수
+    시뮬레이션이라 KIS를 안 부른다(규칙 7). 여기서 만들어지는 포지션은 게이트 산수를
+    위한 가상의 것이고, 이 스크립트는 상태 파일을 읽기만 하므로 디스크에 안 남는다 —
+    실제 주문과 실제 진입가는 09:01 execute_open이 낸다.
+    """
 
     async def _record(
         decision: Decision, gate_result: GateResult, portfolio: PortfolioState, sector: str, trade_weight: float
@@ -52,7 +75,7 @@ def _make_recording_execute_fn(recorded: list[dict]):
                     "gate_result": gate_result.model_dump(mode="json"),
                 }
             )
-        return portfolio
+        return pipeline.execute(decision, gate_result, portfolio, sector, trade_weight)
 
     return _record
 

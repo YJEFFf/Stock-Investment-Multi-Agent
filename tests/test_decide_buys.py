@@ -1,4 +1,4 @@
-"""scripts/decide_buys.py — 07:00 판단 전용 진입점. pipeline.run_daily 내부
+"""scripts/decide_buys.py — 08:30 판단 전용 진입점. pipeline.run_daily 내부
 로직(유니버스/필터/분석가/토론)은 이미 각자 테스트에서 검증되므로, 여기서는
 "판단 결과를 실행하지 않고 pending_buys.json에 정확히 남기는가"만 본다 —
 pipeline.run_daily 자체를 가짜로 바꿔치기해서 그 안에 전달되는 execute_fn을
@@ -48,13 +48,19 @@ def test_recording_execute_fn_records_approved_buys_only():
     hold = _decision("035420", "HOLD")
 
     result1 = asyncio.run(record_fn(approved, GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08))
-    result2 = asyncio.run(record_fn(rejected, GateResult(approved=False, rejected_by="position_limit"), portfolio, "반도체", 0.08))
-    result3 = asyncio.run(record_fn(hold, GateResult(approved=False, rejected_by=None), portfolio, "화학", 0.08))
+    result2 = asyncio.run(record_fn(rejected, GateResult(approved=False, rejected_by="position_limit"), result1, "반도체", 0.08))
+    result3 = asyncio.run(record_fn(hold, GateResult(approved=False, rejected_by=None), result2, "화학", 0.08))
 
-    # 포트폴리오는 절대 안 바뀐다 — 이 단계는 집행이 아니라 판단만 한다.
-    assert result1 == portfolio
-    assert result2 == portfolio
-    assert result3 == portfolio
+    # 승인분은 반환 포트폴리오에 얹힌다 — run_day가 이걸 다음 종목 게이트에 넘기므로,
+    # 안 얹으면 그날 후보 전부가 같은 스냅샷을 상대로 독립 판정된다(2026-09-01 발견 1).
+    # 2026-09-01 전까지 이 테스트는 "포트폴리오는 절대 안 바뀐다"고 단언하며 그 버그를
+    # 지키고 있었다.
+    assert [p.ticker for p in result1.positions] == ["005930"]
+    assert result1.cash_weight == pytest.approx(0.92)
+
+    # 거부된 BUY와 HOLD는 아무것도 안 바꾼다.
+    assert result2 == result1
+    assert result3 == result1
 
     assert len(recorded) == 1
     assert recorded[0]["ticker"] == "005930"
@@ -143,3 +149,61 @@ def test_run_daily_day_uses_kst_date_not_utc_date_at_0830_cron_time(monkeypatch,
     asyncio.run(db.main())
 
     assert captured["day"].date().isoformat() == "2026-08-13"
+
+
+def test_recording_execute_fn_lets_the_gate_see_the_running_total():
+    """하루에 여러 건이 승인되면 게이트가 그 누적을 봐야 한다.
+
+    2026-09-01 이전에는 안 봤다. `_record`가 받은 포트폴리오를 그대로 돌려줘서
+    그날 후보 전부가 08:30 스냅샷 하나를 상대로 독립 판정됐고, N건이 각자 한도
+    안이라는 이유로 다 통과했다 — 합쳐서 넘는 건 아무도 안 봤다.
+
+    여기서는 콜백을 run_day처럼 체인으로 부르면서, 총 노출이 실제로 쌓이는지만 본다
+    (게이트 판정 자체는 tests/test_gate.py가 본다).
+    """
+    recorded: list[dict] = []
+    record_fn = db._make_recording_execute_fn(recorded)
+    portfolio = PortfolioState(cash_weight=1.0)
+
+    for i in range(5):
+        portfolio = asyncio.run(
+            record_fn(
+                _decision(f"00000{i}", "BUY"),
+                GateResult(approved=True, rejected_by=None),
+                portfolio,
+                "반도체와반도체장비",
+                0.08,
+            )
+        )
+
+    assert len(recorded) == 5
+    assert len(portfolio.positions) == 5
+    # 투자 비중 0.40이 다음 후보의 total_exposure 판정 입력이 된다.
+    assert 1.0 - portfolio.cash_weight == pytest.approx(0.40)
+
+
+def test_recording_execute_fn_never_touches_the_broker(monkeypatch):
+    """게이트 산수용 가상 포지션이지 실제 주문이 아니다 — execute()이지
+    execute_buy_order()가 아니다(규칙 7)."""
+
+    def fail(*a, **k):
+        raise AssertionError("판단 단계에서 KIS를 부르면 안 된다")
+
+    monkeypatch.setattr(db.pipeline.kis, "place_market_buy_order", fail)
+    monkeypatch.setattr(db.pipeline.kis, "fetch_account_balance", fail)
+    monkeypatch.setattr(db.pipeline.kis, "fetch_current_price", fail)
+
+    recorded: list[dict] = []
+    record_fn = db._make_recording_execute_fn(recorded)
+    result = asyncio.run(
+        record_fn(
+            _decision("005930", "BUY"),
+            GateResult(approved=True, rejected_by=None),
+            PortfolioState(cash_weight=1.0),
+            "반도체",
+            0.08,
+        )
+    )
+
+    # 가상 포지션이라 진입가가 없다 — 실제 체결가는 09:01 execute_open이 채운다.
+    assert result.positions[0].entry_price is None
