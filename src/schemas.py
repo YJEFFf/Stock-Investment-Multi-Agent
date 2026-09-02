@@ -174,14 +174,16 @@ class Position(BaseModel):
     # 평가가 "판단 불가"로 건너뛴다(AnalystOpinion=None과 같은 패턴).
     peak_price: float | None = None  # 진입(또는 마지막 부분 익절) 이후 관측된 최고가 —
     # 트레일링 익절의 기준점.
+    peak_reset_day: date | None = None  # 트레일링 익절로 peak_price를 리셋한 날.
+    # 리셋은 "다음 구간을 새 고점부터 추적한다"는 뜻인데, update_peak_price가 매분
+    # max(peak, day_high)를 잡고 **day_high >= 현재가는 항상 참**이라 리셋이 다음
+    # 회차에 반드시 되돌아왔다(2026-09-02 발견, 2026-08-27 d6c5864의 부작용).
+    # 그날의 고가는 리셋 이전 구간을 포함하므로 리셋한 날엔 day_high를 안 본다 —
+    # 진입 당일에 day_high를 빼는 것과 정확히 같은 이유다(sell.update_peak_price).
     take_profit_stage: int = 0  # 부분 익절이 몇 번 실행됐는지
     exit_plan: ExitPlan | None = None  # 진입 시 확정된 손절/익절 규칙. 보유 중에는 절대
     # 갱신하지 않는다(ExitPlan docstring 참고). None인 포지션(이 기능 이전에 열렸거나
     # 시뮬레이션 경로로 열린 것)은 sell.DEFAULT_EXIT_PLAN을 그대로 쓴다.
-    range_trigger_day: date | None = None  # 당일 저가/고가로만 잡힌 트레일링 익절이
-    # 실행된 날. 당일 저가는 한 번 라인 아래로 내려가면 그날 내내 아래로 남아서, 막지
-    # 않으면 남은 회차마다 계속 팔린다(sell.evaluate_with_day_range). 손절·첫 익절은
-    # 포지션이 사라지거나 stage가 올라가 분기가 바뀌므로 이 제한이 필요 없다.
     quantity: int | None = None  # 실제 보유 주수. pipeline.execute_buy_order가 실제
     # KIS 주문을 넣을 때만 채운다 — 브로커에 실주문을 낸 적 없는(순수 시뮬레이션
     # execute()로 연 포지션은 None으로 남는다. 실제 매도 주문 수량 계산에 쓴다

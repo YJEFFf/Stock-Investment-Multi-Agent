@@ -98,6 +98,21 @@ def _threshold_crossed(position: Position, plan: ExitPlan, low: float, high: flo
     부르면 예전 동작 그대로다. 둘을 따로 구현하면 사후 판정이 실제 안전장치와 어긋나고,
     그 어긋남은 "안 팔았어야 했는데 팔았다"로 나타나서 되돌릴 수가 없다.
     손절이 익절보다 우선한다.
+
+    **트레일링은 구간으로 판정하지 않는다**(2026-09-02, 사용자 확정). 손절과 첫 익절은
+    기준이 *진입가*라 하루 중 언제 찍힌 저가/고가든 상관없지만, 트레일링의 기준은
+    *고점*이고 그 고점은 하루 사이에도 올라간다. 저가와 고점의 시간 순서를 모르는 채
+    둘을 비교하면 **고점보다 먼저 찍힌 저가가 나중에 올라간 고점 대비 -N%가 되어**,
+    가격이 오른 순간에 매도가 발동한다.
+
+    2026-09-02 192820이 정확히 그랬다: 당일 저가 271,000은 09:00, 고가 292,000은
+    13:28이었는데 13:29에 "고점 대비 -7.19%"로 팔렸다. 그 저가는 이미 09:01 매도로
+    소진된 값이라 같은 저가로 두 번 판 셈이다. 오전 저가가 이후 고가보다 트레일 폭만큼
+    아래이기만 하면 성립하므로 거의 매일 재발할 수 있었다.
+
+    분당 샘플이 놓친 트레일링 하락은 이제 못 잡는다. 받아들이는 이유: 트레일링은 이미
+    부분 익절을 한 번 이상 한 포지션에만 걸리므로 놓쳐도 손실이 아니라 이익 축소이고,
+    점 판정은 매분 그대로 돈다. 손절은 반대로 놓치면 손실이라 구간 판정에 그대로 둔다.
     """
     entry = position.entry_price
     if entry is None:
@@ -106,15 +121,8 @@ def _threshold_crossed(position: Position, plan: ExitPlan, low: float, high: flo
     if (low - entry) / entry <= plan.stop_loss_pct:
         return "stop_loss"
 
-    if position.take_profit_stage == 0:
-        if (high - entry) / entry >= plan.take_profit_pct:
-            return "take_profit"
-        return None
-
-    if position.peak_price is None:
-        return None
-    if (low - position.peak_price) / position.peak_price <= plan.trail_pct:
-        return "take_profit_trail"
+    if position.take_profit_stage == 0 and (high - entry) / entry >= plan.take_profit_pct:
+        return "take_profit"
     return None
 
 
@@ -143,14 +151,13 @@ def evaluate_with_day_range(
     파는 게 이상해 보일 수 있지만, 반대로 하면 이미 지나간 순간의 가격에 체결됐다고
     가정하게 되고 그건 사실이 아니다.
 
-    반복 발동 방지: 당일 저가는 한 번 라인 아래로 내려가면 그날 내내 아래로 남는다.
-    트레일링은 부분 익절이라 포지션이 사라지지 않으므로, 막지 않으면 남은 회차마다
-    계속 팔아 하루에 전량이 나간다. 그래서 **구간으로 잡힌 트레일링은 종목당 하루
-    1회**로 묶는다(`Position.range_trigger_day`). 점 판정은 그대로 매분 돈다 —
-    진짜로 가격이 눌러앉으면 그쪽이 잡는다.
-
-    손절은 전량 매도라 포지션이 사라지고, 첫 익절은 stage가 올라가며 분기가 바뀌므로
-    둘 다 반복 위험이 없다 — 날짜 제한은 트레일링에만 건다.
+    **트레일링은 이 경로로 판정하지 않는다**(2026-09-02, 사용자 확정). 이유는
+    _threshold_crossed docstring에 있다 — 저가와 고점의 시간 순서를 모르면 가격이
+    오른 순간에 매도가 발동한다. 여기 남는 건 손절과 첫 익절뿐이고, 그 둘은 기준이
+    진입가라 순서와 무관하다. 반복 발동 위험도 없다: 손절은 전량 매도라 포지션이
+    사라지고, 첫 익절은 stage가 올라가며 분기가 바뀐다. 그래서 하루 1회 제한
+    (옛 `Position.range_trigger_day`)도 같이 걷어냈다 — 걸릴 일이 없는 가드를
+    남겨두면 이 경로가 실제보다 촘촘해 보인다.
     """
     action = evaluate_deterministic_sell(position, quote.price)
     if action is not None:
@@ -176,9 +183,6 @@ def evaluate_with_day_range(
     if reason is None:
         return None, False
 
-    if reason == "take_profit_trail" and position.range_trigger_day == today:
-        return None, False
-
     return _action_for(position, plan, reason), True
 
 
@@ -196,11 +200,11 @@ def threshold_crossed_in_bar(position: Position, bar: OHLCVBar) -> str | None:
     evaluate_deterministic_sell과 같은 순서·같은 문턱을 쓴다(손절 우선). 다르게
     두면 사후 판정이 실제 안전장치와 어긋나서 오히려 사람을 헷갈리게 한다.
 
-    한계 하나: 트레일링은 `position.peak_price`(지금 기록된 고점)를 기준으로 재는데,
-    공백 동안 갱신되지 못한 고점이 실제보다 낮을 수 있다. 그러면 트레일 라인도
-    낮게 잡혀 "안 닿았다"가 나오기 쉬운 쪽으로 기운다. 문턱을 다시 정하는 게
-    아니라 **그 시점에 실제로 적용되던 문턱**으로 재는 것이라 이대로 둔다 —
-    가상의 고점으로 재면 실제로는 발동하지 않았을 매도를 놓쳤다고 알리게 된다.
+    한계 하나: **트레일링 익절은 이 판정에 안 잡힌다**(2026-09-02부터). 일봉은 저가와
+    고가의 시간 순서를 주지 않는데 트레일링은 그 순서에 의존하기 때문이다
+    (_threshold_crossed docstring). 실제 안전장치와 같은 함수를 쓴다는 규약은 그대로다
+    — 안전장치도 구간으로는 트레일링을 안 본다. 공백 구간에서 트레일링 하락을 놓쳤는지는
+    이 도구로 답할 수 없고, 답할 수 있는 척하면 안 된다.
     """
     if position.entry_price is None:
         return None
@@ -226,7 +230,14 @@ def update_peak_price(
     # 진입 당일의 당일 고가는 우리가 사기 전 구간을 포함한다 — 그걸 고점으로 잡으면
     # 트레일 라인이 보유한 적 없는 가격 위에 서고, 첫날부터 트레일링이 걸린다
     # (evaluate_with_day_range의 진입 당일 제외와 같은 이유).
-    if day_high is not None and position.entry_day == (today or datetime.now(KST).date()):
+    #
+    # **트레일링 익절로 고점을 리셋한 날도 같다**(2026-09-02 추가). 그날의 고가는
+    # 리셋 이전 구간을 포함하므로 리셋을 그대로 되돌린다. day_high >= 현재가는 항상
+    # 참이라 이 제외가 없으면 리셋은 단 한 회차도 살아남지 못했고, 트리거가 된 고점이
+    # *그날의* 고가일 때(장중 반락) 매분 재발동해 -7% 하락 한 번에 포지션이 통째로
+    # 나갔다 — 설계 의도는 1/3이다(execute_sell docstring).
+    today = today or datetime.now(KST).date()
+    if day_high is not None and (position.entry_day == today or position.peak_reset_day == today):
         day_high = None
     observed = max(current_price, day_high) if day_high is not None else current_price
     new_peak = max(position.peak_price or position.entry_price, observed)
@@ -235,13 +246,17 @@ def update_peak_price(
     return position.model_copy(update={"peak_price": new_peak})
 
 
-def execute_sell(portfolio: PortfolioState, action: SellAction, current_price: float) -> PortfolioState:
+def execute_sell(
+    portfolio: PortfolioState, action: SellAction, current_price: float, *, today: date | None = None
+) -> PortfolioState:
     """SellAction을 포트폴리오 상태에 반영하는 순수 함수. 실거래 API 호출 없음
     (규칙 7) — 무비용 시뮬레이션 경로다. 실제 KIS 주문까지 내려면
     execute_sell_order를 쓴다.
 
     트레일링 익절이 실행되면 다음 구간을 새 고점부터 추적하도록 peak_price를
     현재가로 리셋한다 — 안 그러면 같은 하락 하나로 여러 단계가 연달아 발동해버린다.
+    리셋한 날짜(peak_reset_day)도 같이 남긴다. 이게 없으면 update_peak_price가 다음
+    회차에 그날의 고가로 리셋을 되돌려 리셋 자체가 무의미해진다(2026-09-02).
     잔여 비중이 사실상 0이면(부동소수 오차 감안) 포지션 자체를 제거한다.
     quantity가 채워져 있으면(실제 주문으로 연 포지션) 비중과 같은 비율로 줄인다 —
     실제 매도 없이 상태만 시뮬레이션하는 경로이므로 근사치다.
@@ -266,6 +281,7 @@ def execute_sell(portfolio: PortfolioState, action: SellAction, current_price: f
     if action.reason == "take_profit_trail":
         update["take_profit_stage"] = position.take_profit_stage + 1
         update["peak_price"] = current_price
+        update["peak_reset_day"] = today or datetime.now(KST).date()
 
     return PortfolioState(
         positions=[*other_positions, position.model_copy(update=update)],
@@ -377,7 +393,10 @@ async def execute_sell_order(
     # 된다. 전량 매도(shares_to_sell == quantity)면 정확히 1.0이라 포지션이 제거된다.
     effective_fraction = shares_to_sell / position.quantity
     updated_portfolio = execute_sell(
-        portfolio, action.model_copy(update={"sell_fraction": effective_fraction}), effective_price
+        portfolio,
+        action.model_copy(update={"sell_fraction": effective_fraction}),
+        effective_price,
+        today=today,
     )
     # 주식수는 execute_sell의 비율 재계산(int(quantity * fraction))에 맡기지 않고 정확한
     # 값으로 덮어쓴다 — 3주 중 1주면 int(3 * (1/3))이 부동소수 오차로 0이 되어버린다.

@@ -948,7 +948,6 @@ async def evaluate_holdings(
         # (sell.evaluate_with_day_range docstring).
         action, from_day_range = sell.evaluate_with_day_range(position, quote, today=_kst_today())
         if from_day_range:
-            position = position.model_copy(update={"range_trigger_day": _kst_today()})
             logger.error(
                 "sell_trigger_from_day_range ticker=%s reason=%s day_low=%s day_high=%s price=%.0f "
                 "— 분당 샘플이 놓친 구간을 당일 범위로 잡았다",

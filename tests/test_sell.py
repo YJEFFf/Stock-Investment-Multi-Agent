@@ -634,13 +634,16 @@ def test_bar_audit_catches_a_take_profit_trigger():
     assert sell.threshold_crossed_in_bar(position, _bar(low=99.0, high=121.0)) == "take_profit"
 
 
-def test_bar_audit_uses_the_trailing_line_once_a_take_profit_already_fired():
-    """stage>0이면 진입가가 아니라 고점 기준이다 — evaluate_deterministic_sell과
-    같은 분기를 타야 사후 판정이 실제 안전장치와 어긋나지 않는다."""
+def test_bar_audit_no_longer_claims_to_see_trailing(): 
+    """2026-09-02 뒤집음. 옛 판정은 저가 185가 고점 200 대비 -7.5%라며
+    "take_profit_trail"을 돌려줬다 — 일봉은 저가와 고점의 시간 순서를 안 주는데도.
+    안전장치가 구간으로 트레일링을 안 보게 됐으므로 사후 판정도 안 본다. 둘이
+    어긋나면 사후 판정이 실제로는 나가지 않았을 매도를 "놓쳤다"고 보고한다."""
     position = _position(entry_price=100.0, peak_price=200.0, take_profit_stage=1)
 
-    assert sell.threshold_crossed_in_bar(position, _bar(low=190.0, high=200.0)) is None
-    assert sell.threshold_crossed_in_bar(position, _bar(low=185.0, high=200.0)) == "take_profit_trail"
+    assert sell.threshold_crossed_in_bar(position, _bar(low=185.0, high=200.0)) is None
+    # 손절은 진입가 기준이라 순서와 무관 — 그대로 잡힌다.
+    assert sell.threshold_crossed_in_bar(position, _bar(low=89.0, high=200.0)) == "stop_loss"
 
 
 def test_bar_audit_prefers_stop_loss_when_both_ends_crossed():
@@ -674,30 +677,39 @@ def _quote(price, low=None, high=None):
     return kis.Quote(price=price, day_low=low, day_high=high)
 
 
-def test_day_range_catches_the_dip_the_minute_samples_walked_past():
-    """2026-08-27 192820 그대로. 09:01 분봉은 280,000에 열려 278,000에 닫혔고
-    그 사이 271,000을 찍었다 — 트레일 라인 275,745를 지났는데 현재가 샘플로는
-    한 번도 안 잡혔다."""
+def test_day_range_no_longer_judges_trailing():
+    """2026-09-02 뒤집음. 8/27 192820 시나리오(저가 271,000이 트레일 라인 275,745를
+    지났다)는 예전엔 구간 판정으로 팔았지만 이제 안 판다 — 저가가 고점보다 먼저
+    찍혔는지를 알 수 없기 때문이다(_threshold_crossed docstring)."""
     position = _position(entry_price=232000.0, peak_price=296500.0, take_profit_stage=4)
 
-    action, from_range = sell.evaluate_with_day_range(
+    assert sell.evaluate_with_day_range(
         position, _quote(278000.0, low=271000.0, high=280000.0), today=TODAY
-    )
+    ) == (None, False)
 
-    assert from_range is True
-    assert action.reason == "take_profit_trail"
+
+def test_the_rally_that_sold_a_position_on_2026_09_02():
+    """실제로 나간 오발동. 192820의 당일 저가 271,000은 09:00에, 고가 292,000은
+    13:28에 찍혔다. 저가가 4시간 반 먼저였는데도 13:29에 "고점 대비 -7.19%"로 팔렸다
+    — 가격이 올라가면서 이미 지나간 저가가 트레일 라인 아래로 들어간 것이다.
+    이제는 안 판다."""
+    position = _position(entry_price=232000.0, peak_price=292000.0, take_profit_stage=6)
+
+    assert sell.evaluate_with_day_range(
+        position, _quote(291500.0, low=271000.0, high=292000.0), today=TODAY
+    ) == (None, False)
 
 
 def test_day_range_trigger_executes_at_the_current_price_not_the_low():
     """꼬리 바닥에 파는 게 아니라 "닿았으니 지금 정리"다 — SellAction은 가격을 담지
-    않고, 집행부가 넘겨받은 현재가로 판다(pipeline.finalize_sell)."""
-    position = _position(entry_price=232000.0, peak_price=296500.0, take_profit_stage=4)
+    않고, 집행부가 넘겨받은 현재가로 판다(pipeline.finalize_sell). 트레일링이 빠진
+    뒤에도 이 규약은 손절·첫 익절에 그대로 남는다."""
+    position = _position(entry_price=100.0, peak_price=100.0)
 
-    action, _ = sell.evaluate_with_day_range(
-        position, _quote(278000.0, low=271000.0, high=280000.0), today=TODAY
-    )
+    action, from_range = sell.evaluate_with_day_range(position, _quote(95.0, low=88.0), today=TODAY)
 
-    assert action.sell_fraction == sell.DEFAULT_EXIT_PLAN.take_profit_fraction
+    assert from_range is True
+    assert action.reason == "stop_loss" and action.sell_fraction == 1.0
 
 
 def test_a_point_trigger_is_not_reported_as_a_range_trigger():
@@ -710,38 +722,16 @@ def test_a_point_trigger_is_not_reported_as_a_range_trigger():
     assert action.reason == "stop_loss"
 
 
-def test_range_triggered_trailing_fires_once_a_day():
-    """당일 저가는 한 번 라인 아래로 내려가면 그날 내내 아래다. 막지 않으면 남은
-    회차마다 계속 팔려 하루에 전량이 나간다."""
-    position = _position(
-        entry_price=232000.0, peak_price=296500.0, take_profit_stage=4, range_trigger_day=TODAY
-    )
-
-    action, from_range = sell.evaluate_with_day_range(
-        position, _quote(278000.0, low=271000.0, high=280000.0), today=TODAY
-    )
-
-    assert action is None and from_range is False
+def test_the_once_a_day_range_guard_is_gone_field_and_all():
+    """하루 1회 제한(range_trigger_day)은 구간 트레일링 때문에 있었다. 트레일링이
+    빠지면서 걸릴 일이 없어졌으므로 필드째 걷어냈다 — 값만 남겨두면 이 경로가
+    실제보다 촘촘해 보인다(sector_concentration_limit 폐기 때와 같은 처리)."""
+    assert "range_trigger_day" not in Position.model_fields
 
 
-def test_yesterdays_range_trigger_does_not_block_today():
-    position = _position(
-        entry_price=232000.0,
-        peak_price=296500.0,
-        take_profit_stage=4,
-        range_trigger_day=date(2026, 8, 26),
-    )
-
-    action, from_range = sell.evaluate_with_day_range(
-        position, _quote(278000.0, low=271000.0, high=280000.0), today=TODAY
-    )
-
-    assert from_range is True and action is not None
-
-
-def test_range_stop_loss_is_not_limited_to_once_a_day():
-    """손절은 전량 매도라 포지션이 사라진다 — 반복될 수가 없어서 제한을 걸지 않는다."""
-    position = _position(entry_price=100.0, peak_price=100.0, range_trigger_day=TODAY)
+def test_range_stop_loss_repeats_until_the_position_is_gone():
+    """손절은 전량 매도라 포지션이 사라진다 — 반복될 수가 없어서 제한이 필요 없다."""
+    position = _position(entry_price=100.0, peak_price=100.0)
 
     action, from_range = sell.evaluate_with_day_range(position, _quote(95.0, low=88.0), today=TODAY)
 
@@ -753,6 +743,64 @@ def test_no_day_range_means_the_old_point_only_behaviour():
     position = _position(entry_price=232000.0, peak_price=296500.0, take_profit_stage=4)
 
     assert sell.evaluate_with_day_range(position, _quote(278000.0), today=TODAY) == (None, False)
+
+
+# --- 트레일링 매도 후의 고점 리셋 (2026-09-02) ---
+
+
+def test_the_peak_reset_survives_the_days_high():
+    """리셋의 요점은 "다음 구간을 새 고점부터 추적한다"인데, day_high >= 현재가는
+    항상 참이라 update_peak_price가 다음 회차에 반드시 되돌렸다. 그래서 리셋한
+    날에는 day_high를 안 본다."""
+    portfolio = PortfolioState(
+        cash_weight=0.5,
+        positions=[_position(entry_price=232000.0, peak_price=292000.0, take_profit_stage=5, quantity=9)],
+    )
+    action = SellAction(ticker="005930", reason="take_profit_trail", sell_fraction=1 / 3)
+
+    after = sell.execute_sell(portfolio, action, current_price=271000.0, today=TODAY)
+    position = after.positions[0]
+    assert position.peak_price == 271000.0 and position.peak_reset_day == TODAY
+
+    # 같은 날 그날의 고가가 다시 들어와도 리셋은 유지된다.
+    assert sell.update_peak_price(position, 271000.0, day_high=292000.0, today=TODAY) is position
+
+
+def test_the_peak_reset_expires_the_next_day():
+    """리셋은 그날 한정이다 — 다음 날의 고가는 리셋 이후 구간이라 정상적으로 잡아야
+    한다. 안 그러면 고점이 영원히 리셋 값에 묶여 트레일 라인이 안 올라간다."""
+    position = _position(
+        entry_price=232000.0, peak_price=271000.0, take_profit_stage=6, peak_reset_day=TODAY
+    )
+
+    tomorrow = date(2026, 8, 28)
+    updated = sell.update_peak_price(position, 285000.0, day_high=292000.0, today=tomorrow)
+
+    assert updated.peak_price == 292000.0
+
+
+def test_one_intraday_reversal_does_not_liquidate_the_whole_position():
+    """리셋이 매분 무효화되던 시절엔 -7% 반락 한 번에 9주가 5분 만에 전량 나갔다
+    (2026-09-02 발견). 설계 의도는 트리거당 1/3이다."""
+    portfolio = PortfolioState(
+        cash_weight=0.5,
+        positions=[_position(entry_price=232000.0, peak_price=292000.0, take_profit_stage=5, quantity=9)],
+    )
+    price, day_high = 271000.0, 292000.0  # 고가 292,000에서 반락한 뒤 그대로 횡보
+
+    sells = 0
+    for _ in range(5):
+        position = portfolio.positions[0]
+        position = sell.update_peak_price(position, price, day_high=day_high, today=TODAY)
+        portfolio = PortfolioState(positions=[position], cash_weight=portfolio.cash_weight)
+        action = sell.evaluate_deterministic_sell(position, price)
+        if action is None:
+            continue
+        sells += 1
+        portfolio = sell.execute_sell(portfolio, action, price, today=TODAY)
+
+    assert sells == 1
+    assert portfolio.positions[0].quantity == 6
 
 
 def test_peak_uses_the_days_high_not_just_the_sample():

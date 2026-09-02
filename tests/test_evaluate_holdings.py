@@ -780,12 +780,13 @@ def _quotes(monkeypatch, price, low=None, high=None):
     )
 
 
-def test_a_dip_the_samples_missed_still_sells_at_the_current_price(monkeypatch, tmp_path):
-    """2026-08-27 192820 재현. 현재가 278,000은 트레일 라인(275,745) 위라 점 판정으로는
-    안 잡히지만, 당일 저가 271,000이 이미 지났다 — 지금 가격에 익절한다."""
-    position = _position(entry_price=232000.0, peak_price=296500.0, take_profit_stage=4, quantity=8)
+def test_a_stop_loss_dip_the_samples_missed_still_sells_at_the_current_price(monkeypatch, tmp_path):
+    """2026-08-27에 이 경로를 만든 이유는 그대로다 — 매분 한 번 찍는 샘플은 두 샘플
+    사이를 스쳐간 가격을 못 본다. 손절은 기준이 진입가라 저가가 하루 중 언제
+    찍혔든 상관없으므로 구간 판정에 남아 있다."""
+    position = _position(entry_price=100.0, peak_price=100.0, quantity=8)
     portfolio = PortfolioState(cash_weight=0.90, positions=[position])
-    _quotes(monkeypatch, price=278000.0, low=271000.0, high=280000.0)
+    _quotes(monkeypatch, price=95.0, low=88.0, high=101.0)
 
     sold = []
 
@@ -797,47 +798,55 @@ def test_a_dip_the_samples_missed_still_sells_at_the_current_price(monkeypatch, 
 
     asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
 
-    assert sold == [("take_profit_trail", 278000.0)]
+    assert sold == [("stop_loss", 95.0)]
 
 
-def test_a_range_trigger_is_stamped_so_it_does_not_repeat_all_day(monkeypatch, tmp_path):
+def test_a_missed_trailing_dip_is_no_longer_sold_from_the_day_range(monkeypatch, tmp_path):
+    """2026-09-02 뒤집음. 같은 상황에서 예전엔 팔았다 — 당일 저가 271,000이 트레일
+    라인 아래라는 이유로. 그 저가가 고점보다 먼저 찍혔는지를 알 수 없으므로 이제
+    안 판다(sell._threshold_crossed)."""
     position = _position(entry_price=232000.0, peak_price=296500.0, take_profit_stage=4, quantity=8)
     portfolio = PortfolioState(cash_weight=0.90, positions=[position])
     _quotes(monkeypatch, price=278000.0, low=271000.0, high=280000.0)
 
-    result = asyncio.run(
-        pipeline.evaluate_holdings(
-            portfolio,
-            DAY,
-            sell.execute_sell_simulated,
-            log_path=tmp_path / "sell.jsonl",
-            trade_journal_log_path=tmp_path / "trade_journal.jsonl",
-        )
+    sold = []
+
+    async def fake_finalize(pf, action, pos, price, *a, **k):
+        sold.append(action.reason)
+        return pf
+
+    monkeypatch.setattr(pipeline, "finalize_sell", fake_finalize)
+
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    assert sold == []
+
+
+def test_an_intraday_reversal_sells_one_stage_not_the_whole_position(monkeypatch, tmp_path):
+    """매분 도는 회차 전체를 통과시켜 본다. 고점 리셋이 day_high로 되돌아가던 시절엔
+    회차마다 다시 팔려 -7% 반락 한 번에 전량이 나갔다(2026-09-02 발견)."""
+    position = _position(
+        entry_price=232000.0, peak_price=292000.0, take_profit_stage=5, quantity=9
     )
-
-    stamped = [p for p in result.positions if p.ticker == "005930"]
-    assert stamped and stamped[0].range_trigger_day == pipeline._kst_today()
-
-
-def test_the_second_round_of_the_same_day_does_not_sell_again(monkeypatch, tmp_path):
-    """당일 저가는 그날 내내 라인 아래로 남는다 — 막지 않으면 매분 팔린다."""
-    position = _position(entry_price=232000.0, peak_price=296500.0, take_profit_stage=4, quantity=8)
     portfolio = PortfolioState(cash_weight=0.90, positions=[position])
-    _quotes(monkeypatch, price=278000.0, low=271000.0, high=280000.0)
+    _quotes(monkeypatch, price=271000.0, low=271000.0, high=292000.0)
 
     sells = []
 
-    async def counting_finalize(pf, action, *a, **k):
+    async def counting_finalize(pf, action, pos, price, *a, **k):
         sells.append(action.reason)
-        return pf
+        updated, _ = await sell.execute_sell_simulated(pf, action, price)
+        return updated
 
     monkeypatch.setattr(pipeline, "finalize_sell", counting_finalize)
 
-    portfolio = asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
-    portfolio = asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
-    portfolio = asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+    for _ in range(4):
+        portfolio = asyncio.run(
+            pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated)
+        )
 
     assert sells == ["take_profit_trail"]
+    assert portfolio.positions[0].quantity == 6
 
 
 def test_the_days_high_raises_the_peak(monkeypatch, tmp_path):
