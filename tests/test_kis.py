@@ -658,3 +658,41 @@ def test_fetch_quote_returns_none_when_request_fails(monkeypatch, real_fetch_quo
     monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: None)
 
     assert kis.fetch_quote("192820") is None
+
+
+# --- 시세 신선도 판별 필드 (2026-09-02) ---
+#
+# 응답에 "언제 찍힌 시세인가"가 없다. 전일 종가를 역산해두면 개장 직후 받은 값이
+# 당일 것인지 전일 것인지 사후에 가릴 수 있다(pipeline._log_quote_freshness_at_open).
+
+
+def test_fetch_quote_derives_the_previous_close(monkeypatch, real_fetch_quote):
+    payload = {
+        "rt_cd": "0",
+        "output": {"stck_prpr": "283000", "stck_oprc": "285000", "prdy_vrss": "-4000"},
+    }
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: payload)
+
+    quote = kis.fetch_quote("192820")
+
+    assert quote.open_price == 285000
+    assert quote.prev_close == 287000  # 283,000 - (-4,000)
+
+
+def test_fetch_quote_reads_an_unchanged_previous_close(monkeypatch, real_fetch_quote):
+    """보합이면 prdy_vrss가 0이다. 고가/저가처럼 "0은 없는 값"으로 처리하면
+    보합인 날의 전일 종가가 통째로 사라진다 — 부호 있는 값이라 규칙이 다르다."""
+    payload = {"rt_cd": "0", "output": {"stck_prpr": "283000", "prdy_vrss": "0"}}
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: payload)
+
+    assert kis.fetch_quote("192820").prev_close == 283000
+
+
+def test_fetch_quote_leaves_freshness_fields_none_when_absent(monkeypatch, real_fetch_quote):
+    """"안 재봤다"와 "0원"이 같은 모양이 되면 안 된다 — 장 시작 전 시가는 0으로 온다."""
+    payload = {"rt_cd": "0", "output": {"stck_prpr": "283000", "stck_oprc": "0"}}
+    monkeypatch.setattr(kis, "_kis_get", lambda path, tr_id, params, policy=None: payload)
+
+    quote = kis.fetch_quote("192820")
+
+    assert quote.open_price is None and quote.prev_close is None

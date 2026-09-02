@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -838,6 +838,46 @@ async def _audit_blackout_window(
     return len(targets), checked, crossed
 
 
+# 개장 직후 첫 회차가 정말 당일 시세를 보고 있는지 확인하기 위한 창(2026-09-02).
+# 09:00은 매분 크론, 09:01은 execute_open이 부른다 — 둘 다 남겨야 "09:00은 조용했고
+# 09:01에 팔렸다"를 같은 축에서 비교할 수 있다.
+QUOTE_FRESHNESS_WINDOW = (time(9, 0), time(9, 2))  # [09:00:00, 09:02:00)
+
+
+def _log_quote_freshness_at_open(quote_by_ticker: dict[str, kis.Quote]) -> None:
+    """개장 직후 회차가 받은 시세를 종목별로 한 줄씩 남긴다.
+
+    왜 필요한가 (2026-09-02): 그날 09:00:13 회차는 매도를 하나도 안 냈는데
+    (`evaluate_holdings_done sells=0`) 1분 뒤 09:01에 192820이 트레일링 익절로
+    팔렸다. 당시 시세가 전일 값(종가 287,000 / 저 285,500 / 고 306,500)이었다면
+    점 판정도 구간 판정도 고점 306,500 대비 -7%를 **아슬하게** 못 넘는 것과 정확히
+    맞는다(-6.36% / -6.85%). 그렇다면 그 회차의 "sells=0"은 문턱을 안 넘었다는
+    증거가 아니라 어제를 보고 있었다는 뜻이고, 둘은 완전히 다른 상태다
+    (이 파일이 `evaluate_holdings_done`을 매 회차 남기는 이유와 같은 구분이다).
+
+    **읽는 법**: `prev_close`가 직전 거래일 종가면 당일 시세다. 그 전 거래일 종가면
+    전일 스냅샷을 받은 것이다. `inquire-price` 응답에는 시각 필드가 없어서
+    (kis.Quote) 이 역산이 유일한 단서다. 추가 조회는 없다.
+
+    개장 창 밖에서는 아무것도 안 남긴다 — 매분 390회씩 찍으면 로그가 이걸로 덮인다.
+    """
+    start, end = QUOTE_FRESHNESS_WINDOW
+    if not (start <= datetime.now(KST).time() < end):
+        return
+
+    for ticker, quote in quote_by_ticker.items():
+        logger.info(
+            "quote_at_open ticker=%s price=%s open=%s high=%s low=%s prev_close=%s "
+            "— prev_close가 직전 거래일 종가면 당일 시세, 그 전 거래일 종가면 전일 시세다",
+            ticker,
+            quote.price,
+            quote.open_price,
+            quote.day_high,
+            quote.day_low,
+            quote.prev_close,
+        )
+
+
 async def evaluate_holdings(
     portfolio: PortfolioState,
     day: datetime,
@@ -889,6 +929,8 @@ async def evaluate_holdings(
         quote_by_ticker[position.ticker] = quote
 
     price_by_ticker = {t: q.price for t, q in quote_by_ticker.items()}
+
+    _log_quote_freshness_at_open(quote_by_ticker)
 
     # 한 종목도 못 받았으면 이 회차는 손절·익절을 **아무것도 판정하지 않았다** —
     # 문턱을 넘지 않아서 조용한 것과 눈을 감아서 조용한 것은 전혀 다른데, 지금까지

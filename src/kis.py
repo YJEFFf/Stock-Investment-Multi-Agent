@@ -384,17 +384,26 @@ def fetch_daily_ohlcv(
 
 @dataclass(frozen=True)
 class Quote:
-    """시세 한 건. 현재가 + **당일 고가/저가**.
+    """시세 한 건. 현재가 + **당일 고가/저가** + 신선도 판별용 시가/전일 종가.
 
     당일 고가/저가는 원래부터 `inquire-price` 응답에 같이 들어 있었는데
     (`stck_hgpr`/`stck_lwpr`) 2026-08-27까지 버리고 `stck_prpr`만 썼다. 매분
     390번씩 받아놓고 안 쓴 셈이다 — 그 두 숫자가 "분당 1회 샘플링이 스쳐 지나간
     가격"을 복원하는 유일한 무료 단서다(sell.evaluate_deterministic_sell).
+
+    open_price/prev_close도 같은 응답의 다른 필드다(2026-09-02 추가, 추가 호출 없음).
+    **이 응답에는 "언제 찍힌 시세인가"를 말해주는 필드가 없다** — 그래서 개장 직후
+    받은 값이 당일 것인지 전일 것인지 구분할 방법이 이 둘뿐이다. prev_close는
+    `stck_prpr - prdy_vrss`로 역산한다: 직전 거래일 종가가 나오면 당일 시세고,
+    그 전 거래일 종가가 나오면 전일 스냅샷을 받은 것이다
+    (pipeline._log_quote_freshness_at_open).
     """
 
     price: float
     day_high: float | None = None
     day_low: float | None = None
+    open_price: float | None = None
+    prev_close: float | None = None
 
 
 def fetch_quote(ticker: str, *, policy: RetryPolicy = DEFAULT_POLICY) -> Quote | None:
@@ -419,10 +428,28 @@ def fetch_quote(ticker: str, *, policy: RetryPolicy = DEFAULT_POLICY) -> Quote |
         return value if value > 0 else None
 
     try:
-        return Quote(price=float(price_str), day_high=_optional("stck_hgpr"), day_low=_optional("stck_lwpr"))
+        price = float(price_str)
     except ValueError:
         logger.warning("kis_price_unparseable ticker=%s raw=%s", ticker, price_str)
         return None
+
+    # 전일 대비는 부호가 있고 보합이면 0이라 _optional(>0만 통과)로는 못 읽는다.
+    # 역산한 전일 종가가 양수일 때만 채운다 — 못 읽으면 None으로 남긴다("모른다"와
+    # "0원"을 같은 모양으로 만들지 않는다).
+    try:
+        prev_close = price - float(output.get("prdy_vrss"))
+    except (TypeError, ValueError):
+        prev_close = None
+    if prev_close is not None and prev_close <= 0:
+        prev_close = None
+
+    return Quote(
+        price=price,
+        day_high=_optional("stck_hgpr"),
+        day_low=_optional("stck_lwpr"),
+        open_price=_optional("stck_oprc"),
+        prev_close=prev_close,
+    )
 
 
 def fetch_current_price(ticker: str, *, policy: RetryPolicy = DEFAULT_POLICY) -> float | None:

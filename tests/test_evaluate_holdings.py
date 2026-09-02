@@ -849,6 +849,63 @@ def test_an_intraday_reversal_sells_one_stage_not_the_whole_position(monkeypatch
     assert portfolio.positions[0].quantity == 6
 
 
+# --- 개장 직후 시세가 당일 것인지 (2026-09-02) ---
+
+
+def _clock_at(monkeypatch, hh, mm, ss=0):
+    """pipeline이 보는 시계만 KST로 고정한다."""
+    import datetime as _dt
+
+    fixed = _dt.datetime(2026, 9, 3, hh, mm, ss, tzinfo=pipeline.KST)
+
+    class _Clock(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed.astimezone(tz) if tz else fixed
+
+    monkeypatch.setattr(pipeline, "datetime", _Clock)
+
+
+def _run_once(monkeypatch, quote):
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position(quantity=8)])
+    monkeypatch.setattr(kis, "fetch_quote", lambda ticker, policy=None: quote)
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+
+def test_the_open_round_records_what_the_quote_actually_was(monkeypatch, caplog):
+    """09:00 회차의 sells=0이 "문턱을 안 넘었다"인지 "어제를 보고 있었다"인지
+    가르는 유일한 단서다 — 응답에 시각 필드가 없다(kis.Quote)."""
+    _clock_at(monkeypatch, 9, 0, 13)
+    quote = kis.Quote(price=278500.0, day_high=278500.0, day_low=271000.0,
+                      open_price=278500.0, prev_close=285500.0)
+
+    with caplog.at_level("INFO", logger="src.pipeline"):
+        _run_once(monkeypatch, quote)
+
+    line = next(r.getMessage() for r in caplog.records if "quote_at_open" in r.getMessage())
+    assert "price=278500.0" in line and "prev_close=285500.0" in line
+
+
+def test_the_execute_open_round_is_recorded_too(monkeypatch, caplog):
+    """09:01은 execute_open이 부른다. 09:00과 같은 축에 있어야 둘을 비교할 수 있다."""
+    _clock_at(monkeypatch, 9, 1, 24)
+
+    with caplog.at_level("INFO", logger="src.pipeline"):
+        _run_once(monkeypatch, kis.Quote(price=280000.0, prev_close=287000.0))
+
+    assert any("quote_at_open" in r.getMessage() for r in caplog.records)
+
+
+def test_the_rest_of_the_day_is_not_recorded(monkeypatch, caplog):
+    """매분 390회 x 보유 종목 수만큼 찍으면 로그가 이걸로 덮인다."""
+    _clock_at(monkeypatch, 9, 2, 0)
+
+    with caplog.at_level("INFO", logger="src.pipeline"):
+        _run_once(monkeypatch, kis.Quote(price=280000.0, prev_close=287000.0))
+
+    assert not any("quote_at_open" in r.getMessage() for r in caplog.records)
+
+
 def test_the_days_high_raises_the_peak(monkeypatch, tmp_path):
     """2026-08-26에 놓친 것 — 기록 고점 296,500, 실제 고가 297,000."""
     position = _position(entry_price=232000.0, peak_price=296500.0, take_profit_stage=4, quantity=8)
