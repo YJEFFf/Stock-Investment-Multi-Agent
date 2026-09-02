@@ -84,7 +84,13 @@ if day_high is not None and (position.entry_day == today or position.peak_reset_
 
 ### 배포
 
-@@DEPLOY@@
+`29a1500` push -> EC2 `git pull`. **489 passed / 5 skipped**(로컬·EC2 동일),
+크론 안 건드림(6줄 그대로).
+
+- 운영 상태 파일 로드 확인: 7종목 정상, 192820은 `peak_reset_day=None`
+  (옛 `range_trigger_day="2026-09-02"` 값은 무시되고 다음 저장 때 사라진다).
+- **다음 09:00 회차부터 적용된다.** 오늘 나간 매도 2건은 소급되지 않는다 — 09:01
+  건은 수정 후에도 그대로 나갔을 정상 매도이고, 13:29 건은 이미 체결됐다.
 
 ---
 
