@@ -804,7 +804,7 @@ def _replace_children(page_id: str, children: list[dict]) -> bool:
 async def sync_trade_journal(
     trade_journal_log_path: Path,
     database_id: str,
-    state_path: Path = DEFAULT_SYNC_STATE_PATH,
+    state_path: Path | None = None,
 ) -> dict:
     """logs/trade_journal.jsonl에서 아직 노션에 안 올라간 이벤트만 새로 올린다.
 
@@ -818,6 +818,7 @@ async def sync_trade_journal(
     틀린 값을 들고 있게 된다. 그때마다 일회용 스크립트로 페이지를 찾아 고치는 걸
     세 번 반복한 뒤 여기로 들여왔다.
     """
+    state_path = state_path or DEFAULT_SYNC_STATE_PATH
     if not trade_journal_log_path.exists():
         return {"synced": 0, "updated": 0, "failed": 0, "skipped": 0}
 
@@ -1141,9 +1142,9 @@ async def sync_daily_report(
     day: str,
     portfolio: PortfolioState,
     database_id: str,
-    pipeline_log_path: Path = DEFAULT_PIPELINE_LOG_PATH,
-    trade_journal_log_path: Path = DEFAULT_TRADE_JOURNAL_LOG_PATH,
-    state_path: Path = DEFAULT_DAILY_REPORT_STATE_PATH,
+    pipeline_log_path: Path | None = None,
+    trade_journal_log_path: Path | None = None,
+    state_path: Path | None = None,
     account: kis.AccountSnapshot | None = None,
 ) -> bool:
     """하루에 한 번, 장 마감 뒤 그날의 판단·매수·매도·최종 보유 종목을 요약해
@@ -1162,6 +1163,9 @@ async def sync_daily_report(
     같은 날짜로 이미 만든 적 있으면(로컬 state 파일 기준) 다시 안 만든다 —
     run_daily.py가 같은 날 재실행돼도 중복 리포트가 안 생기게.
     """
+    pipeline_log_path = pipeline_log_path or DEFAULT_PIPELINE_LOG_PATH
+    trade_journal_log_path = trade_journal_log_path or DEFAULT_TRADE_JOURNAL_LOG_PATH
+    state_path = state_path or DEFAULT_DAILY_REPORT_STATE_PATH
     synced_days = _load_synced_days(state_path)
     if day in synced_days:
         logger.info("notion_daily_report_skipped day=%s reason=already_synced", day)

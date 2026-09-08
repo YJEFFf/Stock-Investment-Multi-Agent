@@ -235,7 +235,7 @@ async def execute_buy_order(
     portfolio: PortfolioState,
     sector: str,
     trade_weight: float,
-    log_path: Path = DEFAULT_TRADE_JOURNAL_LOG_PATH,
+    log_path: Path | None = None,
 ) -> PortfolioState:
     """게이트를 통과한 BUY를 실제 KIS 모의투자 시장가 주문으로 집행한다.
 
@@ -250,6 +250,7 @@ async def execute_buy_order(
     정확하진 않다. 포지션을 추가매수하는 경우는 드물어 이 근사로 충분하다고
     본다).
     """
+    log_path = log_path or DEFAULT_TRADE_JOURNAL_LOG_PATH
     if not (decision.action == "BUY" and gate_result.approved):
         return portfolio
 
@@ -655,7 +656,7 @@ async def run_daily(
     judge_fn: JudgeFn,
     execute_fn: ExecuteFn,
     total_expected_analysts: int = 1,
-    log_path: Path = DEFAULT_LOG_PATH,
+    log_path: Path | None = None,
 ) -> tuple[PortfolioState, list[tuple[Decision, GateResult]]]:
     """하루치 전체 파이프라인 진입점: 코스피200 유니버스 구성 -> 정량 필터 ->
     run_day(analyst_fn, judge_fn, execute_fn). 유니버스 조회 자체가 실패하면(네이버
@@ -666,6 +667,7 @@ async def run_daily(
     쓸지 무비용 경로(propose_decision/execute_simulated)를 쓸지 호출부가 항상
     명시해야 실수로 비용이나 실주문이 나가지 않는다.
     """
+    log_path = log_path or DEFAULT_LOG_PATH
     universe = await build_universe_with_sectors()
     if universe is None:
         logger.error("run_daily_aborted day=%s reason=universe_fetch_failed", day.date().isoformat())
@@ -693,7 +695,7 @@ async def run_day(
     judge_fn: JudgeFn,
     execute_fn: ExecuteFn,
     total_expected_analysts: int = 1,
-    log_path: Path = DEFAULT_LOG_PATH,
+    log_path: Path | None = None,
 ) -> tuple[PortfolioState, list[tuple[Decision, GateResult]]]:
     """유니버스(종목, 섹터)를 순회하며 분석→판단→게이트→집행을 실행하고 로그를 남긴다.
 
@@ -703,6 +705,7 @@ async def run_day(
     실제 LLM 토론+매니저(judgment.judge)·실제 KIS 주문(execute_buy_order)인지 호출부가
     항상 명시적으로 골라야 한다.
     """
+    log_path = log_path or DEFAULT_LOG_PATH
     raw_results = await asyncio.gather(
         *(analyst_fn(ticker, sector, day) for ticker, sector in universe), return_exceptions=True
     )
@@ -884,8 +887,8 @@ async def evaluate_holdings(
     sell_execute_fn: SellExecuteFn,
     analyst_fn: AnalystFn | None = None,
     judge_sell_fn: JudgeSellFn | None = None,
-    log_path: Path = DEFAULT_SELL_LOG_PATH,
-    trade_journal_log_path: Path = DEFAULT_TRADE_JOURNAL_LOG_PATH,
+    log_path: Path | None = None,
+    trade_journal_log_path: Path | None = None,
 ) -> PortfolioState:
     """보유 포지션 전체를 매일 재평가한다 — 결정론적 안전장치(손절/트레일링
     익절, src/sell.py)는 항상 돌고, LLM 재량 매도(judgment.judge_sell)는
@@ -906,6 +909,8 @@ async def evaluate_holdings(
     이유가 없다. 가격 조회가 실패한 종목은 오늘 평가를 건너뛴다(collectors/kis
     단에서 이미 재시도를 소진한 뒤라 여기서 다시 재시도하지 않는다, 규칙 4).
     """
+    log_path = log_path or DEFAULT_SELL_LOG_PATH
+    trade_journal_log_path = trade_journal_log_path or DEFAULT_TRADE_JOURNAL_LOG_PATH
     if not portfolio.positions:
         return portfolio
 

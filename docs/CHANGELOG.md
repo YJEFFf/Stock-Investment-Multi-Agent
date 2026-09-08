@@ -49,7 +49,7 @@ dust 청산 2주 전량.
 
 9/2에 추가한 개장 시세 테스트 3개가 `finalize_sell`을 목킹하지 않은 채
 `evaluate_holdings`를 통과시켰다. 진입가 100원짜리 테스트 포지션이 +20% 익절 문턱을
-넘어 **가짜 매도 3건**이 운영 `sell.jsonl`·`trade_journal.jsonl`에 적혔고,
+넘어 **가짜 매도가** 운영 `sell.jsonl`·`trade_journal.jsonl`에 적혔고,
 **9/3 09:01 노션 동기화(`synced=3`)로 매매일지 페이지 3개까지 생겼다.**
 
 실제 KIS 주문은 안 나갔다(`_never_reach_the_real_broker`). `portfolio_state.json`,
@@ -70,7 +70,31 @@ dust 청산 2주 전량.
   "오늘 체결 없음"이 되어버리므로 고가·저가를 현재가로 채웠다 — 안 그러면 매도를
   검증하는 테스트가 전부 조용히 통과한다(아무것도 판정 안 했는데 "매도 안 남").
 
-**오염 3건 제거는 장 마감 후에 한다**(사용자 확정) — 1분 크론이 같은 파일에 append하는
+### 그리고 그 격리 수정이 실제로는 안 먹었다 — 정의 시점 기본 인자
+
+모듈 상수를 전부 등록하고 배포한 뒤 EC2에서 테스트를 돌렸더니 **매매일지에 한 행이
+또 적혔다**(13:56:55). `scripts/purge_journal_entries.py` 드라이런이 3행이 아니라
+4행을 세면서 드러났다.
+
+```python
+def evaluate_holdings(..., log_path: Path = DEFAULT_SELL_LOG_PATH):   # 정의 시점에 묶인다
+```
+
+**파이썬은 기본 인자를 def 시점에 평가한다.** import 때 이미 운영 경로 객체가
+시그니처에 박히므로, 나중에 `monkeypatch.setattr(pipeline, "DEFAULT_SELL_LOG_PATH", tmp)`를
+해도 그 기본값은 안 바뀐다. 격리가 통째로 무효였다. `judgment`만 무사했던 건
+거기가 `path = log_path or DEFAULT_...`로 **호출 시점에** 해석하고 있었기 때문이다.
+
+- `src` 전체에서 이런 인자 10개(pipeline 5 / notion_sync 4 / llm 1)를
+  `Path | None = None` + 함수 안 해석으로 바꿨다.
+- 가드 테스트에 두 번째 검사를 붙였다: `inspect.signature`로 **함수 기본값까지** 훑는다.
+  일부러 하나를 되돌려 실제로 깨지는 것을 확인했다.
+- `tests/test_end_to_end_workflow.py`는 chdir로 스스로 격리하고 **기본 경로가 실제로
+  쓰이는 것 자체**를 검증하므로, 그 테스트에서만 상대 경로 기본값을 되돌려 준다.
+
+`500 passed / 5 skipped`.
+
+**오염 4건 제거는 장 마감 후에 한다**(사용자 확정) — 1분 크론이 같은 파일에 append하는
 동안 읽기->쓰기로 덮으면 진짜 매도 기록이 사라질 수 있다. 대상 노션 페이지 ID 3개는
 `notion_sync_state.json`에서 확인해뒀다.
 

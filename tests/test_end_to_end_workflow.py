@@ -70,6 +70,17 @@ async def _fake_call_structured(*, system, user, response_model, json_schema, **
 def test_full_daily_workflow_sell_then_buy_end_to_end(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)  # logs/*.jsonl, portfolio_state.json 전부 tmp_path 밑으로
 
+    # 이 테스트는 chdir로 스스로 격리하므로 상대 경로 기본값을 되돌린다.
+    # conftest._isolate_default_state_paths는 절대 경로로 덮어쓰는데, 여기서는
+    # **기본 경로가 실제로 쓰이는 것 자체**를 검증한다 — 운영에서 아무 인자도 안
+    # 넘겼을 때 매매일지가 어디에 떨어지는지가 이 테스트의 관심사다.
+    for module, name, relative in (
+        (rd.pipeline, "DEFAULT_LOG_PATH", "logs/pipeline.jsonl"),
+        (rd.pipeline, "DEFAULT_SELL_LOG_PATH", "logs/sell.jsonl"),
+        (rd.pipeline, "DEFAULT_TRADE_JOURNAL_LOG_PATH", "logs/trade_journal.jsonl"),
+    ):
+        monkeypatch.setattr(module, name, Path(relative))
+
     # --- 초기 포트폴리오: 손절선을 넘은 보유 종목 하나 ---
     held = Position(
         ticker=HELD_TICKER,

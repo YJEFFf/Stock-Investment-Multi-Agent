@@ -76,7 +76,7 @@ async def call_structured(
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     effort: str = DEFAULT_EFFORT,
     label: str = "unknown",
-    log_path: Path = DEFAULT_LLM_CALL_LOG_PATH,
+    log_path: Path | None = None,
 ) -> T:
     """구조화 출력을 받아 response_model로 검증한다.
 
@@ -91,6 +91,7 @@ async def call_structured(
     분석가·토론·매니저가 공유하는 통로라 여기서 남기지 않으면 나중에 호출별
     분석가 귀속이 불가능해진다.
     """
+    log_path = log_path or DEFAULT_LLM_CALL_LOG_PATH
     last_error: Exception | None = None
     total_input_tokens = 0
     total_output_tokens = 0
