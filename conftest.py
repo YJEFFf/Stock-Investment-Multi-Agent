@@ -45,10 +45,29 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     등록을 잊으면 조용히 운영 기록이 오염되고, 그 기록들은 하나같이 "사후에 무슨
     일이 있었는지 보려고" 만든 것이라 가짜 줄이 섞이는 순간 목적을 잃는다.
     개별 테스트가 명시적으로 경로를 넘기는 건 이 픽스처와 무관하게 그대로 동작한다.
+
+    2026-09-08에 네 번째로 났고, 이번엔 **가장 중요한 두 개가 애초에 등록되어 있지
+    않았다**: `pipeline`의 매도 로그와 매매일지. 9/2에 추가한 개장 시세 테스트가
+    `finalize_sell`을 목킹하지 않은 채 evaluate_holdings를 통과시켰고(진입가 100원
+    포지션이 +20% 익절 문턱을 넘는다), 가짜 매도 3건이 운영 `sell.jsonl`·
+    `trade_journal.jsonl`에 적힌 뒤 다음 날 노션 매매일지까지 동기화됐다.
+    그래서 이제 **`src` 전체의 `logs/` 기본값을 빠짐없이 등록한다.**
     """
-    from src import judgment
+    from src import judgment, llm, notion_sync, pipeline, portfolio_store
 
     monkeypatch.setattr(judgment, "DEFAULT_SELL_JUDGMENT_LOG_PATH", tmp_path / "sell_judgment.jsonl")
+    monkeypatch.setattr(pipeline, "DEFAULT_LOG_PATH", tmp_path / "pipeline.jsonl")
+    monkeypatch.setattr(pipeline, "DEFAULT_SELL_LOG_PATH", tmp_path / "sell.jsonl")
+    monkeypatch.setattr(pipeline, "DEFAULT_TRADE_JOURNAL_LOG_PATH", tmp_path / "trade_journal.jsonl")
+    monkeypatch.setattr(llm, "DEFAULT_LLM_CALL_LOG_PATH", tmp_path / "llm_calls.jsonl")
+    monkeypatch.setattr(notion_sync, "DEFAULT_PIPELINE_LOG_PATH", tmp_path / "pipeline.jsonl")
+    monkeypatch.setattr(notion_sync, "DEFAULT_TRADE_JOURNAL_LOG_PATH", tmp_path / "trade_journal.jsonl")
+    monkeypatch.setattr(
+        notion_sync, "DEFAULT_DAILY_REPORT_STATE_PATH", tmp_path / "notion_daily_report_state.json"
+    )
+    monkeypatch.setattr(notion_sync, "DEFAULT_SYNC_STATE_PATH", tmp_path / "notion_sync_state.json")
+    monkeypatch.setattr(portfolio_store, "PORTFOLIO_STATE_PATH", tmp_path / "portfolio_state.json")
+    monkeypatch.setattr(portfolio_store, "PORTFOLIO_LOCK_PATH", tmp_path / "portfolio_state.lock")
 
 
 @pytest.fixture(autouse=True)
@@ -77,14 +96,20 @@ def _never_reach_the_real_broker(monkeypatch):
 def _quote_follows_the_price_mock(monkeypatch):
     """`fetch_quote`가 기본적으로 `fetch_current_price`를 따라가게 한다.
 
-    당일 고가/저가는 없는 Quote가 나가므로 구간 판정은 꺼진 것과 같고, 기존 테스트의
+    당일 고가/저가를 현재가와 같게 둔다. 구간 판정은 low=high=현재가면 점 판정과
+    똑같아지므로(`sell._threshold_crossed` docstring) 꺼진 것과 같고, 기존 테스트의
     `fetch_current_price` 목킹이 그대로 유효하다. 당일 범위가 필요한 테스트는
     `fetch_quote`를 직접 목킹하면 이 픽스처를 덮어쓴다(monkeypatch 순서상 테스트가 나중).
+
+    **고가/저가를 None으로 두지 않는 이유**(2026-09-08): 그건 "오늘 아직 체결이
+    없다"는 뜻이고, 이제 그런 종목은 판정 자체를 건너뛴다(kis.Quote.traded_today).
+    None으로 두면 매도를 검증하는 테스트가 전부 조용히 통과해버린다 — 아무것도
+    판정하지 않았는데 "매도가 안 났다"로 보인다.
     """
     from src import kis
 
     def _quote(ticker, *, policy=None):
         price = kis.fetch_current_price(ticker, policy=policy)
-        return None if price is None else kis.Quote(price=price)
+        return None if price is None else kis.Quote(price=price, day_high=price, day_low=price)
 
     monkeypatch.setattr(kis, "fetch_quote", _quote)

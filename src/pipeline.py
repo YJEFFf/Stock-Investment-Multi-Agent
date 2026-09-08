@@ -980,6 +980,27 @@ async def evaluate_holdings(
 
     sells = 0
     for ticker, quote in quote_by_ticker.items():
+        # **오늘 체결이 아직 없으면 판정하지 않는다**(2026-09-08, 사용자 확정).
+        # 그 상태의 현재가는 오늘 가격이 아니라 기준가(전일 종가)라, 그대로 재면
+        # 어제 값으로 손절·익절을 판정하게 된다(kis.Quote.traded_today).
+        #
+        # "시세를 못 받았다"와는 다른 상태라 price_by_ticker에는 그대로 남긴다 —
+        # 여기서 빼면 개장 첫 회차마다 전 종목 실패로 잡혀 시세 공백 알림이
+        # 매일 아침 울린다. 받긴 받았고, 오늘 것이 아닐 뿐이다.
+        #
+        # 놓치는 것은 없다: 09:01 execute_open이 곧바로 다시 평가하고, 그때는
+        # 체결이 잡혀 있다. "판단 불가"와 "판단했으나 문턱 미달"을 같은 모양으로
+        # 두지 않는 것이 이 프로젝트의 규약이다(AnalystOpinion=None과 같은 패턴).
+        if not quote.traded_today:
+            logger.info(
+                "evaluate_holdings_pre_open_skipped ticker=%s price=%s prev_close=%s "
+                "— 당일 체결 없음(기준가). 이번 회차 판정 안 함",
+                ticker,
+                quote.price,
+                quote.prev_close,
+            )
+            continue
+
         current_price = quote.price
         position = next(p for p in portfolio.positions if p.ticker == ticker)
         position = sell.update_peak_price(

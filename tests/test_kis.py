@@ -688,6 +688,14 @@ def test_fetch_quote_reads_an_unchanged_previous_close(monkeypatch, real_fetch_q
     assert kis.fetch_quote("192820").prev_close == 283000
 
 
+def test_a_quote_without_a_days_range_has_not_traded_yet():
+    """개장 전엔 고가·저가가 둘 다 0으로 온다. 그 상태의 현재가는 기준가다."""
+    assert kis.Quote(price=149900.0, prev_close=149900.0).traded_today is False
+    assert kis.Quote(price=149700.0, day_high=151500.0, day_low=148700.0).traded_today is True
+    # 한쪽만 잡혀도 체결은 있었던 것이다.
+    assert kis.Quote(price=100.0, day_high=100.0).traded_today is True
+
+
 def test_fetch_quote_leaves_freshness_fields_none_when_absent(monkeypatch, real_fetch_quote):
     """"안 재봤다"와 "0원"이 같은 모양이 되면 안 된다 — 장 시작 전 시가는 0으로 온다."""
     payload = {"rt_cd": "0", "output": {"stck_prpr": "283000", "stck_oprc": "0"}}

@@ -405,6 +405,22 @@ class Quote:
     open_price: float | None = None
     prev_close: float | None = None
 
+    @property
+    def traded_today(self) -> bool:
+        """오늘 체결이 하나라도 잡혔는가.
+
+        당일 고가·저가는 **개장 전엔 둘 다 0으로 오고**(-> None) 첫 체결이 잡히는
+        순간 채워진다. 그때 `stck_prpr`은 오늘 가격이 아니라 기준가(전일 종가)다 —
+        2026-09-08에 `quote_at_open` 로그로 확인했다:
+
+            09:00:08  282330 price=149,900 high=None low=None prev_close=149,900
+            09:01:11  282330 price=149,700 high=151,500 low=148,700 prev_close=149,900
+
+        09:00 크론 회차가 이 상태를 자주 만난다(종목마다 다르다 — 시가단일가 체결이
+        잡히는 순서 차이다). 이걸 그냥 판정하면 **전일 종가로 손절·익절을 재게 된다.**
+        """
+        return self.day_high is not None or self.day_low is not None
+
 
 def fetch_quote(ticker: str, *, policy: RetryPolicy = DEFAULT_POLICY) -> Quote | None:
     """현재가와 당일 고가/저가를 한 번에. 추가 호출이 아니라 같은 응답의 다른 필드다."""

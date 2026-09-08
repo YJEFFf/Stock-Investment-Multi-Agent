@@ -775,6 +775,11 @@ def test_quiet_rounds_never_touch_the_daily_bar_api(monkeypatch, tmp_path):
 
 
 def _quotes(monkeypatch, price, low=None, high=None):
+    """당일 범위를 안 넘기면 현재가로 채운다 — 오늘 한 번 체결된 종목과 같은 모양이다.
+    None으로 두면 "오늘 체결 없음"이 되어 판정 자체가 건너뛰어진다
+    (kis.Quote.traded_today)."""
+    low = price if low is None else low
+    high = price if high is None else high
     monkeypatch.setattr(
         kis, "fetch_quote", lambda ticker, policy=None: kis.Quote(price=price, day_low=low, day_high=high)
     )
@@ -906,6 +911,66 @@ def test_the_rest_of_the_day_is_not_recorded(monkeypatch, caplog):
     assert not any("quote_at_open" in r.getMessage() for r in caplog.records)
 
 
+def test_a_pre_open_quote_is_not_judged(monkeypatch, caplog):
+    """09:00 회차가 자주 만나는 상태 — 당일 고가·저가가 둘 다 없고 현재가는 기준가
+    (전일 종가)다. 그대로 재면 어제 값으로 손절을 판정하게 된다."""
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position(quantity=8)])
+    # 진입가 100원 대비 -20%. 오늘 값이었다면 손절이 나갔어야 한다.
+    monkeypatch.setattr(
+        kis, "fetch_quote",
+        lambda ticker, policy=None: kis.Quote(price=80.0, day_high=None, day_low=None, prev_close=80.0),
+    )
+
+    sold = []
+
+    async def fake_finalize(pf, action, *a, **k):
+        sold.append(action.reason)
+        return pf
+
+    monkeypatch.setattr(pipeline, "finalize_sell", fake_finalize)
+
+    with caplog.at_level("INFO", logger="src.pipeline"):
+        asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    assert sold == []
+    assert any("evaluate_holdings_pre_open_skipped" in r.getMessage() for r in caplog.records)
+
+
+def test_a_pre_open_quote_is_not_a_price_outage(monkeypatch, caplog):
+    """"시세를 못 받았다"와 "받았는데 오늘 것이 아니다"는 다른 상태다. 섞으면 개장
+    첫 회차마다 전 종목 실패로 잡혀 시세 공백 알림이 매일 아침 울린다."""
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position(quantity=8)])
+    monkeypatch.setattr(
+        kis, "fetch_quote",
+        lambda ticker, policy=None: kis.Quote(price=100.0, day_high=None, day_low=None, prev_close=100.0),
+    )
+
+    with caplog.at_level("INFO", logger="src.pipeline"):
+        asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("all_prices_unavailable" in m for m in messages)
+    assert any("priced=1" in m for m in messages)  # 받긴 받았다
+
+
+def test_the_first_fill_of_the_day_turns_judgement_back_on(monkeypatch):
+    """체결이 하나라도 잡히면 고가·저가가 채워진다 — 그때부터는 정상 판정이다."""
+    portfolio = PortfolioState(cash_weight=0.90, positions=[_position(quantity=8)])
+    _quotes(monkeypatch, price=80.0)  # 헬퍼가 고가·저가를 현재가로 채운다
+
+    sold = []
+
+    async def fake_finalize(pf, action, *a, **k):
+        sold.append(action.reason)
+        return pf
+
+    monkeypatch.setattr(pipeline, "finalize_sell", fake_finalize)
+
+    asyncio.run(pipeline.evaluate_holdings(portfolio, DAY, sell.execute_sell_simulated))
+
+    assert sold == ["stop_loss"]
+
+
 def test_the_days_high_raises_the_peak(monkeypatch, tmp_path):
     """2026-08-26에 놓친 것 — 기록 고점 296,500, 실제 고가 297,000."""
     position = _position(entry_price=232000.0, peak_price=296500.0, take_profit_stage=4, quantity=8)
@@ -935,7 +1000,9 @@ def test_the_days_high_raises_the_peak(monkeypatch, tmp_path):
 def _wire_sell_with_fill(monkeypatch, price, *, fee_before=0.0, fee_after=None, observed_qty=None):
     """매도 체결 조회를 건다. 주문 전후 누적 집계를 흉내내 수수료 차까지 나오게 한다."""
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: price)
-    monkeypatch.setattr(kis, "fetch_quote", lambda ticker, policy=None: kis.Quote(price=price))
+    monkeypatch.setattr(
+        kis, "fetch_quote", lambda ticker, policy=None: kis.Quote(price=price, day_high=price, day_low=price)
+    )
     monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
 
     calls = {"n": 0}
@@ -1022,7 +1089,9 @@ def test_journal_scales_fee_up_when_fill_observation_is_partial(monkeypatch, tmp
 def test_journal_falls_back_to_fee_rate_when_broker_fee_unavailable(monkeypatch, tmp_path):
     """체결 조회 자체가 실패하면 수수료도 요율 계산으로 물러서되, 출처를 남긴다."""
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 120.0)
-    monkeypatch.setattr(kis, "fetch_quote", lambda ticker, policy=None: kis.Quote(price=120.0))
+    monkeypatch.setattr(
+        kis, "fetch_quote", lambda ticker, policy=None: kis.Quote(price=120.0, day_high=120.0, day_low=120.0)
+    )
     monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
     monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: None)
 
