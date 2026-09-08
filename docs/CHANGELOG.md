@@ -94,9 +94,25 @@ def evaluate_holdings(..., log_path: Path = DEFAULT_SELL_LOG_PATH):   # 정의 �
 
 `500 passed / 5 skipped`.
 
-**오염 4건 제거는 장 마감 후에 한다**(사용자 확정) — 1분 크론이 같은 파일에 append하는
-동안 읽기->쓰기로 덮으면 진짜 매도 기록이 사라질 수 있다. 대상 노션 페이지 ID 3개는
-`notion_sync_state.json`에서 확인해뒀다.
+### 오염 제거 — 15:57 완료
+
+장 마감 후(크론 쓰기 구간 밖)에 `purge_journal_entries.py --apply`를 돌렸다. 장중에
+안 한 이유는 1분 크론이 같은 파일에 append하는 동안 읽기->쓰기로 덮으면 진짜 매도
+기록이 사라지기 때문이다.
+
+```
+sell.jsonl        17행 -> 13행 (4행 제거)   backup: .bak-20260908-155708-purge
+trade_journal.jsonl 28행 -> 24행 (4행 제거)  backup: .bak-20260908-155708-purge
+notion_sync_state  키 4개 제거              backup: .json.bak-20260908-155709-purge
+```
+
+**노션 4페이지 중 3개가 `Can't edit block that is archived`로 아카이브 실패했다.**
+확인해 보니 넷 다 이미 `archived=True / in_trash=True`였다 — 3개는 그 전에 이미
+휴지통에 있었고, 15:36 동기화로 새로 생긴 4번째만 이번에 아카이브됐다. **결과 상태는
+의도한 그대로**라 추가 조치는 없다. 도구가 실패를 조용히 넘기지 않고 ERROR로 남긴
+덕에 확인하고 넘어갈 수 있었다.
+
+최종 확인: `sell.jsonl` / `trade_journal.jsonl` / `notion_sync_state.json` 전부 005930 0건.
 
 ### 수정 — 개장 전 시세로는 판정하지 않는다 (사용자 확정)
 
