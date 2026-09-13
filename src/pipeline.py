@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -76,6 +77,22 @@ DEFAULT_TRADE_JOURNAL_LOG_PATH = Path("logs/trade_journal.jsonl")
 # 시세 공백(보유 종목 전멸) 구간을 세는 키. notify의 하루 1회 알림 마커와 같은 키를
 # 써서 "같은 사건"임을 한눈에 보이게 한다 — 마커는 .txt, 공백 상태는 .blackout.json.
 BLACKOUT_CONTEXT = "holdings_all_prices_unavailable"
+
+# KIS 시세가 실패한 종목의 2차 소스(collectors.fetch_naver_quotes) 사용 모드.
+# "shadow": 받아서 기록만 한다(판정은 KIS가 된 종목만). "active": 판정에 쓴다.
+# 2026-09-14 도입 시 shadow로 시작한다 — 매매 경로 변경은 최소 1거래일 섀도로 돌려 증거를
+# 본 뒤 켠다(docs/PLAN.md "매매 경로 변경 절차"). 켜기 전에 cron.log의
+# secondary_quote_shadow / secondary_quote_agreement 줄을 볼 것.
+SECONDARY_QUOTE_MODE = "shadow"
+# 섀도 기간에 KIS·네이버 가격이 실제로 같은지 하루 한 번 대조하는 창(장 마감 직전).
+SECONDARY_QUOTE_AGREEMENT_WINDOW = (time(15, 20), time(15, 21))
+SECONDARY_QUOTE_WALL_TIMEOUT_S = 5.0  # 회차 안에서 네이버를 기다리는 벽시계 상한
+
+# 하루 안전장치 공백 예산(분). 09:00~15:30 391개 회차 중 판정한 회차가 없는 분을 센다.
+# 첫 1개월은 22거래일 285분(3.3%, 하루 평균 13분)이었고 최장 79분이었다. 연속 5분 공백
+# 알림(notify.track_blackout)과 달리 **짧은 공백이 여러 번 쌓여 하루 예산을 넘는 경우**를 잡는다.
+BLIND_MINUTES_BUDGET = 15
+DEFAULT_CRON_LOG_PATH = Path("logs/cron.log")
 
 
 # 정량 사전 필터 절대 문턱값 (docs/PLAN.md §5, 2026-08-08 확정). 관행값으로 시작하고
@@ -270,8 +287,10 @@ async def execute_buy_order(
     # 같은 버그다. 같은 함수가 원장 조회에는 이미 _kst_today()를 쓰고 있었다.
     today = _kst_today()
 
+    # 30거래일을 받는다(같은 API 호출, KIS가 100일을 주고 뒤에서 자른다). 갭 체크는 여전히
+    # 마지막 봉만 쓰고, 나머지는 출구 규칙의 20일 변동성(sell.volatility_exit_plan) 계산용이다.
     prev_bars, quote = await asyncio.gather(
-        asyncio.to_thread(kis.fetch_daily_ohlcv, ticker, 2),
+        asyncio.to_thread(kis.fetch_daily_ohlcv, ticker, EXIT_PLAN_LOOKBACK_BARS),
         _wait_for_traded_quote(ticker),
     )
     if not prev_bars or quote is None:
@@ -290,7 +309,32 @@ async def execute_buy_order(
         return portfolio
     current_price = quote.price
 
-    prev_close = prev_bars[-1].close
+    # **갭 기준은 오늘 이전의 종가다.** KIS 일봉은 장중에 오늘 봉을 포함한다(2026-09-03 시세 공백
+    # 감사가 당일 봉으로 판정했다). 그런데 여기서 prev_bars[-1]을 그대로 쓰면 09:01의 "전일 종가"가
+    # 사실상 지금 가격이라 갭이 0 근처로 눌려 필터가 안 걸린다. 2026-08-12 192820은 실제 시가 갭이
+    # +10.48%였는데 gap_pct=0.0으로 기록되고 매수됐다(첫 1개월 독립 리뷰, 2026-09-14). KIS 현재가
+    # 응답의 전일 대비(prev_close)가 1순위, 없으면 오늘 이전 마지막 봉의 종가다.
+    history = [b for b in prev_bars if b.date < today]
+    prev_close = quote.prev_close or (history[-1].close if history else None)
+    if quote.prev_close and history and abs(quote.prev_close - history[-1].close) / history[-1].close > 0.005:
+        # 둘은 같은 "전일 종가"여야 한다. 어긋나면 배당락 조정이거나(KIS 기준가가 맞다) 시세가 전일
+        # 스냅샷일 가능성이 있다 — 판정은 기준가로 하되 사후에 되짚을 수 있게 남긴다(독립 리뷰 제안).
+        logger.warning(
+            "execute_buy_order_prev_close_mismatch ticker=%s quote_prev_close=%s last_bar_close=%s",
+            ticker, quote.prev_close, history[-1].close,
+        )
+    if not prev_close:
+        logger.warning("execute_buy_order_skipped ticker=%s reason=price_data_unavailable detail=no_prev_close", ticker)
+        _log_buy_skip(log_path, today, ticker, "price_data_unavailable")
+        return portfolio
+
+    # 출구 규칙의 변동성도 **주문 전에** 계산한다. 주문 뒤에 계산하다 예외가 나면 브로커엔 체결된
+    # 주식이 있는데 상태 파일엔 없는 보유가 생긴다(독립 리뷰 지적). 계산이 실패하면 None — 고정
+    # 기본값으로 떨어질 뿐 매수를 막지 않는다.
+    sigma_20d_pct = _sigma_20d_pct(history)
+    volatility_plan = sell.volatility_exit_plan(sigma_20d_pct)
+    exit_plan_source = "volatility" if volatility_plan is not None else "default"
+
     gap_pct = abs(current_price - prev_close) / prev_close
     if gap_pct > GAP_SKIP_THRESHOLD_PCT:
         logger.warning("execute_buy_order_skipped ticker=%s reason=gap_too_large gap_pct=%.4f", ticker, gap_pct)
@@ -423,7 +467,7 @@ async def execute_buy_order(
                 # 경로(existing is not None)에서는 일부러 건드리지 않는다 — 나중에
                 # 다시 정할 수 있게 두면 "물타기하면서 손절선도 같이 넓히는" 경로가
                 # 열린다. 기존 포지션의 규칙이 그대로 이긴다.
-                exit_plan=decision.exit_plan,
+                exit_plan=volatility_plan,
             )
         )
 
@@ -450,10 +494,18 @@ async def execute_buy_order(
             "fee_amount": fill.fee if fill is not None else None,
             "order_no": order_no,
             "gap_pct": round(gap_pct, 4),
-            # 이 포지션에 박힌 출구 규칙. None이면 고정 기본값(degraded 판단이거나
-            # 추가매수라 기존 규칙 유지). 나중에 "LLM이 정한 출구가 고정값보다
-            # 나았나"를 가르는 기준이 이 필드다.
-            "exit_plan": decision.exit_plan.model_dump(mode="json") if decision.exit_plan else None,
+            # 이 포지션에 박힌 출구 규칙(2026-09-14부터 코드가 변동성으로 정한다). None이면
+            # 고정 기본값 — 변동성을 못 구했거나 추가매수라 기존 규칙이 그대로 이긴다.
+            # 추가매수면 새 규칙은 포지션에 안 박히므로 기록도 기존 규칙 기준으로 남긴다.
+            "exit_plan": (
+                (existing.exit_plan.model_dump(mode="json") if existing.exit_plan else None)
+                if existing is not None
+                else (volatility_plan.model_dump(mode="json") if volatility_plan else None)
+            ),
+            "exit_plan_source": "existing_position" if existing is not None else exit_plan_source,
+            "exit_plan_sigma_20d_pct": sigma_20d_pct,
+            # 매니저가 낸 출구 규칙 — 포지션엔 안 쓰고 비교용으로만 남긴다.
+            "manager_exit_plan": decision.exit_plan.model_dump(mode="json") if decision.exit_plan else None,
             "decision": decision.model_dump(mode="json"),
         },
     )
@@ -485,6 +537,23 @@ def display_name(ticker: str) -> str:
 # 09:01에 첫 체결이 아직 안 잡힌 종목을 얼마나 기다릴지. 시가단일가 체결은 종목마다
 # 몇 초~1분 차이로 잡힌다(2026-09-08 quote_at_open 로그). 기다리는 건 데이터 수집
 # 재시도이지 판단 재시도가 아니다(규칙 4) — 판단은 이미 08:30에 끝났다.
+EXIT_PLAN_LOOKBACK_BARS = 30  # 20일 수익률 표준편차에는 21개 종가가 필요하다. 여유분 포함
+
+
+def _sigma_20d_pct(history: list) -> float | None:
+    """오늘 이전 마지막 21개 종가의 20일 일간 수익률 표본 표준편차(퍼센트). collectors.compute_indicators의
+    daily_return_stdev_20d와 같은 정의지만, 주문 경로에서 쓰므로 **어떤 입력에도 예외를 던지지 않는다**
+    (종가 0·결측이면 None)."""
+    try:
+        closes = [float(b.close) for b in history[-21:]]
+        if len(closes) < 21 or any(c <= 0 for c in closes):
+            return None
+        returns = [(closes[i] - closes[i - 1]) / closes[i - 1] * 100 for i in range(1, 21)]
+        mean = sum(returns) / 20
+        return (sum((r - mean) ** 2 for r in returns) / 19) ** 0.5
+    except Exception:  # noqa: BLE001 - 출구 규칙 계산 실패가 매수 집행을 막으면 안 된다
+        logger.exception("exit_plan_sigma_failed")
+        return None
 PRE_OPEN_QUOTE_ATTEMPTS = 6
 PRE_OPEN_QUOTE_WAIT_S = 10.0
 
@@ -974,6 +1043,61 @@ def _log_quote_freshness_at_open(quote_by_ticker: dict[str, kis.Quote]) -> None:
         )
 
 
+def _apply_secondary_quotes(
+    portfolio: PortfolioState,
+    quote_by_ticker: dict[str, kis.Quote],
+    secondary: dict[str, kis.Quote],
+    missing: list[str],
+) -> None:
+    """2차 시세를 모드에 따라 판정에 넣거나(active) 기록만 한다(shadow).
+
+    섀도 기록에는 **그 시세였다면 안전장치가 무엇을 했을지**를 같이 남긴다. 켜기 전에 봐야
+    하는 증거가 이것이다 — 가격만 남기면 "네이버로 판정했으면 오판했을까"를 사후에 다시 계산해야 한다.
+    """
+    unrecovered = [t for t in missing if t not in secondary]
+    if unrecovered:
+        logger.warning("secondary_quote_unavailable tickers=%s", unrecovered)
+    for ticker, quote in secondary.items():
+        if SECONDARY_QUOTE_MODE == "active":
+            quote_by_ticker[ticker] = quote
+            logger.warning(
+                "evaluate_holdings_secondary_quote_used ticker=%s price=%s high=%s low=%s source=naver",
+                ticker, quote.price, quote.day_high, quote.day_low,
+            )
+            continue
+        position = next(p for p in portfolio.positions if p.ticker == ticker)
+        would = None
+        if quote.traded_today:
+            probe = sell.update_peak_price(position, quote.price, day_high=quote.day_high, today=_kst_today())
+            action, _ = sell.evaluate_with_day_range(probe, quote, today=_kst_today())
+            would = sell.exit_trigger(action, probe) if action else None
+        logger.info(
+            "secondary_quote_shadow ticker=%s price=%s high=%s low=%s traded_today=%s would_sell=%s",
+            ticker, quote.price, quote.day_high, quote.day_low, quote.traded_today, would,
+        )
+
+
+async def _check_secondary_quote_agreement(quote_by_ticker: dict[str, kis.Quote]) -> None:
+    """섀도 기간에 하루 한 번(15:20 회차) KIS와 네이버 현재가를 같은 순간에 대조한다.
+    2차 소스를 active로 켜기 전의 증거다 — KIS가 멀쩡한 날에도 표본이 쌓이게 한다."""
+    start, end = SECONDARY_QUOTE_AGREEMENT_WINDOW
+    if not quote_by_ticker or not (start <= datetime.now(KST).time() < end):
+        return
+    secondary = await asyncio.wait_for(
+        asyncio.to_thread(collectors.fetch_naver_quotes, sorted(quote_by_ticker)), SECONDARY_QUOTE_WALL_TIMEOUT_S
+    )
+    diffs = {
+        t: abs(secondary[t].price - q.price) / q.price
+        for t, q in quote_by_ticker.items()
+        if t in secondary and q.price > 0
+    }
+    logger.info(
+        "secondary_quote_agreement compared=%d of %d max_abs_diff_pct=%s",
+        len(diffs), len(quote_by_ticker),
+        f"{max(diffs.values()) * 100:.3f}" if diffs else "none",
+    )
+
+
 async def evaluate_holdings(
     portfolio: PortfolioState,
     day: datetime,
@@ -1026,9 +1150,28 @@ async def evaluate_holdings(
             continue
         quote_by_ticker[position.ticker] = quote
 
-    price_by_ticker = {t: q.price for t, q in quote_by_ticker.items()}
-
     _log_quote_freshness_at_open(quote_by_ticker)
+
+    # KIS 시세가 실패한 종목은 네이버로 한 번 더 받는다(collectors.fetch_naver_quotes).
+    # 섀도 모드에서는 기록만 하고 판정에는 안 쓴다 — 그래서 아래 price_by_ticker·시세 공백
+    # 판단은 섀도일 때 KIS 결과 그대로다(눈을 감은 건 감은 것으로 센다).
+    # **이 블록의 어떤 실패도 손절·익절 회차를 죽이면 안 된다.** 보조 장치가 주 장치를 끄는 건
+    # 최악의 결함이다 — 독립 리뷰에서 네이버가 JSON 배열을 주면 AttributeError가 회차 전체를 죽여
+    # KIS가 가격을 준 종목의 손절까지 못 나가는 것을 재현했다(2026-09-14). 벽시계 상한도 둔다 —
+    # requests의 timeout은 DNS를 안 덮는다.
+    missing = [p.ticker for p in portfolio.positions if p.ticker not in quote_by_ticker]
+    try:
+        if missing:
+            secondary = await asyncio.wait_for(
+                asyncio.to_thread(collectors.fetch_naver_quotes, missing), SECONDARY_QUOTE_WALL_TIMEOUT_S
+            )
+            _apply_secondary_quotes(portfolio, quote_by_ticker, secondary, missing)
+        elif SECONDARY_QUOTE_MODE == "shadow":
+            await _check_secondary_quote_agreement(quote_by_ticker)
+    except Exception as exc:  # noqa: BLE001 - 2차 시세는 보조 장치다
+        logger.warning("secondary_quote_block_failed missing=%s error=%r", missing, exc)
+
+    price_by_ticker = {t: q.price for t, q in quote_by_ticker.items()}
 
     # 한 종목도 못 받았으면 이 회차는 손절·익절을 **아무것도 판정하지 않았다** —
     # 문턱을 넘지 않아서 조용한 것과 눈을 감아서 조용한 것은 전혀 다른데, 지금까지
@@ -1113,7 +1256,7 @@ async def evaluate_holdings(
                 "sell_trigger_from_day_range ticker=%s reason=%s day_low=%s day_high=%s price=%.0f "
                 "— 분당 샘플이 놓친 구간을 당일 범위로 잡았다",
                 ticker,
-                action.reason if action else "?",
+                sell.exit_trigger(action, position) if action else "?",
                 quote.day_low,
                 quote.day_high,
                 current_price,
@@ -1271,12 +1414,14 @@ async def finalize_sell(
         # 낫다. 다만 총액은 못 쓴다 — 아래 sell_amount에서 단가 x 수량으로 되세운다.
         exit_price_source = "fill_partial"
 
+    trigger = sell.exit_trigger(action, position)
     _append_log(
         log_path,
         {
             "day": day.date().isoformat(),
             "ticker": position.ticker,
             "reason": action.reason,
+            "exit_trigger": trigger,
             "sell_fraction": action.sell_fraction,
             "price": exit_price,
         },
@@ -1330,6 +1475,9 @@ async def finalize_sell(
             "day": day.date().isoformat(),
             "ticker": position.ticker,
             "reason": action.reason,
+            # 사람이 읽는 사유(sell.exit_trigger). reason은 판정 로직의 문자열이라 1차 익절과
+            # 트레일링이 둘 다 take_profit_trail이다. 2026-09-14 이전 행에는 없다.
+            "exit_trigger": trigger,
             "reasoning": action.reasoning,
             "sell_fraction": action.sell_fraction,
             "exit_price": exit_price,
@@ -1380,7 +1528,7 @@ async def finalize_sell(
     notify.send_telegram_alert(
         notify.format_sell_alert(
             display_name(position.ticker),
-            notify.REASON_LABELS.get(action.reason, action.reason),
+            notify.TRIGGER_LABELS.get(trigger) or notify.REASON_LABELS.get(trigger, trigger),
             exit_price,  # 알림에도 호가가 아니라 체결가를 보여준다
             realized_pnl_pct,
             reasoning=reasoning_ko,
@@ -1500,9 +1648,128 @@ def summarize_llm_calls(log_path: Path, since: datetime | None = None) -> dict:
     return by_label
 
 
+GATE_HEADROOM_MAX_PROBES = 50
+_BLIND_ROUND_PATTERN = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}):\d{2}[,.]\d+ INFO evaluate_holdings_done positions=(\d+) priced=(\d+)"
+)
+SAFETY_WINDOW = (time(9, 0), time(15, 30))
+
+
+def _decision_log_has_day(log_path: Path, day: date) -> bool:
+    """오늘 매수 판단이 실제로 났는가. Claude API 정지 등으로 판단을 건너뛴 날에는 최근 20일 창이
+    옛 데이터 그대로라, 그 창으로 매주 "거부 0건"을 알리면 같은 사실을 반복할 뿐이다(독립 리뷰)."""
+    if not log_path.exists():
+        return False
+    needle = f'"day": "{day.isoformat()}"'
+    with log_path.open(errors="replace") as f:
+        return any(needle in line for line in f)
+
+
+def _probe_decision(ticker: str) -> Decision:
+    return Decision(ticker=ticker, action="BUY", reason="gate_headroom_probe", inputs=[], degraded=False)
+
+
+def gate_headroom(
+    portfolio: PortfolioState, config: RiskGateConfig | None = None, trade_weight: float = TRADE_WEIGHT
+) -> dict:
+    """지금 포트폴리오에서 게이트가 **실제로 거부하는지**를 매일 운영 코드로 확인한다.
+
+    첫 1개월 게이트는 0/1,018건 발동했다. "막을 일이 없었다"와 "막는 경로가 죽어 있다"를
+    거부 건수로는 구분할 수 없고, 규칙 6(최종 승인권은 코드)이 운영에서 한 번도 검증되지
+    않은 채였다(첫 1개월 평가 P1-5). 주문을 내지 않고, 운영과 같은 check_gate·execute
+    체인에 가상의 신규 매수를 계속 넣어 몇 건째에 어느 룰로 거부되는지 본다. 가장 큰 보유
+    종목에 추가매수를 넣어 종목당 한도 경로도 같이 태운다.
+
+    판단 로그·게이트 거부 집계에는 아무것도 안 남긴다 — 가짜 판단이 신호율에 섞이면 안 된다.
+    """
+    config = config or RiskGateConfig()
+    probe = portfolio
+    approvals, rejected_by = 0, None
+    for i in range(GATE_HEADROOM_MAX_PROBES):
+        decision = _probe_decision(f"PROBE{i:02d}")
+        result = check_gate(decision, probe, config, trade_weight)
+        if not result.approved:
+            rejected_by = result.rejected_by
+            break
+        probe = execute(decision, result, probe, "", trade_weight)
+        approvals += 1
+
+    addon_ticker = addon_rejected_by = None
+    if portfolio.positions:
+        largest = max(portfolio.positions, key=lambda p: p.weight)
+        addon_ticker = largest.ticker
+        addon_rejected_by = check_gate(_probe_decision(largest.ticker), portfolio, config, trade_weight).rejected_by
+
+    return {
+        "invested_weight": round(1.0 - portfolio.cash_weight, 4),
+        "new_buys_until_reject": approvals,
+        "rejected_by": rejected_by,
+        "addon_ticker": addon_ticker,
+        "addon_rejected_by": addon_rejected_by,
+    }
+
+
+def summarize_blind_minutes(cron_log_path: Path, day: date, *, had_positions: bool) -> dict | None:
+    """그날 09:00~15:30 중 **판정한 회차가 한 번도 없는 분**을 센다.
+
+    판정한 회차 = `evaluate_holdings_done ... priced=N`에서 N > 0. 매분 크론 회차·09:01
+    execute_open 회차를 가리지 않는다(둘 다 같은 줄을 남긴다) — 락에 막혀 건너뛴 분도 그 분에
+    다른 회차가 판정했으면 공백이 아니다. 포지션이 전량 청산된 뒤(positions=0)의 분은 셀
+    대상이 아니다.
+
+    한계: 회차가 다음 분으로 넘어가 끝나면(레이트리밋 등) 그 줄의 분으로 기록돼 앞 분이
+    공백으로 잡힐 수 있다 — 약간 과대 집계 쪽이다. 첫 1개월 평가의 285분도 같은 방식이다.
+
+    로그에 회차가 하나도 없고 보유 종목도 없었으면 None(셀 것이 없다). 보유 종목이 있었는데
+    회차가 하나도 없으면 391분 전부 공백이다 — 크론이 안 돈 것이고, 가장 나쁜 경우다.
+    """
+    covered: set[tuple[int, int]] = set()
+    zero_since: tuple[int, int] | None = None  # 그날 **마지막까지 이어진** positions=0 구간의 시작
+    seen = False
+    if cron_log_path.exists():
+        prefix = day.isoformat()
+        with cron_log_path.open(errors="replace") as f:
+            for line in f:
+                if not line.startswith(prefix):
+                    continue
+                m = _BLIND_ROUND_PATTERN.match(line)
+                if not m:
+                    continue
+                seen = True
+                minute = (int(m.group(2)), int(m.group(3)))
+                if int(m.group(5)) > 0:
+                    covered.add(minute)
+                # 전량 청산 뒤 다시 매수하면 positions가 다시 양수가 된다 — 중간의 0으로 창을 자르면
+                # 그 뒤의 공백이 통째로 빠진다(독립 리뷰 재현: 09:00 청산, 09:01 매수, 60분 장애 → 공백 0).
+                if int(m.group(4)) == 0:
+                    zero_since = zero_since or minute
+                else:
+                    zero_since = None
+    if not seen and not had_positions:
+        return None
+    end = time(*zero_since) if zero_since else SAFETY_WINDOW[1]
+
+    expected: list[tuple[int, int]] = []
+    h, mi = SAFETY_WINDOW[0].hour, SAFETY_WINDOW[0].minute
+    while time(h, mi) <= end:
+        expected.append((h, mi))
+        h, mi = (h, mi + 1) if mi < 59 else (h + 1, 0)
+
+    blind = [m for m in expected if m not in covered]
+    longest = run = 0
+    prev = None
+    for m in blind:
+        run = run + 1 if prev is not None and (m[0] * 60 + m[1]) - (prev[0] * 60 + prev[1]) == 1 else 1
+        longest = max(longest, run)
+        prev = m
+    return {"expected": len(expected), "blind": len(blind), "longest_run": longest}
+
+
 def log_monitoring_summary(
     decision_log_path: Path | None = None,
     llm_log_path: Path | None = None,
+    portfolio: PortfolioState | None = None,
+    cron_log_path: Path | None = None,
 ) -> None:
     """CLAUDE.md "감시 지표"를 하루 한 번 cron 로그에 남긴다.
 
@@ -1542,3 +1809,45 @@ def log_monitoring_summary(
             stats["input_tokens"],
             stats["output_tokens"],
         )
+
+    if portfolio is None:
+        return
+
+    # --- 게이트가 살아 있는가 (2026-09-14, 첫 1개월 평가 P1-5) ---
+    headroom = gate_headroom(portfolio)
+    logger.info(
+        "monitoring_gate_headroom invested=%.3f new_buys_until_reject=%d rejected_by=%s addon_ticker=%s addon_rejected_by=%s",
+        headroom["invested_weight"],
+        headroom["new_buys_until_reject"],
+        headroom["rejected_by"],
+        headroom["addon_ticker"],
+        headroom["addon_rejected_by"],
+    )
+    if headroom["rejected_by"] != "total_exposure":
+        # 가상 매수를 50건 넣어도 총노출 한도가 안 걸렸다 = 게이트 경로가 죽었거나 설정이 풀렸다.
+        logger.error("monitoring_gate_headroom_broken headroom=%s", headroom)
+        notify.alert_once_per_day("gate_headroom_broken", notify.format_gate_headroom_broken_alert(headroom))
+    decided_today = _decision_log_has_day(decision_log_path, _kst_today())
+    if decided_today and signal["total_days"] >= MONITORING_WINDOW_TRADING_DAYS and not signal["rejected_by_counts"]:
+        # 거부 0건 자체는 이상이 아닐 수 있다(하루 승인이 한도에 안 닿으면 정상). 그래서 매일이
+        # 아니라 주 1회, 위 여유 계산과 함께 보낸다 — "룰이 살아 있고 여유가 몇 건인지"가 요점이다.
+        year, week, _ = datetime.now(KST).isocalendar()
+        notify.alert_once(
+            f"gate_zero_rejections_{year}w{week:02d}",
+            notify.format_gate_zero_rejection_alert(signal["total_days"], headroom),
+        )
+
+    # --- 안전장치 공백 예산 (2026-09-14, 첫 1개월 평가 P1-9) ---
+    blind = summarize_blind_minutes(
+        cron_log_path or DEFAULT_CRON_LOG_PATH, _kst_today(), had_positions=bool(portfolio.positions)
+    )
+    if blind is not None:
+        logger.info(
+            "monitoring_blind_minutes day=%s blind=%d of %d longest_run=%d budget=%d",
+            _kst_today().isoformat(), blind["blind"], blind["expected"], blind["longest_run"], BLIND_MINUTES_BUDGET,
+        )
+        if blind["blind"] > BLIND_MINUTES_BUDGET:
+            notify.alert_once_per_day(
+                "blind_minutes_budget",
+                notify.format_blind_minutes_budget_alert(_kst_today().isoformat(), blind, BLIND_MINUTES_BUDGET),
+            )

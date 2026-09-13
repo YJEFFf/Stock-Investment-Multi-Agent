@@ -301,7 +301,7 @@ def test_adds_to_existing_position_averages_by_shares(monkeypatch, tmp_path):
     assert pos.entry_price == pytest.approx(1333.333333, rel=1e-6)
 
 
-# --- ExitPlan이 진입 시점에 포지션에 박히는가 (사용자 확정 2026-08-15) ---
+# --- 출구 규칙은 진입 시점에 코드가 변동성으로 정한다 (2026-09-14, 매니저 결정에서 변경) ---
 
 
 def _plan(stop_loss_pct=-0.06) -> ExitPlan:
@@ -313,97 +313,98 @@ def _plan(stop_loss_pct=-0.06) -> ExitPlan:
     )
 
 
-def _wire_successful_buy(monkeypatch):
-    monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
-    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 101.0)
+def _volatile_bars(daily_move=0.02, n=30):
+    """종가가 +2%, −2%를 번갈아 움직이는 30거래일. 20일 일간 수익률 표준편차가 약 2%다."""
+    from datetime import timedelta
+
+    from src.schemas import OHLCVBar
+
+    bars, px, d = [], 100.0, date(2026, 7, 1)
+    for i in range(n):
+        px = px * (1 + daily_move) if i % 2 else px / (1 + daily_move)
+        bars.append(OHLCVBar(date=d + timedelta(days=i), open=px, high=px, low=px, close=px, volume=1000))
+    return bars
+
+
+def _wire_successful_buy(monkeypatch, bars=None):
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: bars or _prev_bars(100.0))
+    monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: (bars[-1].close if bars else 101.0))
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
     monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: "order-1")
-    monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, day: 101.0)
+    monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, day: (bars[-1].close if bars else 101.0))
     monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: None)
 
 
-def test_new_position_carries_the_decisions_exit_plan(monkeypatch, tmp_path):
-    _wire_successful_buy(monkeypatch)
-    plan = _plan()
+def _buy(decision, portfolio, log_path):
+    return asyncio.run(
+        pipeline.execute_buy_order(
+            decision, GateResult(approved=True, rejected_by=None), portfolio, "반도체", 0.08, log_path=log_path
+        )
+    )
+
+
+def test_new_position_uses_the_volatility_plan_not_the_managers(monkeypatch, tmp_path):
+    """2026-09-14 뒤집음. 매니저 출구 규칙은 829건 중 77%가 같은 값이었고 변동성과 상관이
+    없었다. 손절폭은 리스크 한도라 코드가 정한다(규칙 6) — 매니저 값은 포지션에 박지 않는다."""
+    from src import collectors, sell
+
+    bars = _volatile_bars()
+    _wire_successful_buy(monkeypatch, bars)
     decision = _decision()
-    decision.exit_plan = plan
-    portfolio = PortfolioState(positions=[], cash_weight=1.0)
+    decision.exit_plan = _plan()
 
-    updated = asyncio.run(
-        pipeline.execute_buy_order(
-            decision,
-            GateResult(approved=True, rejected_by=None),
-            portfolio,
-            "반도체",
-            0.08,
-            log_path=tmp_path / "journal.jsonl",
-        )
-    )
+    updated = _buy(decision, PortfolioState(positions=[], cash_weight=1.0), tmp_path / "journal.jsonl")
 
-    assert updated.positions[0].exit_plan == plan
+    sigma = collectors.compute_indicators(bars)["daily_return_stdev_20d"]
+    expected = sell.volatility_exit_plan(sigma)
+    assert updated.positions[0].exit_plan == expected
+    assert updated.positions[0].exit_plan != decision.exit_plan
 
 
-def test_new_position_without_exit_plan_stays_none(monkeypatch, tmp_path):
-    """degraded 판단은 exit_plan이 None이고, sell.plan_for가 고정 기본값으로 떨어뜨린다."""
-    _wire_successful_buy(monkeypatch)
-    portfolio = PortfolioState(positions=[], cash_weight=1.0)
+def test_new_position_without_enough_history_falls_back_to_the_default(monkeypatch, tmp_path):
+    """20일 변동성을 못 구하면(상장 직후·조회 결과 부족) exit_plan=None이고, sell.plan_for가
+    고정 기본값으로 떨어뜨린다. 매니저 값으로 폴백하지 않는다."""
+    _wire_successful_buy(monkeypatch)  # 봉 1개뿐
+    decision = _decision()
+    decision.exit_plan = _plan()
 
-    updated = asyncio.run(
-        pipeline.execute_buy_order(
-            _decision(),
-            GateResult(approved=True, rejected_by=None),
-            portfolio,
-            "반도체",
-            0.08,
-            log_path=tmp_path / "journal.jsonl",
-        )
-    )
+    updated = _buy(decision, PortfolioState(positions=[], cash_weight=1.0), tmp_path / "journal.jsonl")
 
     assert updated.positions[0].exit_plan is None
 
 
 def test_adding_to_existing_position_keeps_the_original_exit_plan(monkeypatch, tmp_path):
     """물타기하면서 손절선도 같이 넓히는 경로를 열지 않는다 — 기존 규칙이 이긴다."""
-    _wire_successful_buy(monkeypatch)
+    _wire_successful_buy(monkeypatch, _volatile_bars(0.05))  # 새로 계산하면 훨씬 넓은 규칙이 나온다
     original = _plan(stop_loss_pct=-0.05)
     existing = Position(
         ticker=TICKER, sector="반도체", weight=0.05, entry_price=90.0, peak_price=90.0, quantity=10,
         exit_plan=original,
     )
-    decision = _decision()
-    decision.exit_plan = _plan(stop_loss_pct=-0.14)  # 훨씬 느슨한 새 계획
-    portfolio = PortfolioState(positions=[existing], cash_weight=0.95)
+    log_path = tmp_path / "journal.jsonl"
 
-    updated = asyncio.run(
-        pipeline.execute_buy_order(
-            decision,
-            GateResult(approved=True, rejected_by=None),
-            portfolio,
-            "반도체",
-            0.08,
-            log_path=tmp_path / "journal.jsonl",
-        )
-    )
+    updated = _buy(_decision(), PortfolioState(positions=[existing], cash_weight=0.95), log_path)
 
     assert updated.positions[0].exit_plan == original
+    entry = json.loads(log_path.read_text().strip())
+    assert entry["exit_plan_source"] == "existing_position"
+    assert entry["exit_plan"]["stop_loss_pct"] == pytest.approx(-0.05)
 
 
-def test_buy_journal_records_the_exit_plan(monkeypatch, tmp_path):
-    _wire_successful_buy(monkeypatch)
+def test_buy_journal_records_applied_plan_source_sigma_and_the_managers_plan(monkeypatch, tmp_path):
+    bars = _volatile_bars()
+    _wire_successful_buy(monkeypatch, bars)
     log_path = tmp_path / "journal.jsonl"
     decision = _decision()
     decision.exit_plan = _plan()
 
-    asyncio.run(
-        pipeline.execute_buy_order(
-            decision, GateResult(approved=True, rejected_by=None),
-            PortfolioState(positions=[], cash_weight=1.0), "반도체", 0.08, log_path=log_path,
-        )
-    )
+    updated = _buy(decision, PortfolioState(positions=[], cash_weight=1.0), log_path)
 
     entry = json.loads(log_path.read_text().strip())
-    assert entry["exit_plan"]["stop_loss_pct"] == pytest.approx(-0.06)
-    assert entry["exit_plan"]["take_profit_pct"] == pytest.approx(0.12)
+    assert entry["exit_plan"] == updated.positions[0].exit_plan.model_dump(mode="json")
+    assert entry["exit_plan_source"] == "volatility"
+    assert entry["exit_plan_sigma_20d_pct"] == pytest.approx(2.0, abs=0.1)
+    assert entry["manager_exit_plan"]["stop_loss_pct"] == pytest.approx(-0.06)  # 비교용으로만 남는다
 
 
 # --- 진입가 출처 체인 (2026-08-15, 192820 오익절 건 이후) ---
@@ -691,3 +692,64 @@ def test_a_real_gap_is_still_caught_once_the_quote_is_live(monkeypatch, tmp_path
 
     assert orders == []
     assert json.loads(log_path.read_text().splitlines()[0])["reason"] == "gap_too_large"
+
+
+# --- 독립 리뷰 지적 (2026-09-14) ---
+
+
+def _bars_with_today(prev_close=100.0, today_close=110.0):
+    from datetime import timedelta
+
+    from src.schemas import OHLCVBar
+
+    today = pipeline._kst_today()
+    bars = [OHLCVBar(date=today - timedelta(days=30 - i), open=prev_close, high=prev_close, low=prev_close, close=prev_close, volume=1) for i in range(29)]
+    bars.append(OHLCVBar(date=today, open=today_close, high=today_close, low=today_close, close=today_close, volume=1))
+    return bars
+
+
+def test_the_gap_is_measured_against_the_previous_close_not_todays_forming_bar(monkeypatch, tmp_path):
+    """KIS 일봉은 장중에 오늘 봉을 포함한다. 그 봉의 종가를 "전일 종가"로 쓰면 갭이 0으로 눌린다 —
+    2026-08-12 192820은 실제 시가 갭 +10.48%에 gap_pct=0.0으로 기록되고 매수됐다."""
+    orders = []
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _bars_with_today(100.0, 110.0))
+    monkeypatch.setattr(
+        kis, "fetch_quote", lambda ticker, policy=None: kis.Quote(price=110.0, day_high=110.0, day_low=109.0, prev_close=None)
+    )
+    monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
+    monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: orders.append(qty) or "o")
+    log_path = tmp_path / "journal.jsonl"
+
+    asyncio.run(pipeline.execute_buy_order(_decision(), GateResult(approved=True, rejected_by=None), PortfolioState(cash_weight=1.0), "반도체", 0.08, log_path=log_path))
+
+    assert orders == []
+    entry = json.loads(log_path.read_text().splitlines()[0])
+    assert entry["reason"] == "gap_too_large" and entry["gap_pct"] == pytest.approx(0.10)
+
+
+def test_the_brokers_previous_close_is_preferred_when_present(monkeypatch, tmp_path):
+    orders = []
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _bars_with_today(104.0, 110.0))
+    monkeypatch.setattr(
+        kis, "fetch_quote", lambda ticker, policy=None: kis.Quote(price=110.0, day_high=110.0, day_low=109.0, prev_close=100.0)
+    )
+    monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
+    monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: orders.append(qty) or "o")
+    log_path = tmp_path / "journal.jsonl"
+
+    asyncio.run(pipeline.execute_buy_order(_decision(), GateResult(approved=True, rejected_by=None), PortfolioState(cash_weight=1.0), "반도체", 0.08, log_path=log_path))
+
+    assert json.loads(log_path.read_text().splitlines()[0])["gap_pct"] == pytest.approx(0.10)
+
+
+def test_a_corrupt_bar_cannot_crash_the_buy_after_the_order_filled(monkeypatch, tmp_path):
+    """독립 리뷰 재현: 종가 0인 봉 하나로 변동성 계산이 ZeroDivisionError를 냈고, 그 계산이 주문 뒤라
+    브로커엔 체결된 주식이 상태 파일엔 없는 보유가 생길 수 있었다. 이제 주문 전에, 예외 없이 계산한다."""
+    bars = _volatile_bars()
+    bars[10] = bars[10].model_copy(update={"close": 0.0})
+    _wire_successful_buy(monkeypatch, bars)
+
+    updated = _buy(_decision(), PortfolioState(positions=[], cash_weight=1.0), tmp_path / "journal.jsonl")
+
+    assert len(updated.positions) == 1 and updated.positions[0].exit_plan is None
+    assert json.loads((tmp_path / "journal.jsonl").read_text().strip())["exit_plan_source"] == "default"

@@ -34,7 +34,17 @@ KST = ZoneInfo("Asia/Seoul")  # "하루"의 경계는 장이 도는 시간대 �
 
 # notion_sync.REASON_LABELS와 값은 같지만 독립적으로 든다 — 이 파일과 notion_sync.py는
 # "노션에 뭘 쓰나"/"텔레그램에 뭘 보내나"로 고치는 이유가 다르다.
+# 매도 기록의 exit_trigger(sell.exit_trigger)용. REASON_LABELS의 take_profit_trail("익절")은
+# 1차 익절과 트레일링을 가르지 못해 2026-09-14 이전 기록을 읽을 때만 쓴다.
+TRIGGER_LABELS = {
+    "stop_loss": "손절",
+    "take_profit_first": "1차익절",
+    "take_profit_trail": "트레일링익절",
+    "llm_discretionary": "LLM재량매도",
+}
+
 REASON_LABELS = {
+    **TRIGGER_LABELS,
     "stop_loss": "손절",
     "take_profit_trail": "익절",
     "llm_discretionary": "LLM재량매도",
@@ -158,6 +168,36 @@ def format_buy_decision_alert(day: str, names: list[str]) -> str:
     return f"🔎 [SIMA] 매수 판단 완료 ({day})\n승인 {len(names)}건: {', '.join(names)}\n집행은 09:00 장 시작 직후"
 
 
+def format_gate_headroom_broken_alert(headroom: dict) -> str:
+    return (
+        "🔴 [SIMA] 게이트 점검 실패\n"
+        f"가상 신규 매수를 {headroom['new_buys_until_reject']}건 넣어도 총노출 한도가 거부하지 않았습니다 "
+        f"(거부 룰: {headroom['rejected_by']}). 게이트 경로나 설정을 확인하세요.\n"
+        "주문은 내지 않은 점검입니다."
+    )
+
+
+def format_gate_zero_rejection_alert(days: int, headroom: dict) -> str:
+    addon = (
+        f"\n보유 최대 종목 추가매수 시: {headroom['addon_rejected_by'] or '승인'}"
+        if headroom.get("addon_ticker")
+        else ""
+    )
+    return (
+        f"🧱 [SIMA] 게이트 주간 점검\n최근 {days}거래일 게이트 거부 0건\n"
+        f"지금 투자비중 {headroom['invested_weight']:.1%} — 신규 매수 {headroom['new_buys_until_reject']}건 뒤 "
+        f"{headroom['rejected_by']} 한도가 거부합니다(가상 점검, 주문 없음){addon}"
+    )
+
+
+def format_blind_minutes_budget_alert(day: str, blind: dict, budget: int) -> str:
+    return (
+        f"🟠 [SIMA] 안전장치 공백 예산 초과 ({day})\n"
+        f"오늘 09:00~15:30 중 손절·익절 판정이 없던 분: {blind['blind']}분 / 예산 {budget}분\n"
+        f"최장 연속 {blind['longest_run']}분. 짧은 공백이 쌓인 날도 잡으려는 알림입니다."
+    )
+
+
 def format_buy_decision_skipped_alert(day: str) -> str:
     """Claude API 스위치가 꺼져 매수 판단을 건너뛴 날. 조용히 넘기지 않는다 — 스위치를
     켜는 걸 잊으면 매수 판단이 소리 없이 영영 멈춘다."""
@@ -240,6 +280,22 @@ def send_telegram_alert(message: str) -> bool:
 # 안 나와도(안전장치가 눈을 감은 상태) 두 번째 알림이 안 나간다. context별로
 # 따로 센다.
 ALERT_MARKER_DIR = Path("logs/alert_markers")
+
+
+def alert_once(context_key: str, message: str) -> bool:
+    """이 context_key로 **한 번도** 안 보냈으면 보내고 True. 주 1회 같은 주기는 키에 주차를
+    넣어 만든다(alert_once_per_day는 마커의 날짜를 비교하므로 매일 다시 울린다)."""
+    marker = ALERT_MARKER_DIR / f"{context_key}.once.txt"
+    if marker.exists():
+        return False
+    if not send_telegram_alert(message):
+        return False  # 못 보냈으면 마커를 안 남긴다 — 다음에 다시 시도한다
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(datetime.now(KST).isoformat())
+    except OSError as exc:
+        logger.warning("alert_once_marker_write_failed key=%s error=%s", context_key, exc)
+    return True
 
 
 def alert_once_per_day(context_key: str, message: str, today: date | None = None) -> bool:

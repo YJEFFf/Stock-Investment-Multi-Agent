@@ -332,11 +332,12 @@ def test_main_logs_the_monitoring_summary(monkeypatch, tmp_path):
     portfolio_store.save_portfolio(PortfolioState(cash_weight=1.0))
 
     called = []
-    monkeypatch.setattr(dls.pipeline, "log_monitoring_summary", lambda: called.append(True))
+    monkeypatch.setattr(dls.pipeline, "log_monitoring_summary", lambda **kw: called.append(kw))
 
     asyncio.run(dls.main())
 
-    assert called == [True]
+    # 게이트 여유·공백 분 집계에 장 마감 시점 포트폴리오가 필요하다(2026-09-14).
+    assert len(called) == 1 and called[0]["portfolio"] == PortfolioState(cash_weight=1.0)
 
 
 def test_monitoring_summary_failure_does_not_break_the_sell_path(monkeypatch, tmp_path):

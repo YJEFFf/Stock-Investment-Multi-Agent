@@ -92,6 +92,16 @@ def _never_reach_notion(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _never_reach_naver_quotes(monkeypatch):
+    """네이버 2차 시세(collectors.fetch_naver_quotes)는 KIS가 실패한 회차마다 불린다 —
+    시세 실패를 흉내 내는 테스트가 실제 네이버를 치지 않게 기본으로 "못 받음"을 준다.
+    함수 자체를 검증하는 테스트는 import 시점에 원본을 잡아뒀다가 되돌려 쓴다."""
+    from src import collectors
+
+    monkeypatch.setattr(collectors, "fetch_naver_quotes", lambda tickers, **kwargs: {})
+
+
+@pytest.fixture(autouse=True)
 def _never_call_anthropic(monkeypatch):
     """Claude API는 클라이언트의 messages.create 지점에서 막는다. tests/test_llm.py가
     같은 속성을 목킹하므로 그 테스트는 그대로 유효하다(feedback_llm_api_cost)."""
@@ -159,6 +169,7 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(judgment, "DEFAULT_SELL_JUDGMENT_LOG_PATH", tmp_path / "sell_judgment.jsonl")
     monkeypatch.setattr(pipeline, "DEFAULT_LOG_PATH", tmp_path / "pipeline.jsonl")
     monkeypatch.setattr(pipeline, "DEFAULT_PREFILTER_LOG_PATH", tmp_path / "prefilter.jsonl")
+    monkeypatch.setattr(pipeline, "DEFAULT_CRON_LOG_PATH", tmp_path / "cron.log")
     monkeypatch.setattr(evaluation, "DEFAULT_PRICE_HISTORY_DIR", tmp_path / "price_history")
     monkeypatch.setattr(evaluation, "DEFAULT_IC_SUMMARY_PATH", tmp_path / "ic_summary.json")
     monkeypatch.setattr(pipeline, "DEFAULT_SELL_LOG_PATH", tmp_path / "sell.jsonl")

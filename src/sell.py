@@ -46,6 +46,66 @@ DEFAULT_EXIT_PLAN = ExitPlan(
 )
 
 
+# **진입 시 출구 규칙은 코드가 변동성으로 정한다**(2026-09-14 사용자 확정, 첫 1개월 평가 P1-8).
+# 매니저가 정하던 때는 829건 중 641건(77.3%)이 같은 값(−7/+14/0.30/−6)이었고 20일 변동성과의
+# 상관이 −0.005였다 — 매니저 입력에 변동성이 없으니 종목별로 다를 수가 없었다. 손절폭은 리스크
+# 한도이고 한도는 코드가 갖는다(규칙 6). 매니저의 exit_plan 출력은 판단 로그·매매일지에 비교용으로만
+# 남기고 포지션에는 박지 않는다.
+#
+#   손절   = −clamp(2.5 × σ20 × √5, 3%, 15%)
+#   익절   = 2 × |손절|                       (2:1 고정, 기존 규칙 그대로)
+#   트레일 = −clamp(2.0 × σ20 × √5, 3%, 12%)
+#   익절 비중 = 1/3                           (DEFAULT와 같게 고정)
+#
+# σ20은 진입 직전 20거래일 일간 수익률 표준편차(비율). √5는 약 1주 보유 창의 변동폭으로 환산하는
+# 계수다. 범위(3~15%, 3~12%)는 CLAUDE.md "아직 정해지지 않은 것"에서 사용자가 정한 바운드다.
+EXIT_PLAN_STOP_K = 2.5
+EXIT_PLAN_TRAIL_K = 2.0
+EXIT_PLAN_HORIZON_DAYS = 5
+EXIT_PLAN_STOP_BOUNDS = (0.03, 0.15)
+EXIT_PLAN_TRAIL_BOUNDS = (0.03, 0.12)
+EXIT_PLAN_TAKE_PROFIT_FRACTION = 1.0 / 3.0
+
+
+def _clamp(value: float, bounds: tuple[float, float]) -> float:
+    return min(max(value, bounds[0]), bounds[1])
+
+
+def volatility_exit_plan(daily_vol_pct: float | None) -> ExitPlan | None:
+    """진입 직전 20거래일 일간 수익률 표준편차(퍼센트 단위, collectors.compute_indicators의
+    daily_return_stdev_20d)로 출구 규칙을 만든다. 변동성을 못 구하면 None —
+    Position.exit_plan=None은 DEFAULT_EXIT_PLAN으로 떨어진다(plan_for). 0으로 채우면
+    하한 3%가 박혀 "매우 조용한 종목"으로 오인된다."""
+    if daily_vol_pct is None or daily_vol_pct <= 0:
+        return None
+    window_move = (daily_vol_pct / 100.0) * (EXIT_PLAN_HORIZON_DAYS**0.5)
+    stop = _clamp(EXIT_PLAN_STOP_K * window_move, EXIT_PLAN_STOP_BOUNDS)
+    trail = _clamp(EXIT_PLAN_TRAIL_K * window_move, EXIT_PLAN_TRAIL_BOUNDS)
+    return ExitPlan(
+        stop_loss_pct=-round(stop, 6),
+        take_profit_pct=round(2 * stop, 6),
+        take_profit_fraction=EXIT_PLAN_TAKE_PROFIT_FRACTION,
+        trail_pct=-round(trail, 6),
+    )
+
+
+def exit_trigger(action: SellAction, position: Position) -> str:
+    """사람이 읽는 매도 사유. **판정 로직의 사유(action.reason)는 바꾸지 않는다.**
+
+    SellAction.reason은 1차 익절도 트레일링도 "take_profit_trail"이다 — execute_sell이 그
+    문자열로 익절 단계를 올리고 고점을 리셋하므로 거기를 쪼개면 분기 하나만 놓쳐도 단계가
+    안 올라가 매분 재발동한다(2026-09-02 캐스케이드와 같은 부류). 그래서 표시·기록 층에서만
+    가른다: 매도 직전 take_profit_stage가 0이면 진입가 대비 1차 익절, 1 이상이면 고점 대비
+    트레일링이다(evaluate_deterministic_sell의 분기와 같은 기준).
+
+    2026-09-07 007660 1차 익절이 로그에 take_profit_trail로 찍혀, 9/2에 폐기한 "구간 판정
+    트레일링"이 살아 있는 것처럼 보였다(첫 1개월 평가 P1-10).
+    """
+    if action.reason == "take_profit_trail":
+        return "take_profit_first" if position.take_profit_stage == 0 else "take_profit_trail"
+    return action.reason
+
+
 def plan_for(position: Position) -> ExitPlan:
     """이 포지션에 적용할 출구 규칙. 진입 시 확정된 게 있으면 그걸 쓰고, 없으면
     고정 기본값으로 떨어진다 — 이 기능 이전에 열린 포지션도 그대로 돌아가야 한다."""

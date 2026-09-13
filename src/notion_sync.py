@@ -49,6 +49,13 @@ DEFAULT_DAILY_REPORT_STATE_PATH = Path("logs/notion_daily_report_state.json")
 # 텍스트라 손보는 이유가 다르다(문서 내용이 아니라 노션 블록 포맷을 고치게 됨).
 DEFAULT_SYNC_STATE_PATH = Path("logs/notion_sync_state.json")
 
+TRIGGER_LABELS = {  # notify.TRIGGER_LABELS와 값은 같지만 독립적으로 둔다(REASON_LABELS와 같은 이유)
+    "stop_loss": "손절",
+    "take_profit_first": "1차익절",
+    "take_profit_trail": "트레일링익절",
+    "llm_discretionary": "LLM재량매도",
+}
+
 REASON_LABELS = {
     "stop_loss": "손절",
     "take_profit_trail": "익절",
@@ -476,10 +483,13 @@ def sell_reason_label(entry: dict) -> str:
     갔다가 되돌아온 포지션을 손절선까지 그냥 타고 내려가게 된다.
     """
     reason = entry.get("reason")
-    if reason == "take_profit_trail":
+    trigger = entry.get("exit_trigger")  # 2026-09-14부터. 1차 익절과 트레일링을 가른다
+    if reason == "take_profit_trail" and trigger != "take_profit_first":
         pnl = entry.get("realized_pnl_pct")
         if pnl is not None and pnl <= 0:
             return "트레일링청산"
+    if trigger:
+        return TRIGGER_LABELS.get(trigger, trigger)
     return REASON_LABELS.get(reason, reason)
 
 

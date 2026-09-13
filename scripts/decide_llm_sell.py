@@ -183,7 +183,7 @@ async def main() -> None:
     # 읽기 전용이고 매매 판단에 되먹이지 않지만, 그래도 예외로 매도 경로를 죽이지는
     # 않게 감싼다. 지표 집계 실패가 장 마감 처리를 막을 이유는 없다.
     try:
-        pipeline.log_monitoring_summary()
+        pipeline.log_monitoring_summary(portfolio=load_portfolio())
     except Exception:
         logger.exception("monitoring_summary_failed")
 

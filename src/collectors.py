@@ -9,9 +9,10 @@ import time
 import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypeVar
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -24,6 +25,8 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 NAVER_CHART_URL = "https://fchart.stock.naver.com/sise.nhn"
+NAVER_REALTIME_QUOTE_URL = "https://polling.finance.naver.com/api/realtime/domestic/stock/{codes}"
+NAVER_REALTIME_TIMEOUT_S = 3.0
 NAVER_STOCK_NEWS_URL = "https://finance.naver.com/item/news_news.naver"
 NAVER_NEWS_HUB_URL = "https://finance.naver.com/news/"
 NAVER_KOSPI200_CONSTITUENTS_URL = "https://finance.naver.com/sise/entryJongmok.naver"
@@ -567,3 +570,70 @@ def fetch_disclosures(ticker: str, lookback_days: int = 30, limit: int = 10) -> 
     if items is None:
         return None
     return items[:limit]
+
+
+def _naver_raw_number(row: dict, key: str) -> float | None:
+    raw = row.get(key)
+    try:
+        value = float(str(raw).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def fetch_naver_quotes(tickers: list[str], *, today: date | None = None) -> dict[str, kis.Quote]:
+    """KIS 시세가 실패한 종목의 **2차 시세 소스**(2026-09-14, 첫 1개월 평가 P1-9).
+
+    첫 달 안전장치 공백 285분의 대부분이 "KIS 시세가 보유 전 종목 실패"였다. 매도 주문은
+    여전히 KIS로만 내지만, 판정까지 KIS에 묶이면 KIS 시세 장애 = 안전장치 실명이다.
+
+    한 번 요청으로 여러 종목을 받는다(콤마 구분). 재시도하지 않는다 — 매분 크론이 곧
+    재시도 루프이고, 이 함수는 이미 KIS가 실패한 회차 안에서 불리므로 오래 붙잡으면 다음
+    분이 락에 막힌다(kis.FAST_FAIL_POLICY와 같은 이유).
+
+    **KRX 필드만 쓴다.** 응답의 integratedPriceInfo·overMarketPriceInfo는 넥스트레이드·
+    시간외가 섞인 값이라 손절 판정 기준으로 쓰면 안 된다. 체결 시각(localTradedAt)이 오늘이
+    아니면 당일 고가·저가를 None으로 둔다 — kis.Quote.traded_today가 False가 되어 개장 전
+    기준가로 판정하지 않는 규약이 KIS와 똑같이 적용된다.
+    """
+    if not tickers:
+        return {}
+    today = today or datetime.now(ZoneInfo("Asia/Seoul")).date()
+    url = NAVER_REALTIME_QUOTE_URL.format(codes=",".join(tickers))
+    try:
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=NAVER_REALTIME_TIMEOUT_S)
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("naver_quote_fetch_failed tickers=%s error=%s", tickers, exc)
+        return {}
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("datas"), list):
+        logger.warning("naver_quote_unexpected_payload tickers=%s type=%s", tickers, type(payload).__name__)
+        return {}
+
+    quotes: dict[str, kis.Quote] = {}
+    for row in payload["datas"]:
+        if not isinstance(row, dict):
+            continue
+        ticker = row.get("itemCode")
+        price = _naver_raw_number(row, "closePriceRaw")
+        if ticker not in tickers or price is None:
+            continue
+        traded_at = str(row.get("localTradedAt") or "")
+        # 체결 시각이 오늘이고 **정규장이 열려 있을 때만** 당일 범위를 믿는다. 장 전·후에는 넥스트레이드
+        # 거래가 섞일 수 있어(독립 리뷰, 실측 미확인) 기준가로 판정하지 않는 쪽을 택한다. active로
+        # 켜기 전에 실제 09:00 응답으로 확인할 것.
+        traded_today = traded_at[:10] == today.isoformat() and row.get("marketStatus") == "OPEN"
+        change = row.get("compareToPreviousClosePriceRaw")
+        try:
+            prev_close = price - float(str(change).replace(",", "")) if change is not None else None
+        except ValueError:
+            prev_close = None
+        quotes[ticker] = kis.Quote(
+            price=price,
+            day_high=_naver_raw_number(row, "highPriceRaw") if traded_today else None,
+            day_low=_naver_raw_number(row, "lowPriceRaw") if traded_today else None,
+            open_price=_naver_raw_number(row, "openPriceRaw") if traded_today else None,
+            prev_close=prev_close if prev_close and prev_close > 0 else None,
+        )
+    return quotes
