@@ -10,6 +10,14 @@ from pydantic import BaseModel
 from src import llm
 
 
+@pytest.fixture(autouse=True)
+def _claude_api_switched_on(monkeypatch):
+    """이 파일은 call_structured의 **켜진 상태** 동작(재시도·로깅·토큰)을 검증한다. 운영
+    스위치(llm.CLAUDE_API_ENABLED)는 2026-09-14부터 꺼져 있고, 꺼진 동작은 맨 아래 테스트가
+    따로 본다. 실제 네트워크는 여전히 conftest가 messages.create 지점에서 막는다."""
+    monkeypatch.setattr(llm, "CLAUDE_API_ENABLED", True)
+
+
 class _DummyModel(BaseModel):
     value: int
 
@@ -245,3 +253,28 @@ def test_call_structured_sends_default_max_tokens(monkeypatch, tmp_path):
 
     assert seen["max_tokens"] == llm._DEFAULT_MAX_TOKENS
     assert llm._DEFAULT_MAX_TOKENS >= 2048
+
+
+# --- 전면 스위치 (2026-09-14) ---
+
+
+def test_switched_off_raises_before_touching_the_client_or_the_call_log(monkeypatch, tmp_path):
+    """꺼져 있으면 네트워크에도 호출 로그에도 닿지 않는다. 호출 로그에 실패 줄이 쌓이면
+    감시 지표의 분석가별 실패율이 "API 장애"로 오염된다 — 우리가 끈 것과 API가 죽은 것은
+    다른 상태다."""
+    monkeypatch.setattr(llm, "CLAUDE_API_ENABLED", False)
+
+    async def must_not_be_called(**kwargs):
+        raise AssertionError("스위치가 꺼졌는데 messages.create가 불렸다")
+
+    monkeypatch.setattr(llm._client.messages, "create", must_not_be_called)
+    log_path = tmp_path / "llm_calls.jsonl"
+
+    with pytest.raises(llm.ClaudeApiDisabled):
+        asyncio.run(
+            llm.call_structured(
+                system="s", user="u", response_model=_DummyModel, json_schema=_SCHEMA, label="chart", log_path=log_path
+            )
+        )
+
+    assert not log_path.exists()

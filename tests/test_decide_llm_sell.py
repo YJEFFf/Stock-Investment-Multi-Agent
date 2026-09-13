@@ -90,6 +90,7 @@ def test_llm_sell_is_stopped_and_calls_nothing(monkeypatch, tmp_path):
 
 def test_decides_sell_without_executing(monkeypatch, tmp_path):
     monkeypatch.setattr(dls, "LLM_SELL_ENABLED", True)  # 경로 자체는 다시 켤 때를 위해 검증한다
+    monkeypatch.setattr(dls.llm, "CLAUDE_API_ENABLED", True)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
 
@@ -127,6 +128,7 @@ def test_decides_sell_without_executing(monkeypatch, tmp_path):
 
 def test_skips_position_when_price_unavailable(monkeypatch, tmp_path):
     monkeypatch.setattr(dls, "LLM_SELL_ENABLED", True)
+    monkeypatch.setattr(dls.llm, "CLAUDE_API_ENABLED", True)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
     portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))
@@ -231,6 +233,7 @@ def test_sync_daily_report_sends_error_alert_on_failure(monkeypatch):
 
 def test_hold_when_judge_sell_returns_none(monkeypatch, tmp_path):
     monkeypatch.setattr(dls, "LLM_SELL_ENABLED", True)
+    monkeypatch.setattr(dls.llm, "CLAUDE_API_ENABLED", True)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
     portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))
@@ -358,6 +361,7 @@ def test_a_ticker_skipped_for_price_failure_still_appears_in_the_judgment_log(mo
     """빠진 종목이 파일에 아예 없으면, 읽는 사람이 "판단하고 안 팔았다"와 "판단을
     못 했다"를 기록의 *부재*로 역추정해야 한다."""
     monkeypatch.setattr(dls, "LLM_SELL_ENABLED", True)
+    monkeypatch.setattr(dls.llm, "CLAUDE_API_ENABLED", True)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
     portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))
@@ -373,3 +377,21 @@ def test_a_ticker_skipped_for_price_failure_still_appears_in_the_judgment_log(mo
         ("skipped", "price_unavailable", "005930")
     ]
     assert rows[0]["unrealized_pct"] is None  # 시세가 없으니 손익도 없다 — 0.0으로 지어내지 않는다
+
+
+def test_llm_sell_stays_off_while_claude_api_is_off_even_if_its_own_flag_is_on(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
+    monkeypatch.setattr(dls, "LLM_SELL_ENABLED", True)
+    monkeypatch.setattr(dls.llm, "CLAUDE_API_ENABLED", False)
+    portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))
+
+    def fail(*a, **k):
+        raise AssertionError("Claude API가 꺼졌는데 재량 매도 경로를 탔다")
+
+    monkeypatch.setattr(dls.pipeline, "make_combined_analyst_fn", fail)
+    monkeypatch.setattr(dls.judgment, "judge_sell", fail)
+
+    asyncio.run(dls.main())
+
+    assert json.loads(dls.PENDING_SELLS_PATH.read_text())["actions"] == []

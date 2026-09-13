@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import judgment, notify, pipeline  # noqa: E402
+from src import judgment, llm, notify, pipeline  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.portfolio_store import load_portfolio  # noqa: E402
 from src.schemas import Decision, GateResult, PortfolioState, RiskGateConfig  # noqa: E402
@@ -91,6 +91,26 @@ async def main() -> None:
     # today_kst로 그날 날짜를 필터링하므로 하루씩 어긋나 매일 "판단 로그가 없다"로
     # 나왔던 버그(2026-08-13 발견).
     day = datetime.now(KST)
+
+    # Claude API를 껐으면 매수 판단 자체를 건너뛴다. 분석가를 돌려 호출마다 실패시키면
+    # 판단 로그에 "분석 실패로 판단 불가"가 수백 건 쌓이고, 신호율 집계가 그날을 "신호 없는
+    # 날"로 센다 — 판단을 안 한 날과 판단했으나 승인 0건인 날은 다른 상태다. 그래서
+    # pipeline.jsonl에는 아무것도 안 쓴다(프리필터도 안 돈다).
+    # 오늘 날짜의 빈 pending_buys는 남긴다 — execute_open이 "decide_buys가 제시간에 못
+    # 끝났다"는 날짜 불일치 오류 알림을 보내지 않게.
+    if not llm.CLAUDE_API_ENABLED:
+        logger.warning("decide_buys_skipped day=%s reason=claude_api_disabled", today_kst.isoformat())
+        PENDING_BUYS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PENDING_BUYS_PATH.write_text(
+            json.dumps(
+                {"day": today_kst.isoformat(), "decisions": [], "skipped": "claude_api_disabled"},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        notify.send_telegram_alert(notify.format_buy_decision_skipped_alert(today_kst.isoformat()))
+        return
+
     config = RiskGateConfig()
     portfolio = load_portfolio()
 

@@ -43,6 +43,10 @@ async def to_korean(text: str | None, label: str = "translate") -> str | None:
     자체를 막는 것보다 낫다."""
     if not text:
         return text
+    if not llm.CLAUDE_API_ENABLED:
+        # 스위치로 끈 것은 실패가 아니다 — 스택트레이스를 남기지 않고 원문을 쓴다.
+        logger.info("translate_skipped label=%s reason=claude_api_disabled", label)
+        return text
 
     try:
         result = await llm.call_structured(

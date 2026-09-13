@@ -158,6 +158,16 @@ def format_buy_decision_alert(day: str, names: list[str]) -> str:
     return f"🔎 [SIMA] 매수 판단 완료 ({day})\n승인 {len(names)}건: {', '.join(names)}\n집행은 09:00 장 시작 직후"
 
 
+def format_buy_decision_skipped_alert(day: str) -> str:
+    """Claude API 스위치가 꺼져 매수 판단을 건너뛴 날. 조용히 넘기지 않는다 — 스위치를
+    켜는 걸 잊으면 매수 판단이 소리 없이 영영 멈춘다."""
+    return (
+        f"⏸ [SIMA] 매수 판단 건너뜀 ({day})\n"
+        "Claude API 정지 중(llm.CLAUDE_API_ENABLED=False) — 신규 매수 없음\n"
+        "보유 종목 손절·익절 감시와 IC 측정은 정상 동작"
+    )
+
+
 def format_sell_decision_alert(day: str, names: list[str]) -> str:
     """decide_llm_sell.py(15:35)가 판단만 마쳤을 때 보내는 요약 — 0건이어도
     보낸다. format_buy_decision_alert와 같은 이유(사용자 요청, 2026-08-11)."""

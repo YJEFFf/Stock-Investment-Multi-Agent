@@ -34,6 +34,21 @@ DEFAULT_LLM_CALL_LOG_PATH = Path("logs/llm_calls.jsonl")
 
 KST = ZoneInfo("Asia/Seoul")
 
+# **Claude API 전면 스위치.** 2026-09-14 사용자 결정으로 끔. 모든 Claude 호출은 이 모듈의
+# call_structured 하나를 지나므로 여기서 막으면 새는 곳이 없다 — 분석가·토론·매니저·
+# 매도 판단·번역 전부. 꺼져 있으면 네트워크에 닿기 전에 ClaudeApiDisabled를 던진다.
+#
+# 코드 상수로 둔 이유: .env나 서버 파일로 두면 git에 흔적이 안 남는다(2026-08-19 크론
+# 직접 수정이 하루 만에 출처 불명이 된 사고). **다시 켤 때는 이 값을 True로 바꾸는 커밋과
+# docs/CHANGELOG.md 항목을 같이 남기고, deploy/pull.sh로 08:25 전에 배포한다.**
+CLAUDE_API_ENABLED = False
+
+
+class ClaudeApiDisabled(RuntimeError):
+    """CLAUDE_API_ENABLED=False일 때 call_structured가 던진다. 네트워크 실패와 구분하려고
+    따로 둔다 — "API가 죽었다"와 "우리가 껐다"는 다른 상태다."""
+
+
 _client = AsyncAnthropic(max_retries=3, timeout=30.0)
 
 T = TypeVar("T", bound=BaseModel)
@@ -91,6 +106,9 @@ async def call_structured(
     분석가·토론·매니저가 공유하는 통로라 여기서 남기지 않으면 나중에 호출별
     분석가 귀속이 불가능해진다.
     """
+    if not CLAUDE_API_ENABLED:
+        raise ClaudeApiDisabled(f"Claude API is switched off (llm.CLAUDE_API_ENABLED=False), label={label}")
+
     log_path = log_path or DEFAULT_LLM_CALL_LOG_PATH
     last_error: Exception | None = None
     total_input_tokens = 0

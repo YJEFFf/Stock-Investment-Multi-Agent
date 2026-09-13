@@ -71,6 +71,7 @@ def test_recording_execute_fn_records_approved_buys_only():
 
 
 def test_main_writes_pending_buys_json_from_run_daily_results(monkeypatch, tmp_path):
+    monkeypatch.setattr(db.llm, "CLAUDE_API_ENABLED", True)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
 
@@ -106,6 +107,7 @@ def test_main_skips_on_non_trading_day(monkeypatch, tmp_path):
 
 
 def test_main_writes_empty_decisions_when_nothing_approved(monkeypatch, tmp_path):
+    monkeypatch.setattr(db.llm, "CLAUDE_API_ENABLED", True)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
 
@@ -121,6 +123,7 @@ def test_main_writes_empty_decisions_when_nothing_approved(monkeypatch, tmp_path
 
 
 def test_run_daily_day_uses_kst_date_not_utc_date_at_0830_cron_time(monkeypatch, tmp_path):
+    monkeypatch.setattr(db.llm, "CLAUDE_API_ENABLED", True)
     """08:30 KST cron 시각은 UTC로는 전날 23:30이다 — pipeline.run_daily에 넘기는
     day가 UTC 기준이면 pipeline.jsonl에 전날 날짜로 기록되고, notion_sync의
     같은 날 필터링과 하루씩 어긋난다("판단 로그가 없다"로 매일 잘못 표시된 버그,
@@ -207,3 +210,30 @@ def test_recording_execute_fn_never_touches_the_broker(monkeypatch):
 
     # 가상 포지션이라 진입가가 없다 — 실제 체결가는 09:01 execute_open이 채운다.
     assert result.positions[0].entry_price is None
+
+
+# --- Claude API 스위치 (2026-09-14) ---
+
+
+def test_main_skips_the_whole_buy_decision_when_claude_api_is_off(monkeypatch, tmp_path):
+    """분석가를 돌려 호출마다 실패시키지 않고 판단 자체를 건너뛴다. pipeline.jsonl에 아무것도
+    안 써야 신호율 집계가 그날을 "승인 0건인 날"로 세지 않는다 — 판단을 안 한 날이다."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+    monkeypatch.setattr(db.llm, "CLAUDE_API_ENABLED", False)
+
+    async def must_not_run(*a, **k):
+        raise AssertionError("Claude API가 꺼졌는데 run_daily(유니버스·프리필터·분석가)를 돌렸다")
+
+    monkeypatch.setattr(db.pipeline, "run_daily", must_not_run)
+    monkeypatch.setattr(db, "load_portfolio", lambda: (_ for _ in ()).throw(AssertionError("상태 파일도 안 읽는다")))
+    alerts = []
+    monkeypatch.setattr(db.notify, "send_telegram_alert", lambda m: alerts.append(m) or True)
+
+    asyncio.run(db.main())
+
+    payload = json.loads(db.PENDING_BUYS_PATH.read_text())
+    assert payload["decisions"] == [] and payload["skipped"] == "claude_api_disabled"
+    assert payload["day"] == db.datetime.now(db.KST).date().isoformat()  # execute_open 날짜 불일치 알림 방지
+    assert not db.pipeline.DEFAULT_LOG_PATH.exists()
+    assert len(alerts) == 1 and "매수 판단 건너뜀" in alerts[0]

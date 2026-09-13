@@ -38,7 +38,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import judgment, kis, notify, notion_sync, pipeline  # noqa: E402
+from src import judgment, kis, llm, notify, notion_sync, pipeline  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.portfolio_store import load_portfolio  # noqa: E402
 
@@ -119,13 +119,17 @@ async def main() -> None:
 
     actions: list[dict] = []
 
-    if portfolio.positions and not LLM_SELL_ENABLED:
+    llm_sell_active = LLM_SELL_ENABLED and llm.CLAUDE_API_ENABLED
+
+    if portfolio.positions and not llm_sell_active:
         logger.info(
-            "llm_sell_disabled positions=%d — 2026-09-14 결정. 결정론적 손절/익절만 유지",
+            "llm_sell_disabled positions=%d llm_sell_enabled=%s claude_api_enabled=%s — 결정론적 손절/익절만 유지",
             len(portfolio.positions),
+            LLM_SELL_ENABLED,
+            llm.CLAUDE_API_ENABLED,
         )
 
-    if portfolio.positions and LLM_SELL_ENABLED:
+    if portfolio.positions and llm_sell_active:
         analyst_fn = pipeline.make_combined_analyst_fn(
             [
                 pipeline.make_chart_analyst_fn(),
@@ -160,7 +164,7 @@ async def main() -> None:
         json.dumps({"decided_on": today_kst.isoformat(), "actions": actions}, ensure_ascii=False, indent=2)
     )
 
-    if LLM_SELL_ENABLED:
+    if llm_sell_active:
         # 정지 중에는 "재량 매도 판단 완료 0건"을 보내지 않는다 — 판단한 적이 없는데
         # 판단했다고 알리는 꼴이다. "판단 안 함"과 "판단했으나 0건"은 다른 상태다.
         names = [pipeline.display_name(a["ticker"]) for a in actions]
