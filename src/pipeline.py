@@ -41,6 +41,11 @@ BUY_SCORE_THRESHOLD = 0.85
 MIN_CONFIDENCE = 0.7
 
 # 포지션 사이징 로직이 아직 없어서 쓰는 고정값 — 실제 사이징 알고리즘이 들어오면 교체.
+# 종목당 진입 비중. 게이트 룰이 아니라 **집행 파라미터**인데, 실제 노출 수준을 결정하는 건
+# 이 값이다 — 게이트(총노출 100%)는 하루 7건을 승인해야 발동한다. 첫 1개월 평가에서
+# "노출 38.5%는 설계가 아니라 이 상수의 잔차"로 지적돼 2026-09-14 사용자 확정 리스크
+# 파라미터로 docs/PLAN.md §5 표에 올렸다. 값은 그대로다 — 표본 축적 중 노출을 바꾸면
+# 성과 비교가 깨진다. 바꾸려면 PLAN 표를 먼저 고친다.
 TRADE_WEIGHT = 0.08
 
 # 판단 시점(전일 데이터 기준)과 실제 집행 시점(장 시작) 사이에 가격이 이 이상
@@ -49,6 +54,10 @@ TRADE_WEIGHT = 0.08
 GAP_SKIP_THRESHOLD_PCT = 0.03
 
 DEFAULT_LOG_PATH = Path("logs/pipeline.jsonl")
+# 프리필터를 통과한 종목이 **어떤 조건으로** 통과했고 그때 모멘텀·RSI가 얼마였는지.
+# 2026-09-14 모멘텀 편향 가설(docs/CHANGELOG.md)의 판정 자료 — 후보군 자체가 "이미
+# 많이 오른 종목"으로 기울어 있는지를 이 로그 없이는 사후에 재구성할 수 없었다.
+DEFAULT_PREFILTER_LOG_PATH = Path("logs/prefilter.jsonl")
 
 # CLAUDE.md "감시 지표" 창. 신호율은 영업일 기준, LLM 호출 집계는 달력일 기준이다.
 MONITORING_WINDOW_TRADING_DAYS = 20
@@ -261,14 +270,25 @@ async def execute_buy_order(
     # 같은 버그다. 같은 함수가 원장 조회에는 이미 _kst_today()를 쓰고 있었다.
     today = _kst_today()
 
-    prev_bars, current_price = await asyncio.gather(
+    prev_bars, quote = await asyncio.gather(
         asyncio.to_thread(kis.fetch_daily_ohlcv, ticker, 2),
-        asyncio.to_thread(kis.fetch_current_price, ticker),
+        _wait_for_traded_quote(ticker),
     )
-    if not prev_bars or current_price is None:
+    if not prev_bars or quote is None:
         logger.warning("execute_buy_order_skipped ticker=%s reason=price_data_unavailable", ticker)
         _log_buy_skip(log_path, today, ticker, "price_data_unavailable")
         return portfolio
+
+    # 오늘 체결이 아직 없으면 현재가 자리에 기준가(전일 종가)가 온다(kis.Quote.traded_today).
+    # 그 값으로 갭을 재면 갭이 항상 0이고, 체결 조회가 실패하면 그 값이 진입가가 된다 —
+    # 2026-08-12 매수 4건이 정확히 그랬다(gap 0.0, 진입가=전일 종가, 그중 하나가
+    # 192820 오익절 캐스케이드 −79만원의 출발점). 매도 경로는 9/8에 막았는데 매수
+    # 경로는 남아 있었다(첫 1개월 평가 P0).
+    if not quote.traded_today:
+        logger.warning("execute_buy_order_skipped ticker=%s reason=pre_open_quote price=%s", ticker, quote.price)
+        _log_buy_skip(log_path, today, ticker, "pre_open_quote")
+        return portfolio
+    current_price = quote.price
 
     prev_close = prev_bars[-1].close
     gap_pct = abs(current_price - prev_close) / prev_close
@@ -462,6 +482,33 @@ def display_name(ticker: str) -> str:
     return (names or {}).get(ticker, ticker)
 
 
+# 09:01에 첫 체결이 아직 안 잡힌 종목을 얼마나 기다릴지. 시가단일가 체결은 종목마다
+# 몇 초~1분 차이로 잡힌다(2026-09-08 quote_at_open 로그). 기다리는 건 데이터 수집
+# 재시도이지 판단 재시도가 아니다(규칙 4) — 판단은 이미 08:30에 끝났다.
+PRE_OPEN_QUOTE_ATTEMPTS = 6
+PRE_OPEN_QUOTE_WAIT_S = 10.0
+
+
+async def _wait_for_traded_quote(ticker: str) -> kis.Quote | None:
+    """오늘 체결이 잡힌 시세를 돌려준다. 끝까지 안 잡히면 마지막(기준가) 시세를 그대로
+    돌려주고 호출부가 traded_today로 가른다. 조회 자체가 실패하면 None."""
+    quote = None
+    for attempt in range(1, PRE_OPEN_QUOTE_ATTEMPTS + 1):
+        quote = await asyncio.to_thread(kis.fetch_quote, ticker)
+        if quote is None or quote.traded_today:
+            return quote
+        logger.info(
+            "execute_buy_order_waiting_for_first_fill ticker=%s attempt=%d/%d price=%s",
+            ticker,
+            attempt,
+            PRE_OPEN_QUOTE_ATTEMPTS,
+            quote.price,
+        )
+        if attempt < PRE_OPEN_QUOTE_ATTEMPTS:
+            await asyncio.sleep(PRE_OPEN_QUOTE_WAIT_S)
+    return quote
+
+
 def _log_buy_skip(log_path: Path, day, ticker: str, reason: str, **extra) -> None:
     """게이트는 승인했는데 execute_buy_order 단계(가격 갭·잔고·주문거부 등)에서
     실제 체결까지는 못 간 경우를 남긴다. 이걸 안 남기면 pipeline.jsonl엔
@@ -560,20 +607,31 @@ def make_combined_analyst_fn(component_fns: list[AnalystFn]) -> AnalystFn:
     return _fn
 
 
-def passes_quant_filter(indicators: dict[str, float], index_return_5d_pct: float | None) -> bool:
-    """비용 게이트일 뿐 품질 판단이 아니다 — "이 종목이 좋다"가 아니라 "오늘 이
-    종목에 평소보다 뭔가 있다"만 본다. 방향 판단은 전적으로 LLM 분석가 몫이다.
+def quant_filter_reasons(indicators: dict[str, float], index_return_5d_pct: float | None) -> list[str]:
+    """프리필터의 세 조건 중 **어느 것이** 걸렸는지. 비어 있으면 통과 못 한 것이다.
 
-    세 조건을 OR로 묶는다: 거래량 급증 / 자기 변동성 대비 정규화한 지수 초과 모멘텀
-    / RSI 극단. 절대 문턱이라 통과 여부에 종목 개수 목표가 없다 — 규칙 2·3.
+    비용 게이트일 뿐 품질 판단이 아니다 — "이 종목이 좋다"가 아니라 "오늘 이
+    종목에 평소보다 뭔가 있다"만 본다. 방향 판단은 전적으로 LLM 분석가 몫이다.
+    세 조건은 OR다: 거래량 급증 / 자기 변동성 대비 정규화한 지수 초과 모멘텀 /
+    RSI 극단. 절대 문턱이라 통과 여부에 종목 개수 목표가 없다 — 규칙 2·3.
+
+    사유를 돌려주는 이유(2026-09-14): 세 조건 중 둘(RSI ≥ 70, 초과 모멘텀)은 "이미
+    많이 오른 종목"을 고르는 조건이다. 후보군이 그쪽으로 기울면 분석가가 무엇을
+    하든 매수는 고점 추격이 된다 — 첫 1개월에 avg_score가 직전 20일 수익률의
+    대리변수(ρ=+0.63)였던 원인의 절반은 여기일 수 있다. 어느 조건이 얼마나
+    자주 걸리는지 기록해야 그 가설을 판정할 수 있다.
     """
+    reasons: list[str] = []
+
     volume_ratio = indicators.get("volume_vs_20d_avg_ratio")
     if volume_ratio is not None and volume_ratio >= QUANT_VOLUME_SURGE_RATIO:
-        return True
+        reasons.append("volume_surge")
 
     rsi = indicators.get("rsi14")
-    if rsi is not None and (rsi >= QUANT_RSI_OVERBOUGHT or rsi <= QUANT_RSI_OVERSOLD):
-        return True
+    if rsi is not None and rsi >= QUANT_RSI_OVERBOUGHT:
+        reasons.append("rsi_overbought")
+    elif rsi is not None and rsi <= QUANT_RSI_OVERSOLD:
+        reasons.append("rsi_oversold")
 
     stock_return = indicators.get("return_5d_pct")
     daily_vol = indicators.get("daily_return_stdev_20d")
@@ -581,13 +639,27 @@ def passes_quant_filter(indicators: dict[str, float], index_return_5d_pct: float
         excess_return = stock_return - index_return_5d_pct
         expected_5d_vol = daily_vol * (5**0.5)
         if expected_5d_vol > 0 and abs(excess_return) / expected_5d_vol >= QUANT_EXCESS_RETURN_Z_THRESHOLD:
-            return True
+            reasons.append("excess_return_up" if excess_return > 0 else "excess_return_down")
 
-    return False
+    return reasons
+
+
+def passes_quant_filter(indicators: dict[str, float], index_return_5d_pct: float | None) -> bool:
+    return bool(quant_filter_reasons(indicators, index_return_5d_pct))
+
+
+PREFILTER_LOGGED_INDICATORS = (
+    "return_5d_pct",
+    "return_20d_pct",
+    "rsi14",
+    "volume_vs_20d_avg_ratio",
+    "close_vs_recent_high_pct",
+    "daily_return_stdev_20d",
+)
 
 
 async def quant_prefilter(
-    universe: list[tuple[str, str]], lookback_days: int = 60
+    universe: list[tuple[str, str]], lookback_days: int = 60, log_path: Path | None = None
 ) -> list[tuple[str, str]]:
     """코스피200 전체를 개별 종목 시세 조회 없이 LLM 분석가에 넘기면 하루 800회
     호출이 된다 (docs/PLAN.md §2). 이 함수는 그 앞단에서 KIS 시세 데이터만으로
@@ -597,27 +669,33 @@ async def quant_prefilter(
     빠진다 — 이미 collectors 단에서 재시도를 다 소진한 뒤의 결과라 여기서 다시
     재시도하지 않는다(규칙 4는 데이터 수집 계층에서 지킨다).
     """
+    log_path = log_path or DEFAULT_PREFILTER_LOG_PATH
     index_bars = await asyncio.to_thread(collectors.fetch_kospi200_index_bars, lookback_days)
     index_indicators = collectors.compute_indicators(index_bars) if index_bars else {}
     index_return_5d_pct = index_indicators.get("return_5d_pct")
 
-    async def _check(ticker: str, sector: str) -> tuple[str, str] | None:
+    async def _check(ticker: str, sector: str) -> tuple[str, str, list[str], dict[str, float]] | None:
         context = await asyncio.to_thread(collectors.fetch_market_context, ticker, lookback_days)
         if context is None:
             return None
-        if passes_quant_filter(context.indicators, index_return_5d_pct):
-            return (ticker, sector)
-        return None
+        reasons = quant_filter_reasons(context.indicators, index_return_5d_pct)
+        if not reasons:
+            return None
+        snapshot = {k: context.indicators[k] for k in PREFILTER_LOGGED_INDICATORS if k in context.indicators}
+        return (ticker, sector, reasons, snapshot)
 
     raw_results = await asyncio.gather(*(_check(t, s) for t, s in universe), return_exceptions=True)
 
+    today = _kst_today().isoformat()
     passed: list[tuple[str, str]] = []
     for (ticker, _), result in zip(universe, raw_results):
         if isinstance(result, BaseException):
             logger.warning("quant_prefilter_failed ticker=%s error=%s", ticker, result)
             continue
         if result is not None:
-            passed.append(result)
+            ticker, sector, reasons, snapshot = result
+            passed.append((ticker, sector))
+            _append_log(log_path, {"day": today, "ticker": ticker, "reasons": reasons, **snapshot})
 
     logger.info("quant_prefilter_done universe=%d passed=%d", len(universe), len(passed))
     return passed
@@ -767,6 +845,21 @@ async def run_day(
                 # 타임스탬프로 역산해야 했다 — 결정 로그만으로는 알 수 없었다.
                 "degraded": decision.degraded,
                 "analysts": sorted(o.agent for o in decision.inputs),
+                # 분석가별 점수·확신도. 평균만 남기면 "어느 분석가에 예측력이 있는가"를
+                # 영영 못 가른다 — 마일스톤 2(분석가 순차 투입 시 신호율 변화 기록)를
+                # 생략한 채 셋을 한꺼번에 붙였고, 첫 1개월 평가는 이 필드가 없어
+                # 분석가별 IC를 낼 수 없었다(2026-09-14).
+                # prompt는 evidence의 "prompt:chart@7a9654" 항목이다. 프롬프트를 바꾼 전후를
+                # 날짜가 아니라 기록으로 가르려면 판단마다 남아야 한다(CLAUDE.md 핵심 계약).
+                "opinions": [
+                    {
+                        "agent": o.agent,
+                        "score": o.score,
+                        "confidence": o.confidence,
+                        "prompt": next((x for x in o.evidence if x.startswith("prompt:")), None),
+                    }
+                    for o in sorted(decision.inputs, key=lambda o: o.agent)
+                ],
                 # HOLD에도 남긴다. 매니저는 매수 여부와 무관하게 출구 계획을 내는데
                 # (prompts/portfolio_manager.md), 지금까지 그 값은 매수가 성사된
                 # 종목에서만 기록됐다. 그래서 "LLM이 종목마다 손절폭을 실제로 다르게

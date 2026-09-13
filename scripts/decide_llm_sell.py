@@ -1,5 +1,14 @@
-"""장 마감 후(15:35 KST cron) 보유 종목 LLM 재량 매도 판단만 하는 진입점 —
-집행은 안 한다.
+"""장 마감 후(15:35 KST cron) 마감 처리 진입점 — 시세 공백 마무리, 감시 지표, 노션 동기화.
+
+**LLM 재량 매도 판단은 2026-09-14부터 정지했다(사용자 결정, LLM_SELL_ENABLED).**
+22거래일 동안 71/71 HOLD였고 exit_strength는 51건이 0.35로 같았다 — 관측된 어떤
+입력에서도 출력이 상수였다. 정보를 더하지 않으면서 매일 보유 종목 수만큼 LLM을
+불렀다. "조건이 안 온 것"과 "조건이 없는 것"을 구분할 수 없는 프롬프트 설계 자체가
+결함이라, 발동 조건을 관측 가능하게 다시 설계하기 전까지 켜지 않는다
+(docs/evaluations/2026-09-13-first-month.md §5-(2)). 코드는 남긴다 — 다시 켤 때
+같은 경로를 쓴다. 결정론적 손절/익절(check_stop_loss, 매분)은 이 결정과 무관하다.
+
+아래는 정지 전 설명이다.
 
 개장 직후엔 변동성이 커서 재평가 기준으로 나쁘다는 사용자 판단에 따라, 하루
 가격 흐름이 정리된 장 마감 후로 옮겼다. 장이 닫힌 뒤엔 KIS가 어차피 주문을
@@ -38,6 +47,7 @@ logger = logging.getLogger("decide_llm_sell")
 
 KST = ZoneInfo("Asia/Seoul")
 PENDING_SELLS_PATH = Path("logs/pending_sells.json")
+LLM_SELL_ENABLED = False  # 2026-09-14 정지. 켜기 전에 모듈 docstring을 읽을 것.
 
 
 async def _sync_daily_report(today_kst, portfolio) -> None:
@@ -109,7 +119,13 @@ async def main() -> None:
 
     actions: list[dict] = []
 
-    if portfolio.positions:
+    if portfolio.positions and not LLM_SELL_ENABLED:
+        logger.info(
+            "llm_sell_disabled positions=%d — 2026-09-14 결정. 결정론적 손절/익절만 유지",
+            len(portfolio.positions),
+        )
+
+    if portfolio.positions and LLM_SELL_ENABLED:
         analyst_fn = pipeline.make_combined_analyst_fn(
             [
                 pipeline.make_chart_analyst_fn(),
@@ -144,8 +160,11 @@ async def main() -> None:
         json.dumps({"decided_on": today_kst.isoformat(), "actions": actions}, ensure_ascii=False, indent=2)
     )
 
-    names = [pipeline.display_name(a["ticker"]) for a in actions]
-    notify.send_telegram_alert(notify.format_sell_decision_alert(today_kst.isoformat(), names))
+    if LLM_SELL_ENABLED:
+        # 정지 중에는 "재량 매도 판단 완료 0건"을 보내지 않는다 — 판단한 적이 없는데
+        # 판단했다고 알리는 꼴이다. "판단 안 함"과 "판단했으나 0건"은 다른 상태다.
+        names = [pipeline.display_name(a["ticker"]) for a in actions]
+        notify.send_telegram_alert(notify.format_sell_decision_alert(today_kst.isoformat(), names))
 
     logger.info(
         "decide_llm_sell_done day=%s decided=%d tickers=%s",

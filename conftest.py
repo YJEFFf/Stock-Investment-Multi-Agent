@@ -1,6 +1,107 @@
+import os
+from datetime import datetime, time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
 import pytest
 
 from src import kis
+
+REPO_ROOT = Path(__file__).resolve().parent
+OPERATIONAL_LOGS = REPO_ROOT / "logs"
+PRODUCTION_REPO = Path("/home/ubuntu/sima")
+CRON_WINDOW = (time(8, 25), time(16, 10))  # deploy/pull.sh와 같은 창. 16:00 IC 측정까지 포함
+
+
+def pytest_sessionstart(session):
+    """운영 EC2에서 거래일 장중에는 테스트를 돌리지 않는다.
+
+    2026-09-08 13:56 장중에 EC2에서 테스트를 돌렸고, 격리가 안 먹은 테스트 하나가 운영
+    매매일지에 가짜 매도를 적었다. 그 시간엔 1분 크론이 같은 파일에 append하고 있어서
+    되돌리는 것조차 장 마감까지 미뤄야 했다. 로컬에서는 이 검사가 아무것도 안 한다.
+    """
+    if REPO_ROOT != PRODUCTION_REPO:
+        return
+    from src.market_calendar import is_krx_trading_day
+
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    if is_krx_trading_day(now.date()) and CRON_WINDOW[0] <= now.time() < CRON_WINDOW[1]:
+        pytest.exit(f"운영 EC2 거래일 장중({now:%H:%M})에는 테스트를 돌리지 않는다. 16:10 이후에.", returncode=3)
+
+
+def _snapshot_logs() -> dict[str, tuple[int, int]]:
+    if not OPERATIONAL_LOGS.exists():
+        return {}
+    return {
+        str(path.relative_to(OPERATIONAL_LOGS)): (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in OPERATIONAL_LOGS.rglob("*")
+        if path.is_file()
+    }
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _operational_logs_must_not_change():
+    """테스트 세션 전후로 운영 logs/가 한 바이트라도 바뀌면 실패한다.
+
+    경로 격리 픽스처가 아무리 촘촘해도 "등록을 잊은 새 경로"와 "정의 시점에 묶인 기본
+    인자"라는 두 구멍으로 네 번 샜다(2026-09-08 docs/CHANGELOG.md). 이 픽스처는 어떤
+    경로로 샜든 결과만 본다 — 테스트가 끝났을 때 운영 기록이 그대로여야 한다는
+    불변식이다. 로컬엔 보통 logs/가 없어 아무것도 안 한다.
+    """
+    before = _snapshot_logs()
+    yield
+    after = _snapshot_logs()
+    changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+    if changed:
+        pytest.fail(f"테스트가 운영 logs/를 건드렸다: {changed} — 어느 테스트인지 찾아 격리할 것", pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def _never_send_telegram(monkeypatch):
+    """텔레그램은 requests.post 지점에서 막는다. 실제 전송은 실패로 흘러 False가 된다.
+
+    send_telegram_alert를 통째로 목킹하지 않는 이유: 그 함수 자체를 검증하는
+    tests/test_notify.py가 requests.post를 직접 목킹하며, monkeypatch 순서상 테스트의
+    목이 이 픽스처를 덮는다. 같은 지점을 막아야 그 테스트가 그대로 유효하다.
+    """
+    import requests
+
+    from src import notify
+
+    def _blocked(*args, **kwargs):
+        raise requests.RequestException("blocked in tests: telegram")
+
+    monkeypatch.setattr(notify.requests, "post", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def _never_reach_notion(monkeypatch):
+    """노션은 requests.request 지점에서 막는다. _notion_request는 400 이상을 재시도
+    없이 None으로 돌려주므로 599를 주면 대기 없이 곧바로 실패한다."""
+    from src import notion_sync
+
+    class _Blocked:
+        status_code = 599
+        text = "blocked in tests: notion"
+        headers: dict = {}
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(notion_sync.requests, "request", lambda *a, **k: _Blocked())
+
+
+@pytest.fixture(autouse=True)
+def _never_call_anthropic(monkeypatch):
+    """Claude API는 클라이언트의 messages.create 지점에서 막는다. tests/test_llm.py가
+    같은 속성을 목킹하므로 그 테스트는 그대로 유효하다(feedback_llm_api_cost)."""
+    from src import llm
+
+    async def _blocked(*args, **kwargs):
+        raise RuntimeError("blocked in tests: anthropic messages.create")
+
+    monkeypatch.setattr(llm._client.messages, "create", _blocked)
+
 
 
 @pytest.fixture(autouse=True)
@@ -53,10 +154,13 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     `trade_journal.jsonl`에 적힌 뒤 다음 날 노션 매매일지까지 동기화됐다.
     그래서 이제 **`src` 전체의 `logs/` 기본값을 빠짐없이 등록한다.**
     """
-    from src import judgment, llm, notion_sync, pipeline, portfolio_store
+    from src import evaluation, judgment, llm, notion_sync, pipeline, portfolio_store
 
     monkeypatch.setattr(judgment, "DEFAULT_SELL_JUDGMENT_LOG_PATH", tmp_path / "sell_judgment.jsonl")
     monkeypatch.setattr(pipeline, "DEFAULT_LOG_PATH", tmp_path / "pipeline.jsonl")
+    monkeypatch.setattr(pipeline, "DEFAULT_PREFILTER_LOG_PATH", tmp_path / "prefilter.jsonl")
+    monkeypatch.setattr(evaluation, "DEFAULT_PRICE_HISTORY_DIR", tmp_path / "price_history")
+    monkeypatch.setattr(evaluation, "DEFAULT_IC_SUMMARY_PATH", tmp_path / "ic_summary.json")
     monkeypatch.setattr(pipeline, "DEFAULT_SELL_LOG_PATH", tmp_path / "sell.jsonl")
     monkeypatch.setattr(pipeline, "DEFAULT_TRADE_JOURNAL_LOG_PATH", tmp_path / "trade_journal.jsonl")
     monkeypatch.setattr(llm, "DEFAULT_LLM_CALL_LOG_PATH", tmp_path / "llm_calls.jsonl")

@@ -42,6 +42,7 @@ REASON_LABELS = {
     "gap_too_large": "갭초과",
     "balance_unavailable": "잔고조회실패",
     "quantity_zero": "수량0",
+    "pre_open_quote": "개장전시세(체결없음)",
     "order_rejected": "주문거부",
     "order_response_lost": "주문응답유실",
 }
@@ -55,6 +56,28 @@ def _truncate(text: str | None, limit: int = 200) -> str:
 
 def format_buy_alert(ticker: str, price: float, quantity: int, reason: str) -> str:
     return f"🟢 [SIMA] 매수\n{ticker} · {price:,.0f}원 · {quantity}주\n사유: {_truncate(reason)}"
+
+
+def format_ic_alert(day: str, segments: dict) -> str:
+    """scripts/measure_ic.py(16:00)의 결과. 숫자가 없으면 없다고 보낸다 — 0으로 채우지 않는다.
+
+    구간마다 한 덩어리다: 전체와, 2026-09-14 차트 프롬프트 변경 이후(사전 등록 가설).
+    """
+    lines = [f"📐 [SIMA] 신호 IC ({day})"]
+    for name, seg in segments.items():
+        label = "전체" if seg["since"] is None else f"{seg['since']} 이후"
+        lines.append(f"— {label} (판단 {seg['decisions']}건)")
+        for k, s in sorted(seg["horizons"].items(), key=lambda kv: int(kv[0])):
+            if s["mean_ic"] is None:
+                lines.append(f"  k={k}: 측정 가능한 날 없음")
+                continue
+            t_part = f" t={s['t_stat']:+.2f}" if s["t_stat"] is not None else ""
+            lines.append(f"  k={k}: IC {s['mean_ic']:+.3f}{t_part} ({s['days_measured']}일, 양 {s['positive_days']}일)")
+        rho = next((s["rho_score_momentum_20d"] for s in seg["horizons"].values()), None)
+        if rho is not None:
+            lines.append(f"  ρ(점수, 직전20일수익률) {rho:+.2f}")
+    lines.append("판단에 되먹이지 않음 · 60거래일 후 실거래 판단(IC≥0.03, t≥2)")
+    return "\n".join(lines)
 
 
 def format_buy_skipped_alert(ticker: str, reason_label: str, detail: str = "") -> str:

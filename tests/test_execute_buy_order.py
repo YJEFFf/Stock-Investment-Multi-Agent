@@ -611,3 +611,83 @@ def test_skips_when_order_response_lost_and_no_fill(monkeypatch, tmp_path):
     assert order_calls["n"] == 1  # 재전송 금지
     entries = [json.loads(line) for line in log_path.read_text().splitlines()]
     assert entries[0]["reason"] == "order_response_lost"
+
+
+# --- 개장 전 기준가 가드 (2026-09-14, 첫 1개월 평가 P0) ---
+
+
+def _wire_happy_path(monkeypatch, orders):
+    monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
+    monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
+    monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, order_date: 101.0)
+    monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: orders.append(qty) or "ODNO1")
+    monkeypatch.setattr(pipeline, "PRE_OPEN_QUOTE_WAIT_S", 0.0)
+
+
+def test_skips_when_the_quote_never_shows_a_fill_today(monkeypatch, tmp_path):
+    """2026-08-12 매수 4건이 전부 gap 0.0·진입가=전일 종가였다. 첫 체결 전에는 현재가
+    자리에 기준가가 와서 갭이 항상 0으로 재지고, 체결 조회가 실패하면 그 값이 진입가가
+    됐다 — 192820 오익절 캐스케이드(−79만원)의 출발점이다."""
+    orders: list[int] = []
+    _wire_happy_path(monkeypatch, orders)
+    calls = []
+
+    def pre_open(ticker, policy=None):
+        calls.append(ticker)
+        return kis.Quote(price=100.0, day_high=None, day_low=None, prev_close=100.0)
+
+    monkeypatch.setattr(kis, "fetch_quote", pre_open)
+    log_path = tmp_path / "trade_journal.jsonl"
+
+    result = asyncio.run(
+        pipeline.execute_buy_order(
+            _decision(), GateResult(approved=True, rejected_by=None), PortfolioState(cash_weight=1.0),
+            "반도체", 0.08, log_path=log_path,
+        )
+    )
+
+    assert result.positions == [] and orders == []
+    assert len(calls) == pipeline.PRE_OPEN_QUOTE_ATTEMPTS  # 데이터 수집 재시도는 끝까지 한다(규칙 4)
+    entry = json.loads(log_path.read_text().splitlines()[0])
+    assert (entry["event"], entry["reason"]) == ("buy_skipped", "pre_open_quote")
+
+
+def test_waits_for_the_first_fill_and_then_buys_on_the_real_price(monkeypatch, tmp_path):
+    orders: list[int] = []
+    _wire_happy_path(monkeypatch, orders)
+    quotes = iter([
+        kis.Quote(price=100.0, day_high=None, day_low=None, prev_close=100.0),  # 09:01:00 기준가
+        kis.Quote(price=101.0, day_high=101.5, day_low=100.5, prev_close=100.0),  # 첫 체결 잡힘
+    ])
+    monkeypatch.setattr(kis, "fetch_quote", lambda ticker, policy=None: next(quotes))
+
+    result = asyncio.run(
+        pipeline.execute_buy_order(
+            _decision(), GateResult(approved=True, rejected_by=None), PortfolioState(cash_weight=1.0),
+            "반도체", 0.08, log_path=tmp_path / "trade_journal.jsonl",
+        )
+    )
+
+    assert len(result.positions) == 1
+    assert orders == [int((100_000_000 * 0.08) // 101.0)]  # 수량도 기준가가 아니라 실제 가격으로
+
+
+def test_a_real_gap_is_still_caught_once_the_quote_is_live(monkeypatch, tmp_path):
+    """가드가 갭 체크를 대체하지 않는다 — 체결이 잡힌 뒤의 진짜 갭은 그대로 거른다."""
+    orders: list[int] = []
+    _wire_happy_path(monkeypatch, orders)
+    monkeypatch.setattr(
+        kis, "fetch_quote",
+        lambda ticker, policy=None: kis.Quote(price=110.0, day_high=110.0, day_low=109.0, prev_close=100.0),
+    )
+    log_path = tmp_path / "trade_journal.jsonl"
+
+    asyncio.run(
+        pipeline.execute_buy_order(
+            _decision(), GateResult(approved=True, rejected_by=None), PortfolioState(cash_weight=1.0),
+            "반도체", 0.08, log_path=log_path,
+        )
+    )
+
+    assert orders == []
+    assert json.loads(log_path.read_text().splitlines()[0])["reason"] == "gap_too_large"

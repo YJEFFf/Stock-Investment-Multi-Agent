@@ -64,7 +64,32 @@ def test_writes_empty_actions_when_no_positions(monkeypatch, tmp_path):
     assert payload["actions"] == []
 
 
+def test_llm_sell_is_stopped_and_calls_nothing(monkeypatch, tmp_path):
+    """2026-09-14 정지. 22거래일 71/71 HOLD — 관측된 어떤 입력에도 출력이 상수였다.
+    정지 중에는 분석가도 매도 판단도 부르지 않고, "재량 매도 판단 완료"도 보내지 않는다
+    (판단한 적이 없는데 0건이라고 알리면 "판단 안 함"과 "판단했으나 0건"이 섞인다)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
+    portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))
+
+    def fail(*a, **k):
+        raise AssertionError("정지 중에는 LLM 재량 매도 경로를 타면 안 된다")
+
+    monkeypatch.setattr(dls.pipeline, "make_combined_analyst_fn", fail)
+    monkeypatch.setattr(dls.judgment, "judge_sell", fail)
+    monkeypatch.setattr(kis, "fetch_current_price", fail)
+    alerts = []
+    monkeypatch.setattr(dls.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    assert dls.LLM_SELL_ENABLED is False
+    asyncio.run(dls.main())
+
+    assert json.loads(dls.PENDING_SELLS_PATH.read_text())["actions"] == []
+    assert not any("재량 매도 판단 완료" in a for a in alerts)
+
+
 def test_decides_sell_without_executing(monkeypatch, tmp_path):
+    monkeypatch.setattr(dls, "LLM_SELL_ENABLED", True)  # 경로 자체는 다시 켤 때를 위해 검증한다
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
 
@@ -101,6 +126,7 @@ def test_decides_sell_without_executing(monkeypatch, tmp_path):
 
 
 def test_skips_position_when_price_unavailable(monkeypatch, tmp_path):
+    monkeypatch.setattr(dls, "LLM_SELL_ENABLED", True)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
     portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))
@@ -204,6 +230,7 @@ def test_sync_daily_report_sends_error_alert_on_failure(monkeypatch):
 
 
 def test_hold_when_judge_sell_returns_none(monkeypatch, tmp_path):
+    monkeypatch.setattr(dls, "LLM_SELL_ENABLED", True)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
     portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))
@@ -330,6 +357,7 @@ def test_monitoring_summary_failure_does_not_break_the_sell_path(monkeypatch, tm
 def test_a_ticker_skipped_for_price_failure_still_appears_in_the_judgment_log(monkeypatch, tmp_path):
     """빠진 종목이 파일에 아예 없으면, 읽는 사람이 "판단하고 안 팔았다"와 "판단을
     못 했다"를 기록의 *부재*로 역추정해야 한다."""
+    monkeypatch.setattr(dls, "LLM_SELL_ENABLED", True)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(dls, "is_krx_trading_day", lambda day: True)
     portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[_position()]))

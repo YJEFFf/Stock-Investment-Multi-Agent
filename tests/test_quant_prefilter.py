@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import date, datetime, timezone
 
 from src import collectors, pipeline
@@ -240,3 +241,37 @@ def test_run_daily_returns_empty_when_universe_unavailable(monkeypatch, tmp_path
 
     assert results == []
     assert portfolio_out == portfolio_in
+
+
+# --- 통과 사유 기록 (2026-09-14 모멘텀 편향 가설의 판정 자료) ---
+
+
+def test_filter_reasons_name_which_condition_let_a_ticker_through():
+    assert pipeline.quant_filter_reasons({"volume_vs_20d_avg_ratio": 2.5}, None) == ["volume_surge"]
+    assert pipeline.quant_filter_reasons({"rsi14": 75.0}, None) == ["rsi_overbought"]
+    assert pipeline.quant_filter_reasons({"rsi14": 25.0}, None) == ["rsi_oversold"]
+    assert pipeline.quant_filter_reasons({"rsi14": 50.0, "volume_vs_20d_avg_ratio": 1.0}, None) == []
+    up = {"return_5d_pct": 10.0, "daily_return_stdev_20d": 1.0}
+    down = {"return_5d_pct": -10.0, "daily_return_stdev_20d": 1.0}
+    assert pipeline.quant_filter_reasons(up, 0.0) == ["excess_return_up"]
+    assert pipeline.quant_filter_reasons(down, 0.0) == ["excess_return_down"]
+
+
+def test_prefilter_logs_why_each_passing_ticker_passed(monkeypatch, tmp_path):
+    """후보군이 "이미 많이 오른 종목"으로 기울어 있는지를 사후에 재구성할 수 없었다.
+    통과한 종목만, 사유와 그 순간의 모멘텀·RSI를 함께 남긴다."""
+    monkeypatch.setattr(collectors, "fetch_kospi200_index_bars", lambda lookback_days: None)
+    contexts = {
+        "005930": _context("005930", {"rsi14": 78.0, "return_20d_pct": 31.5}),
+        "000660": _context("000660", {"rsi14": 50.0, "volume_vs_20d_avg_ratio": 1.0}),
+    }
+    monkeypatch.setattr(collectors, "fetch_market_context", lambda ticker, lookback_days: contexts[ticker])
+    log_path = tmp_path / "prefilter.jsonl"
+
+    asyncio.run(pipeline.quant_prefilter([("005930", "반도체"), ("000660", "반도체")], log_path=log_path))
+
+    rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == "005930"
+    assert rows[0]["reasons"] == ["rsi_overbought"]
+    assert rows[0]["return_20d_pct"] == 31.5 and rows[0]["rsi14"] == 78.0

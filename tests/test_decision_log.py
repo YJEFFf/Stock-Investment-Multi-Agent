@@ -147,3 +147,18 @@ def test_degraded_flag_is_logged(tmp_path):
     assert all(r["degraded"] is False for r in healthy_rows)
     assert all(r["analysts"] == ["chart"] for r in degraded_rows)
 
+
+
+def test_each_analysts_score_is_logged_not_just_the_average(tmp_path):
+    """평균만 남기면 "어느 분석가에 예측력이 있는가"를 영영 못 가른다. 마일스톤 2(분석가를
+    하나씩 붙이며 신호율 변화를 기록)를 생략한 채 셋을 한꺼번에 붙였고, 첫 1개월 평가는
+    이 필드가 없어 분석가별 IC를 낼 수 없었다(2026-09-14)."""
+    entries = _run(tmp_path, _judge_holding_with_plan(-0.06))
+
+    assert entries
+    for e in entries:
+        assert [o["agent"] for o in e["opinions"]] == e["analysts"]
+        scores = [o["score"] for o in e["opinions"]]
+        assert sum(scores) / len(scores) == e["avg_score"]
+        assert all({"agent", "score", "confidence", "prompt"} == set(o) for o in e["opinions"])
+        assert all(o["prompt"] == "prompt:dummy@m1" for o in e["opinions"])
