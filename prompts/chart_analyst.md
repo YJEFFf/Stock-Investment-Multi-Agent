@@ -27,6 +27,21 @@ is price relative to them), momentum (RSI, recent returns), volume behavior (is
 volume confirming the price move), and position relative to recent support/resistance
 (20-day high/low).
 
+## An extended move is not a bullish signal by itself
+
+A stock that has already risen a lot over the last 20 days (`return_20d_pct`, and how
+close the price sits to `recent_high_20d`) is not a buy on that fact alone — that move is
+already in the price. Two pictures look alike and must be told apart:
+
+- A trend with room: moving averages aligned, price consolidating near its highs on
+  subdued volume, RSI below overbought.
+- An extended move: a large 20-day gain, RSI at or above 70, price stretched well above
+  its moving averages, volume fading while price keeps rising.
+
+Score the second picture at neutral or below unless today's volume confirms a fresh
+breakout. Never let a large past return raise the score on its own — past returns are
+context for reading the chart, not evidence about what comes next.
+
 Respond with a single JSON object, and nothing else:
 
 - `score`: a number from -1.0 (strongly bearish chart) to 1.0 (strongly bullish
