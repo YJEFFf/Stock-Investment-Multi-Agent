@@ -164,7 +164,7 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     `trade_journal.jsonl`에 적힌 뒤 다음 날 노션 매매일지까지 동기화됐다.
     그래서 이제 **`src` 전체의 `logs/` 기본값을 빠짐없이 등록한다.**
     """
-    from src import evaluation, judgment, llm, notion_sync, pipeline, portfolio_store
+    from src import codex_plan, evaluation, judgment, llm, notion_sync, pipeline, portfolio_store
 
     monkeypatch.setattr(judgment, "DEFAULT_SELL_JUDGMENT_LOG_PATH", tmp_path / "sell_judgment.jsonl")
     monkeypatch.setattr(pipeline, "DEFAULT_LOG_PATH", tmp_path / "pipeline.jsonl")
@@ -175,6 +175,7 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline, "DEFAULT_SELL_LOG_PATH", tmp_path / "sell.jsonl")
     monkeypatch.setattr(pipeline, "DEFAULT_TRADE_JOURNAL_LOG_PATH", tmp_path / "trade_journal.jsonl")
     monkeypatch.setattr(llm, "DEFAULT_LLM_CALL_LOG_PATH", tmp_path / "llm_calls.jsonl")
+    monkeypatch.setattr(codex_plan, "DEFAULT_CALL_LOG_PATH", tmp_path / "codex_plan_calls.jsonl")
     monkeypatch.setattr(notion_sync, "DEFAULT_PIPELINE_LOG_PATH", tmp_path / "pipeline.jsonl")
     monkeypatch.setattr(notion_sync, "DEFAULT_TRADE_JOURNAL_LOG_PATH", tmp_path / "trade_journal.jsonl")
     monkeypatch.setattr(
@@ -183,6 +184,17 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(notion_sync, "DEFAULT_SYNC_STATE_PATH", tmp_path / "notion_sync_state.json")
     monkeypatch.setattr(portfolio_store, "PORTFOLIO_STATE_PATH", tmp_path / "portfolio_state.json")
     monkeypatch.setattr(portfolio_store, "PORTFOLIO_LOCK_PATH", tmp_path / "portfolio_state.lock")
+
+
+@pytest.fixture(autouse=True)
+def _never_spend_the_chatgpt_plan(monkeypatch):
+    """테스트가 저장된 ChatGPT 플랜을 실제로 소모하지 않게 막는다."""
+    from src import codex_plan
+
+    def blocked(*args, **kwargs):
+        raise AssertionError("test attempted to start a real Codex process")
+
+    monkeypatch.setattr(codex_plan.subprocess, "run", blocked)
 
 
 @pytest.fixture(autouse=True)

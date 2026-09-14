@@ -81,6 +81,7 @@ docs/PLAN.md            # 설계 배경과 근거
 
 | 시각 | 스크립트 | 하는 일 |
 |---|---|---|
+| 08:05 | `check_codex_plan.sh` | API 키 없이 저장된 ChatGPT 로그인으로 GPT-5.6 Sol 구조화 출력 연결 상태만 확인. 주식 판단·주문 없음 |
 | 08:30 | `decide_buys.sh` | 유니버스 → 정량 필터 → 분석가 → 토론+매니저 → 게이트. 승인된 BUY를 `logs/pending_buys.json`에 기록만 하고 집행 안 함 |
 | 09:00 | `execute_open.sh` | 전날 15:35에 정해둔 매도(`pending_sells.json`)를 먼저 집행 → 오늘 08:30에 정해둔 매수(`pending_buys.json`) 집행. 그 직후 노션 매매일지(`notion_sync.sync_trade_journal`) 동기화 |
 | 09:00–15:30 (매분) | `check_stop_loss.sh` | 보유 종목 전부 결정론적 손절(-10%)/트레일링 익절(+20%)만 체크·집행. LLM 없음 |
@@ -107,6 +108,11 @@ uv sync
 - `NOTION_API_KEY`, `NOTION_PARENT_PAGE_ID`, `NOTION_TRADE_JOURNAL_DB_ID`,
   `NOTION_DAILY_REPORT_DB_ID`, `NOTION_INTRO_PAGE_ID` — 매매일지·일일 리포트
   동기화 (선택, `scripts/setup_notion_workspace.py`로 최초 생성)
+
+ChatGPT 플랜 기반 Codex 점검은 API 키를 읽지 않는다. EC2의 자격증명 없는 전용
+`sima-codex` OS 계정에 ChatGPT 로그인을 저장하고 그 계정으로만 실행한다. 호출별 실제
+사용량은 `logs/codex_plan_calls.jsonl`에 별도로 남는다. 현재는 고정 연결 상태 점검만
+하고 매수 판단과 주문 입력은 받지 않는다.
 
 ## 테스트
 

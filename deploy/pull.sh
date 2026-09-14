@@ -12,6 +12,11 @@ set -euo pipefail
 cd "$HOME/sima"
 export PATH="$HOME/.local/bin:$PATH"
 
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "거부: 운영 체크아웃에 추적 파일 변경이 있다. 먼저 원인을 확인할 것." >&2
+  exit 5
+fi
+
 uv run python - <<'PY'
 import sys
 from datetime import datetime, time
@@ -35,8 +40,11 @@ PY
 TRADING_PATHS=(
   src/sell.py src/pipeline.py src/kis.py src/collectors.py src/schemas.py src/portfolio_store.py
   src/notify.py src/judgment.py src/translate.py src/llm.py
+  src/codex_plan.py
   scripts/execute_open.py scripts/check_stop_loss.py scripts/decide_buys.py scripts/decide_llm_sell.py
+  scripts/check_codex_plan.py
   scripts/check_stop_loss.sh scripts/execute_open.sh scripts/decide_buys.sh scripts/decide_llm_sell.sh
+  scripts/check_codex_plan.sh
   deploy/crontab
 )
 git fetch --quiet origin
@@ -53,6 +61,41 @@ fi
 
 # 검사한 바로 그 커밋으로만 옮긴다. `git pull`은 한 번 더 fetch해서, 검사 뒤에 push된 커밋이
 # 리뷰 없이 따라 들어올 수 있다(독립 리뷰 지적).
+OLD_HEAD=$(git rev-parse HEAD)
+CRONTAB_BACKUP=$(mktemp)
+CRONTAB_ERROR=$(mktemp)
+HAD_CRONTAB=0
+if crontab -l >"$CRONTAB_BACKUP" 2>"$CRONTAB_ERROR"; then
+  HAD_CRONTAB=1
+elif grep -q '^no crontab for ' "$CRONTAB_ERROR"; then
+  HAD_CRONTAB=0
+else
+  cat "$CRONTAB_ERROR" >&2
+  rm -f "$CRONTAB_BACKUP" "$CRONTAB_ERROR"
+  echo "거부: 기존 크론을 읽지 못해 안전한 롤백 상태를 만들 수 없다." >&2
+  exit 6
+fi
+rollback_on_failure() {
+  status=$?
+  trap - EXIT
+  if [ "$status" -ne 0 ]; then
+    git reset --hard --quiet "$OLD_HEAD"
+    if [ "$HAD_CRONTAB" -eq 1 ]; then
+      crontab "$CRONTAB_BACKUP"
+    else
+      crontab -r 2>/dev/null || true
+    fi
+    echo "배포 실패: 코드와 크론을 $OLD_HEAD 상태로 복구했다." >&2
+  fi
+  rm -f "$CRONTAB_BACKUP" "$CRONTAB_ERROR"
+  exit "$status"
+}
+trap rollback_on_failure EXIT
+
 git merge --ff-only --quiet "$TARGET"
 uv run pytest -q 2>&1 | tail -2
+if ! cmp -s <(crontab -l 2>/dev/null || true) deploy/crontab; then
+  crontab deploy/crontab
+  echo "crontab updated from deploy/crontab"
+fi
 git log --oneline -1

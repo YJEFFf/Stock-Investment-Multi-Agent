@@ -7,6 +7,11 @@
 # 2026-08-19 execute_open을 09:00에서 09:01로 옮긴 변경이 정확히 그렇게 유실될 뻔했다
 # (docs/CHANGELOG.md 2026-08-20 항목).
 
+# 08:05 — ChatGPT 플랜 기반 Codex 연결 상태만 확인. 주식 판단·주문 없음.
+# Claude API와 OpenAI API 키를 모두 쓰지 않고, 저장된 ChatGPT 로그인 + Sol 구조화
+# 출력이 살아 있는지만 본다. 실패하면 텔레그램, 신규 매수는 계속 정지 상태다.
+5 8 * * 1-5      /home/ubuntu/sima/scripts/check_codex_plan.sh
+
 # 08:30 — 매수 판단만. 집행 안 함. 개장 30분 전.
 30 8 * * 1-5    /home/ubuntu/sima/scripts/decide_buys.sh
 

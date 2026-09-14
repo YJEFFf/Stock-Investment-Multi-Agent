@@ -84,8 +84,13 @@ BLACKOUT_CONTEXT = "holdings_all_prices_unavailable"
 # 본 뒤 켠다(docs/PLAN.md "매매 경로 변경 절차"). 켜기 전에 cron.log의
 # secondary_quote_shadow / secondary_quote_agreement 줄을 볼 것.
 SECONDARY_QUOTE_MODE = "shadow"
-# 섀도 기간에 KIS·네이버 가격이 실제로 같은지 하루 한 번 대조하는 창(장 마감 직전).
-SECONDARY_QUOTE_AGREEMENT_WINDOW = (time(15, 20), time(15, 21))
+# 섀도 기간에 KIS·네이버 가격이 실제로 같은지 개장 직후와 장 마감 직전에 대조한다.
+# 개장 직후 표본은 넥스트레이드·전일 기준가가 섞이지 않는지 확인하기 위한 것이고,
+# 15:20 표본은 하루 가격 범위가 쌓인 뒤에도 KRX 필드가 일치하는지 확인한다.
+SECONDARY_QUOTE_AGREEMENT_WINDOWS = (
+    ("open", time(9, 2), time(9, 3)),
+    ("close", time(15, 20), time(15, 21)),
+)
 SECONDARY_QUOTE_WALL_TIMEOUT_S = 5.0  # 회차 안에서 네이버를 기다리는 벽시계 상한
 
 # 하루 안전장치 공백 예산(분). 09:00~15:30 391개 회차 중 판정한 회차가 없는 분을 센다.
@@ -1078,10 +1083,13 @@ def _apply_secondary_quotes(
 
 
 async def _check_secondary_quote_agreement(quote_by_ticker: dict[str, kis.Quote]) -> None:
-    """섀도 기간에 하루 한 번(15:20 회차) KIS와 네이버 현재가를 같은 순간에 대조한다.
-    2차 소스를 active로 켜기 전의 증거다 — KIS가 멀쩡한 날에도 표본이 쌓이게 한다."""
-    start, end = SECONDARY_QUOTE_AGREEMENT_WINDOW
-    if not quote_by_ticker or not (start <= datetime.now(KST).time() < end):
+    """섀도 기간 09:02·15:20에 KIS와 네이버 현재가를 같은 순간에 대조한다."""
+    now = datetime.now(KST).time()
+    phase = next(
+        (name for name, start, end in SECONDARY_QUOTE_AGREEMENT_WINDOWS if start <= now < end),
+        None,
+    )
+    if not quote_by_ticker or phase is None:
         return
     secondary = await asyncio.wait_for(
         asyncio.to_thread(collectors.fetch_naver_quotes, sorted(quote_by_ticker)), SECONDARY_QUOTE_WALL_TIMEOUT_S
@@ -1092,8 +1100,8 @@ async def _check_secondary_quote_agreement(quote_by_ticker: dict[str, kis.Quote]
         if t in secondary and q.price > 0
     }
     logger.info(
-        "secondary_quote_agreement compared=%d of %d max_abs_diff_pct=%s",
-        len(diffs), len(quote_by_ticker),
+        "secondary_quote_agreement phase=%s compared=%d of %d max_abs_diff_pct=%s",
+        phase, len(diffs), len(quote_by_ticker),
         f"{max(diffs.values()) * 100:.3f}" if diffs else "none",
     )
 
@@ -1166,8 +1174,6 @@ async def evaluate_holdings(
                 asyncio.to_thread(collectors.fetch_naver_quotes, missing), SECONDARY_QUOTE_WALL_TIMEOUT_S
             )
             _apply_secondary_quotes(portfolio, quote_by_ticker, secondary, missing)
-        elif SECONDARY_QUOTE_MODE == "shadow":
-            await _check_secondary_quote_agreement(quote_by_ticker)
     except Exception as exc:  # noqa: BLE001 - 2차 시세는 보조 장치다
         logger.warning("secondary_quote_block_failed missing=%s error=%r", missing, exc)
 
@@ -1288,6 +1294,14 @@ async def evaluate_holdings(
             portfolio, action, position, current_price, day, sell_execute_fn, log_path, trade_journal_log_path
         )
         sells += 1
+
+    # 정상 KIS 시세와 네이버를 비교하는 관측 작업은 손절·익절 판정 뒤에만 한다.
+    # 2차 소스가 5초 상한까지 느려도 안전 주문을 늦춰서는 안 된다.
+    if not missing and SECONDARY_QUOTE_MODE == "shadow":
+        try:
+            await _check_secondary_quote_agreement(quote_by_ticker)
+        except Exception as exc:  # noqa: BLE001 - 관측 실패로 안전장치 회차를 실패시키지 않는다
+            logger.warning("secondary_quote_agreement_failed error=%r", exc)
 
     # 성공한 회차도 한 줄 남긴다. 이게 없으면 "문턱을 안 넘어서 조용한 회차"와
     # "아예 안 돈 회차"가 로그에서 완전히 같은 모양이다 — 2026-08-21 장애를

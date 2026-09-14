@@ -159,7 +159,7 @@ def test_the_secondary_source_is_not_called_when_kis_answered(monkeypatch):
     monkeypatch.setattr(kis, "fetch_quote", lambda ticker, policy=None: kis.Quote(price=99.0, day_high=99.0, day_low=99.0))
     monkeypatch.setattr(collectors, "fetch_naver_quotes", lambda tickers, **kw: (_ for _ in ()).throw(AssertionError("불필요한 2차 조회")))
     monkeypatch.setattr(pipeline, "_kst_today", lambda: TODAY)
-    monkeypatch.setattr(pipeline, "SECONDARY_QUOTE_AGREEMENT_WINDOW", (datetime.min.time(), datetime.min.time()))
+    monkeypatch.setattr(pipeline, "SECONDARY_QUOTE_AGREEMENT_WINDOWS", ())
 
     asyncio.run(pipeline.evaluate_holdings(_portfolio(), DAY, sell.execute_sell_simulated))
 
@@ -167,6 +167,48 @@ def test_the_secondary_source_is_not_called_when_kis_answered(monkeypatch):
 def test_the_default_mode_is_shadow_until_the_soak_is_reviewed():
     """매매 경로 변경은 최소 1거래일 섀도로 돌린 뒤 켠다(docs/PLAN.md 매매 경로 변경 절차)."""
     assert pipeline.SECONDARY_QUOTE_MODE == "shadow"
+
+
+@pytest.mark.parametrize("phase", ["open", "close"])
+def test_agreement_runs_in_both_observation_windows(monkeypatch, caplog, phase):
+    quote = kis.Quote(price=100.0, day_high=101.0, day_low=99.0)
+    monkeypatch.setattr(
+        collectors,
+        "fetch_naver_quotes",
+        lambda tickers, **kw: {ticker: quote for ticker in tickers},
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "SECONDARY_QUOTE_AGREEMENT_WINDOWS",
+        ((phase, datetime.min.time(), datetime.max.time()),),
+    )
+
+    with caplog.at_level(logging.INFO, logger="src.pipeline"):
+        asyncio.run(pipeline._check_secondary_quote_agreement({"005930": quote}))
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(f"secondary_quote_agreement phase={phase}" in message for message in messages)
+
+
+def test_agreement_observation_runs_after_stop_loss_evaluation(monkeypatch):
+    events = []
+    quote = kis.Quote(price=85.0, day_high=85.0, day_low=85.0)
+    monkeypatch.setattr(kis, "fetch_quote", lambda ticker, policy=None: quote)
+    monkeypatch.setattr(pipeline, "_kst_today", lambda: TODAY)
+
+    async def fake_finalize(portfolio, action, *args, **kwargs):
+        events.append("stop_loss")
+        return portfolio
+
+    async def fake_agreement(quotes):
+        events.append("agreement")
+
+    monkeypatch.setattr(pipeline, "finalize_sell", fake_finalize)
+    monkeypatch.setattr(pipeline, "_check_secondary_quote_agreement", fake_agreement)
+
+    asyncio.run(pipeline.evaluate_holdings(_portfolio(), DAY, sell.execute_sell_simulated))
+
+    assert events == ["stop_loss", "agreement"]
 
 
 def test_a_broken_secondary_source_never_stops_the_stop_loss_on_priced_holdings(monkeypatch):

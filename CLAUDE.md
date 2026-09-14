@@ -135,7 +135,9 @@ docs/CHANGELOG.md  # 변경·특이사항 기록 (날짜 필수)
 ## 기술 스택
 
 - Python 3.11+, pydantic v2, asyncio
-- Anthropic API 직접 호출. **LangGraph / CrewAI / AutoGen 사용하지 않는다.**
+- 운영 매수 판단은 현재 정지된 Anthropic API 경로를 유지한다. ChatGPT 플랜 기반
+  Codex CLI는 별도 섀도 연결 점검만 하며, 검증 없이 주문 판단에 연결하지 않는다.
+  **LangGraph / CrewAI / AutoGen 사용하지 않는다.**
   이 시스템은 에이전트 간 대화나 동적 툴 호출이 없고 병렬 호출 후 스키마 취합이
   전부라서, 프레임워크는 디버깅만 어렵게 만든다.
 - 분석가 호출은 `asyncio.gather(..., return_exceptions=True)`.
