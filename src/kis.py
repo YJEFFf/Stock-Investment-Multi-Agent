@@ -2,9 +2,9 @@
 
 collectors.py(Naver 스크래핑)와 분리한 이유: 인증 토큰 수명 관리·초당 거래건수
 제한 대응은 HTML 파싱과 완전히 다른 종류의 문제라 고치는 이유가 다르다
-(CLAUDE.md "쪼개는 시점" 원칙).
+(AGENTS.md "쪼개는 시점" 원칙).
 
-CLAUDE.md 규칙 7: 모의투자 도메인(openapivts)만 호출한다. 실전투자 도메인
+AGENTS.md 규칙 7: 모의투자 도메인(openapivts)만 호출한다. 실전투자 도메인
 (openapi.koreainvestment.com)은 이 파일 어디에도 등장하지 않는다.
 
 실측으로 확인한 것 (2026-08-08, 모의투자 계좌):
@@ -249,7 +249,7 @@ def _kis_request(
     재시도 대상은 "다시 보내면 통과할 수 있는 실패"뿐이다 — 네트워크 예외와
     용량 거부(_is_capacity_rejection). 비즈니스 오류(rt_cd != "0", 예: 잘못된
     종목코드·잔고 부족)는 몇 번을 보내도 같은 답이라 즉시 실패로 처리한다.
-    CLAUDE.md 규칙 4의 "수집 실패는 재시도 OK, 결과가 마음에 안 들어 재시도는
+    AGENTS.md 규칙 4의 "수집 실패는 재시도 OK, 결과가 마음에 안 들어 재시도는
     금지"와 같은 구분선이다.
 
     **idempotent=False는 주문 전용이다(_kis_post).** 주문 POST는 재전송하면 같은

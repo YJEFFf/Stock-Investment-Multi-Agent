@@ -45,7 +45,7 @@ DEFAULT_PIPELINE_LOG_PATH = Path("logs/pipeline.jsonl")
 DEFAULT_TRADE_JOURNAL_LOG_PATH = Path("logs/trade_journal.jsonl")
 DEFAULT_DAILY_REPORT_STATE_PATH = Path("logs/notion_daily_report_state.json")
 
-# CLAUDE.md/PLAN.md와 다른 파일로 관리하는 이유: 코드가 아니라 노션 표시용
+# AGENTS.md/PLAN.md와 다른 파일로 관리하는 이유: 코드가 아니라 노션 표시용
 # 텍스트라 손보는 이유가 다르다(문서 내용이 아니라 노션 블록 포맷을 고치게 됨).
 DEFAULT_SYNC_STATE_PATH = Path("logs/notion_sync_state.json")
 
@@ -261,32 +261,30 @@ def _intro_page_blocks() -> list[dict]:
             "\"판단했으나 점수가 낮음\"은 다른 상태라 None과 낮은 점수를 구분한다."
         ),
         _code_block(CORE_CONTRACT_CODE, language="python"),
-        _heading("리스크 게이트 수치 (2026-08-08 확정)", level=2),
+        _heading("현재 리스크 게이트 수치", level=2),
         _bulleted("종목당 최대 비중 15%"),
-        _bulleted("섹터 집중도 한도 40%"),
-        _bulleted("일일 손실 한도 -5% (도달 시 그날 신규 매수 중단)"),
-        _bulleted("총 노출 한도 100% (개별 한도로만 통제, 별도 상한 없음)"),
-        _heading("매도 로직 (2026-08-09 확정, 2026-08-15 종목별 조정)", level=2),
+        _bulleted("총 노출 한도 100% (같은 날 승인된 신규 매수까지 누적해서 검사)"),
+        _bulleted("섹터 집중도 한도와 개장 전 일일 손실 한도는 폐기됨"),
+        _heading("매도 로직", level=2),
         _bulleted(
             "결정론적 안전장치(항상 실행): 손절 도달 시 전량 매도, 익절 트리거부터 잔량의 일정 비율씩 "
-            "트레일링 매도. 문턱은 종목마다 다르다 — 진입 시점에 포트폴리오 매니저가 그 종목의 변동성에 "
-            "맞춰 정하고(손절 3~15%, 익절은 항상 그 2배), 청산까지 바뀌지 않는다"
+            "트레일링 매도. 문턱은 종목마다 다르다 — 진입 시점에 코드가 직전 20일 변동성으로 "
+            "정하고(손절 3~15%, 익절은 항상 그 2배), 청산까지 바뀌지 않는다"
         ),
         _bulleted(
             "보유 중에는 문턱을 재조정하지 않는다 — 손실 종목 앞에서 손절선을 다시 물으면 넓히는 쪽 "
-            "논거가 반드시 나오기 때문이다. 분석가가 일부 빠진 판단(degraded)은 고정 기본값(-10%/+20%/"
-            "1-3씩/-7%)으로 떨어진다"
+            "논거가 반드시 나오기 때문이다. 20일 변동성을 구할 수 없을 때만 고정 기본값으로 떨어진다"
         ),
         _bulleted(
-            "LLM 재량 매도(보유 종목 재평가, 옵션): 매수용 강세/약세 토론+매니저와 대칭 구조이지만 "
-            "게이트를 거치지 않고 그대로 실행된다 — 대신 프롬프트 자체를 보수적으로 설계해 상쇄한다"
+            "LLM 재량 매도는 71/71 HOLD로 상수 출력이 확인돼 현재 정지 상태다. "
+            "보유 종목의 결정론적 손절·익절 감시는 장중 매분 계속 실행한다"
         ),
         _heading("기술 스택", level=2),
         _bulleted("Python 3.11+, pydantic v2, asyncio"),
         _bulleted(
-            "Anthropic API 직접 호출 — LangGraph/CrewAI/AutoGen 미사용. "
-            "에이전트 간 대화나 동적 툴 호출이 없고 병렬 호출 후 스키마 취합이 전부라 "
-            "프레임워크는 디버깅만 어렵게 만든다"
+            "현재 자동 운영은 ChatGPT 플랜 기반 Codex 연결 점검을 주문과 격리해 검증 중이다. "
+            "기존 Anthropic API 판단 경로는 정지 상태로 이력·롤백을 위해 남겨뒀고, "
+            "LangGraph/CrewAI/AutoGen은 사용하지 않는다"
         ),
         _bulleted(
             "분석가 호출은 asyncio.gather(..., return_exceptions=True) — "
@@ -311,13 +309,13 @@ def _intro_page_blocks() -> list[dict]:
         _bulleted("게이트 거부 사유별 건수 — 특정 룰만 계속 발동하면 그 룰이 과하거나 분석가가 한쪽으로 쏠려 있다는 뜻"),
         _bulleted("분석가별 호출 수·실패율·토큰 사용량"),
         _divider(),
-        _paragraph("전체 코드와 설계 문서(CLAUDE.md, docs/PLAN.md)는 GitHub에서 그대로 볼 수 있다."),
+        _paragraph("전체 코드와 설계 문서(AGENTS.md, docs/PLAN.md)는 GitHub에서 그대로 볼 수 있다."),
         _bookmark(GITHUB_URL),
     ]
 
 
 def create_intro_page(parent_page_id: str) -> str | None:
-    """CLAUDE.md/docs/PLAN.md 요약 — 왜 이렇게 설계했는지 방문자에게 보여주는 페이지.
+    """AGENTS.md/docs/PLAN.md 요약 — 왜 이렇게 설계했는지 방문자에게 보여주는 페이지.
     링크를 따라가게 하지 않고 핵심 내용을 페이지 안에 직접 다 적어둔다(사용자 요청,
     2026-08-09)."""
     body = {
@@ -336,7 +334,7 @@ def _list_block_children(block_id: str) -> list[dict]:
 
 def refresh_intro_page(page_id: str) -> bool:
     """이미 만들어진 소개 페이지의 내용을 최신 _intro_page_blocks()로 통째로
-    교체한다 — CLAUDE.md/docs/PLAN.md가 바뀌었을 때 다시 실행해서 노션도
+    교체한다 — AGENTS.md/docs/PLAN.md가 바뀌었을 때 다시 실행해서 노션도
     맞춘다. 기존 블록을 전부 지우고 새로 채우는 방식(부분 diff가 아니다)."""
     for block in _list_block_children(page_id):
         _notion_request("DELETE", f"/blocks/{block['id']}")
@@ -1036,7 +1034,7 @@ async def _daily_report_children(
         approved_buy_decisions = [d for d in decisions_today if d["action"] == "BUY" and d["approved"]]
         # 게이트 거부는 rejected_by가 있는 것만이다. approved=False로 세면 HOLD가
         # 전부 거부로 잡힌다 — HOLD는 게이트까지 가지도 않는데. 2026-08-18 리포트가
-        # HOLD 82건을 "게이트 거부 82개"로 적었다. 이러면 CLAUDE.md 감시 지표
+        # HOLD 82건을 "게이트 거부 82개"로 적었다. 이러면 AGENTS.md 감시 지표
         # ("거부 사유별 건수 — 특정 룰만 계속 발동하면 그 룰이 과하다는 뜻")가
         # 통째로 무의미해진다. 어떤 룰도 발동한 적 없는 날과 구분이 안 되기 때문이다.
         gate_rejected = sum(1 for d in decisions_today if d.get("rejected_by"))
@@ -1182,7 +1180,7 @@ async def sync_daily_report(
         return False
 
     # 오늘치를 올리기 전에 뷰 정렬을 맞춰둔다 — 명령어로 한 번 고치는 대신 매일
-    # 확인하는 이유는 이 설정이 EC2에만 있는 상태가 되지 않게 하기 위해서다(CLAUDE.md 서두의
+    # 확인하는 이유는 이 설정이 EC2에만 있는 상태가 되지 않게 하기 위해서다(AGENTS.md 서두의
     # 2026-08-19 크론탭 사건과 같은 모양). 하루에 한 번, 요청 2개라 비용도 없다.
     sort_database_newest_first(database_id)
 

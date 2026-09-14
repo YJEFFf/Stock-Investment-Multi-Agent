@@ -58,7 +58,7 @@ DEFAULT_EXIT_PLAN = ExitPlan(
 #   익절 비중 = 1/3                           (DEFAULT와 같게 고정)
 #
 # σ20은 진입 직전 20거래일 일간 수익률 표준편차(비율). √5는 약 1주 보유 창의 변동폭으로 환산하는
-# 계수다. 범위(3~15%, 3~12%)는 CLAUDE.md "아직 정해지지 않은 것"에서 사용자가 정한 바운드다.
+# 계수다. 범위(3~15%, 3~12%)는 AGENTS.md "아직 정해지지 않은 것"에서 사용자가 정한 바운드다.
 EXIT_PLAN_STOP_K = 2.5
 EXIT_PLAN_TRAIL_K = 2.0
 EXIT_PLAN_HORIZON_DAYS = 5

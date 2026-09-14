@@ -28,7 +28,7 @@ MAX_STRUCTURED_RETRIES = 2
 # — 프롬프트를 건드리는 쪽은 점수를 움직인다는 걸 A/B로 확인했다(같은 항목).
 _DEFAULT_MAX_TOKENS = 2048
 
-# CLAUDE.md "감시 지표" — 분석가별(label) 호출수·실패율·토큰사용량 집계용 원본 로그.
+# AGENTS.md "감시 지표" — 분석가별(label) 호출수·실패율·토큰사용량 집계용 원본 로그.
 # pipeline.py의 DEFAULT_LOG_PATH/DEFAULT_SELL_LOG_PATH와 같은 패턴(호출부에서 override 가능).
 DEFAULT_LLM_CALL_LOG_PATH = Path("logs/llm_calls.jsonl")
 
@@ -66,7 +66,7 @@ def _call_log_entry(label: str, model: str, **fields) -> dict:
     timestamp만으로는 일별 집계가 하루씩 밀린다: 매수 판단 cron은 08:30 KST인데
     그건 UTC로 전날 23:30이라, 하루 호출의 대부분(분석가·토론·매니저 수백 건)이
     전날 몫으로 잡히고 그날엔 15:35 KST 매도 판단분만 남는다. 2026-08-20이
-    실제로 그랬다 — 파일상 35건, 실제로는 그 10배 이상. CLAUDE.md 감시 지표의
+    실제로 그랬다 — 파일상 35건, 실제로는 그 10배 이상. AGENTS.md 감시 지표의
     "분석가별 호출 수·토큰 사용량"이 그대로 틀린 숫자가 된다.
     pipeline.jsonl이 같은 이유로 이미 KST를 쓴다(2026-08-13, 커밋 832fb8b) —
     "하루"의 경계는 장이 도는 시간대 기준으로 통일한다. timestamp를 KST로

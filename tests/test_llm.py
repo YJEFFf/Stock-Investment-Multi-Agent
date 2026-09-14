@@ -183,7 +183,7 @@ def test_call_structured_logs_failure_with_label(monkeypatch, tmp_path):
 def test_call_log_day_is_kst_not_utc(monkeypatch, tmp_path):
     """08:30 KST 매수 판단 cron은 UTC로 전날 23:30이다 — timestamp만 있으면
     하루 호출의 대부분이 전날 몫으로 집계된다(2026-08-20 실측: 파일상 35건).
-    day는 반드시 KST 기준이어야 CLAUDE.md 감시 지표가 맞는 숫자를 낸다."""
+    day는 반드시 KST 기준이어야 AGENTS.md 감시 지표가 맞는 숫자를 낸다."""
     from datetime import datetime, timezone
 
     log_path = tmp_path / "llm_calls.jsonl"

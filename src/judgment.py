@@ -253,7 +253,7 @@ async def portfolio_manager(
     )
 
     # degraded면 LLM이 정한 출구 규칙을 버리고 고정 기본값으로 떨어뜨린다. 분석가가
-    # 일부 빠진 상태에서 나온 판단은 게이트에서 기준을 높인다는 기존 원칙(CLAUDE.md
+    # 일부 빠진 상태에서 나온 판단은 게이트에서 기준을 높인다는 기존 원칙(AGENTS.md
     # 기술 스택)과 같은 방향이다 — 절반만 보고 있는 모델에게 손절선을 넓힐 재량까지
     # 주지는 않는다.
     exit_plan = None if degraded else _exit_plan_from(result)

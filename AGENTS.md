@@ -5,6 +5,11 @@ LLM 분석가들이 각자 의견을 내고, 결정론적 리스크 게이트가
 
 작업 시작 전 `docs/PLAN.md`를 읽을 것. 이 파일은 규칙만 담고, 배경과 근거는 그쪽에 있다.
 
+이 저장소의 자동화 작업 지침은 `AGENTS.md`가 단일 원본이다. Codex는 저장소에 들어오면
+이 파일을 먼저 읽고, OpenAI 제품·모델·플랜 동작을 바꿀 때는 공식 OpenAI 문서를 확인한다.
+ChatGPT 플랜 기반 Codex 경로는 현재 연결 점검 전용이다. 별도 섀도 검증과 사용자 결정 없이
+분석가·매수 판단·주문 경로에 연결하지 않는다.
+
 **수정하거나 특이사항을 발견할 때마다 `docs/CHANGELOG.md` 맨 위에 날짜와 함께 남길 것.**
 코드 수정뿐 아니라 EC2 크론탭·상태 파일처럼 커밋에 안 남는 운영 변경도 반드시 여기 쓴다.
 2026-08-19 매수 시각을 09:00→09:01로 옮긴 조치가 git 밖에 있었던 탓에 하루 만에
@@ -112,7 +117,8 @@ class GateResult(BaseModel):
 ```
 src/
   schemas.py      # 계약 (처음부터 분리)
-  llm.py          # Claude 래퍼 — 재시도·타임아웃·스키마 검증·토큰 로깅
+  llm.py          # 정지된 기존 Anthropic API 래퍼 — 이력·롤백용
+  codex_plan.py   # ChatGPT 플랜 기반 Codex 연결 점검 — 주문과 격리
   collectors.py   # 수집 전부
   analysts.py     # 분석가 전부
   pipeline.py     # 토론 → 매니저 → 게이트 → 집행

@@ -11,7 +11,7 @@ LLM 분석가(차트·뉴스·공시)가 종목별로 독립적으로 의견을 
 이 프로젝트의 이전 버전은 "pending 매수 신호가 부족하면 분석을 재실행"하는
 스케줄러 때문에 사실상 매일 매수를 강제했고, 그 결과 신호에 실제 예측력이 있는지
 자체를 측정할 수 없었다. 자세한 실패 원인과 설계 근거는 [`docs/PLAN.md`](docs/PLAN.md),
-지켜야 할 절대 규칙은 [`CLAUDE.md`](CLAUDE.md)에 있다.
+지켜야 할 절대 규칙과 Codex 작업 지침은 [`AGENTS.md`](AGENTS.md)에 있다.
 
 핵심 원칙만 요약하면:
 
@@ -48,7 +48,8 @@ LLM 분석가(차트·뉴스·공시)가 종목별로 독립적으로 의견을 
 ```
 src/
   schemas.py           # 계층 간 데이터 계약 (pydantic)
-  llm.py                # Claude 래퍼 — 재시도·타임아웃·스키마 검증
+  llm.py                # 정지된 기존 Anthropic API 래퍼 — 이력·롤백용
+  codex_plan.py         # ChatGPT 플랜 기반 Codex 연결 점검 — 주문과 격리
   collectors.py          # 수집 — KOSPI200 종목 리스트(Naver), 뉴스(Naver), 공시(DART)
   kis.py                 # 한국투자증권 API 클라이언트 — 시세·잔고·주문 (모의투자 전용)
   market_calendar.py     # KRX 휴장일 판정
@@ -62,9 +63,9 @@ src/
   evaluation.py          # IC(information coefficient) 측정
 scripts/
   decide_buys.py         # 08:30 — 신규 매수 판단만 (집행 안 함)
-  execute_open.py        # 09:00 — 전날 매도 판단 + 오늘 매수 판단 집행 (매도 먼저)
+  execute_open.py        # 09:01 — 보류 중인 매도·매수 집행 (현재 신규 매수 없음)
   check_stop_loss.py     # 09:00–15:30 매분 — 결정론적 손절/익절만 (LLM 없음)
-  decide_llm_sell.py     # 15:35 — LLM 재량 매도 판단만 (집행 안 함, 다음날 아침 집행)
+  decide_llm_sell.py     # 15:35 — 장 마감 집계·노션 동기화 (LLM 재량 매도 정지)
   run_daily.py           # 위 네 단계를 한 번에 도는 로컬/수동 테스트용 진입점 (cron 미사용)
   setup_notion_workspace.py  # 노션 매매일지·일일 리포트 DB 최초 생성
 prompts/                # LLM 프롬프트 (.md, 코드 밖에 분리)
@@ -82,10 +83,10 @@ docs/PLAN.md            # 설계 배경과 근거
 | 시각 | 스크립트 | 하는 일 |
 |---|---|---|
 | 08:05 | `check_codex_plan.sh` | API 키 없이 저장된 ChatGPT 로그인으로 GPT-5.6 Sol 구조화 출력 연결 상태만 확인. 주식 판단·주문 없음 |
-| 08:30 | `decide_buys.sh` | 유니버스 → 정량 필터 → 분석가 → 토론+매니저 → 게이트. 승인된 BUY를 `logs/pending_buys.json`에 기록만 하고 집행 안 함 |
-| 09:00 | `execute_open.sh` | 전날 15:35에 정해둔 매도(`pending_sells.json`)를 먼저 집행 → 오늘 08:30에 정해둔 매수(`pending_buys.json`) 집행. 그 직후 노션 매매일지(`notion_sync.sync_trade_journal`) 동기화 |
-| 09:00–15:30 (매분) | `check_stop_loss.sh` | 보유 종목 전부 결정론적 손절(-10%)/트레일링 익절(+20%)만 체크·집행. LLM 없음 |
-| 15:35 | `decide_llm_sell.sh` | 보유 종목 LLM 재량 매도 판단만 (`pending_sells.json`에 기록). 장 마감 후라 집행은 다음 거래일 09:00으로 미룸. 그 직후 노션 일일 리포트(`notion_sync.sync_daily_report`) 동기화 — 이 시점 portfolio가 그날의 진짜 장마감 스냅샷이라 여기서 만든다 |
+| 08:30 | `decide_buys.sh` | 기존 Anthropic API 스위치가 꺼져 있어 판단을 건너뛰고 빈 `pending_buys.json`만 기록. 신규 매수 없음 |
+| 09:01 | `execute_open.sh` | 보류 중인 매도를 먼저 처리하고 매수 파일을 확인한 뒤 노션 매매일지를 동기화. 현재 매수 파일은 비어 있음 |
+| 09:00–15:30 (매분) | `check_stop_loss.sh` | 보유 종목별 진입 시점 `ExitPlan`으로 결정론적 손절·트레일링 익절 체크·집행. LLM 없음 |
+| 15:35 | `decide_llm_sell.sh` | 시세 공백·감시 지표를 집계하고 노션 매매일지와 일일 리포트를 동기화. LLM 재량 매도는 정지 상태 |
 
 휴장일(주말·KRX 공휴일)은 `market_calendar.is_krx_trading_day`가 각 스크립트
 맨 앞에서 걸러 LLM/KIS 호출 없이 조용히 종료한다. 전체 파이프라인이 예외로
@@ -128,18 +129,18 @@ SIMA_LIVE_TEST=1 .venv/bin/pytest tests/test_live_smoke.py -v -s  # 실제 API �
 - 판단 계층 (강세/약세 토론 + 포트폴리오 매니저, 매수·매도 대칭 구조): 완료
 - 시세 데이터 소스: KOSPI200 종목 리스트·업종 매핑은 Naver 스크래핑, 개별 종목 시세는 KIS API
 - 정량 사전 필터 (`pipeline.quant_prefilter`): 완료 — LLM 호출 전 비용 게이트
-- 매도 로직: 결정론적 안전장치(손절 -10%, 트레일링 익절, `src/sell.py`) +
-  LLM 재량 매도(`judgment.judge_sell`)까지 전부 구현
+- 매도 로직: 진입 시점 20일 변동성으로 고정한 결정론적 손절·트레일링 익절은 운영 중.
+  LLM 재량 매도(`judgment.judge_sell`)는 상수 출력이 확인돼 정지 상태
 - 주문 집행: 매수·매도 둘 다 KIS 모의투자 시장가 주문으로 실제 연결 완료.
   계좌·잔고·현재가 조회, 주문 접수·거부 응답까지 라이브 검증 완료
 - **AWS EC2 배포 + cron 자동 실행: 완료, 실서비스 중** (모의투자, 실거래
-  연결 없음 — 규칙 7). 하루 판단·집행이 4단계(08:30 매수 판단 / 09:00 집행 /
-  09:00–15:30 매분 손절 체크 / 15:35 재량 매도 판단)로 나뉘어 자동 실행된다
+  연결 없음 — 규칙 7). 하루 운영이 4단계(08:30 매수 중지 확인 / 09:01 보류 주문 처리 /
+  09:00–15:30 매분 손절 체크 / 15:35 장 마감·노션 동기화)로 나뉘어 자동 실행된다
   — 자세한 스케줄은 위 "실행 스케줄" 참고
 - 휴장일 자동 판정(`market_calendar.is_krx_trading_day`), cron 실패·개별 단계
   실패 시 텔레그램 알림(`notify.py`), 매매일지·일일 리포트 노션 동기화
   (`notion_sync.py`) 전부 연결 완료
-- CLAUDE.md "감시 지표"(최근 20영업일 신호 발생률, 게이트 거부 사유별 집계,
+- AGENTS.md "감시 지표"(최근 20영업일 신호 발생률, 게이트 거부 사유별 집계,
   분석가 호출수/실패율/토큰량)를 매일 cron 로그에 자동 기록
 - 마일스톤 3 (IC 측정): 인프라만 구축, 실측 데이터 축적 전 — 워크포워드/실시간
   모의투자 결과가 쌓여야 측정 가능(과거 백테스트는 성공 지표로 안 씀)

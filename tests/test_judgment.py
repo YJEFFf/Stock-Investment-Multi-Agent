@@ -358,7 +358,7 @@ def test_missing_opinions_are_logged_apart_from_a_hold(tmp_path):
 
 
 def test_judgment_row_carries_the_prompt_version(monkeypatch, tmp_path):
-    """성능 변화가 프롬프트 때문인지 데이터 때문인지 가릴 유일한 단서다(CLAUDE.md 계약)."""
+    """성능 변화가 프롬프트 때문인지 데이터 때문인지 가릴 유일한 단서다(AGENTS.md 계약)."""
     monkeypatch.setattr(judgment.llm, "call_structured", _fake_sell_debate_and_manager(action="HOLD"))
     log_path = tmp_path / "sell_judgment.jsonl"
 

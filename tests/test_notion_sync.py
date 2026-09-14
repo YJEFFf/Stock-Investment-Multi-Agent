@@ -377,6 +377,13 @@ def test_create_intro_page_writes_full_content_not_just_a_link(monkeypatch):
     code_blocks = [b for b in children if b["type"] == "code"]
     assert any("리스크 게이트" in b["code"]["rich_text"][0]["text"]["content"] for b in code_blocks)
     assert any("class AnalystOpinion" in b["code"]["rich_text"][0]["text"]["content"] for b in code_blocks)
+    texts = json.dumps(children, ensure_ascii=False)
+    assert "AGENTS.md" in texts
+    assert "ChatGPT 플랜 기반 Codex" in texts
+    assert "Anthropic API 직접 호출" not in texts
+    assert "섹터 집중도 한도 40%" not in texts
+    assert "일일 손실 한도 -5%" not in texts
+    assert "코드가 직전 20일 변동성" in texts
 
 
 def test_refresh_intro_page_deletes_old_blocks_then_appends_new(monkeypatch):
@@ -694,7 +701,7 @@ def test_summary_does_not_count_holds_as_gate_rejections(monkeypatch, tmp_path):
 
     2026-08-18 리포트가 HOLD 82건을 "게이트 거부 82개"로 적었다. approved=False를
     거부로 셌기 때문인데, 그러면 어떤 룰도 발동한 적 없는 날과 실제로 룰이 82번
-    걸린 날이 같은 숫자로 보인다. CLAUDE.md 감시 지표가 정확히 그 구분을 요구한다.
+    걸린 날이 같은 숫자로 보인다. AGENTS.md 감시 지표가 정확히 그 구분을 요구한다.
     """
     monkeypatch.setattr(notion_sync.collectors, "fetch_kospi200_ticker_names", lambda: {})
 

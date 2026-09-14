@@ -60,7 +60,7 @@ DEFAULT_LOG_PATH = Path("logs/pipeline.jsonl")
 # 많이 오른 종목"으로 기울어 있는지를 이 로그 없이는 사후에 재구성할 수 없었다.
 DEFAULT_PREFILTER_LOG_PATH = Path("logs/prefilter.jsonl")
 
-# CLAUDE.md "감시 지표" 창. 신호율은 영업일 기준, LLM 호출 집계는 달력일 기준이다.
+# AGENTS.md "감시 지표" 창. 신호율은 영업일 기준, LLM 호출 집계는 달력일 기준이다.
 MONITORING_WINDOW_TRADING_DAYS = 20
 MONITORING_WINDOW_CALENDAR_DAYS = 30
 
@@ -662,7 +662,7 @@ def make_combined_analyst_fn(component_fns: list[AnalystFn]) -> AnalystFn:
     """종목 하나에 대해 여러 분석가를 동시에 호출하고 성공한 의견만 모은다.
 
     asyncio.gather(..., return_exceptions=True) — 분석가 하나가 실패해도 다른
-    분석가는 살아남는다 (CLAUDE.md 아키텍처 원칙: "DART가 죽어도 차트 분석가는
+    분석가는 살아남는다 (AGENTS.md 아키텍처 원칙: "DART가 죽어도 차트 분석가는
     돌아야 한다").
     """
 
@@ -924,7 +924,7 @@ async def run_day(
                 # 생략한 채 셋을 한꺼번에 붙였고, 첫 1개월 평가는 이 필드가 없어
                 # 분석가별 IC를 낼 수 없었다(2026-09-14).
                 # prompt는 evidence의 "prompt:chart@7a9654" 항목이다. 프롬프트를 바꾼 전후를
-                # 날짜가 아니라 기록으로 가르려면 판단마다 남아야 한다(CLAUDE.md 핵심 계약).
+                # 날짜가 아니라 기록으로 가르려면 판단마다 남아야 한다(AGENTS.md 핵심 계약).
                 "opinions": [
                     {
                         "agent": o.agent,
@@ -1630,7 +1630,7 @@ def summarize_recent_trading_days(log_path: Path, n_days: int) -> dict:
 
 
 def summarize_llm_calls(log_path: Path, since: datetime | None = None) -> dict:
-    """분석가/토론/매니저(label)별 호출수·실패율·토큰사용량 집계 (CLAUDE.md "감시 지표").
+    """분석가/토론/매니저(label)별 호출수·실패율·토큰사용량 집계 (AGENTS.md "감시 지표").
 
     llm.call_structured가 매 호출마다 logs/llm_calls.jsonl에 남기는 원본을 읽는다.
     `since`를 주면 그 시각 이후 기록만 본다 — run_daily.py는 "최근 20영업일"과
@@ -1785,11 +1785,11 @@ def log_monitoring_summary(
     portfolio: PortfolioState | None = None,
     cron_log_path: Path | None = None,
 ) -> None:
-    """CLAUDE.md "감시 지표"를 하루 한 번 cron 로그에 남긴다.
+    """AGENTS.md "감시 지표"를 하루 한 번 cron 로그에 남긴다.
 
     읽기 전용 리포트다 — 판단 로직 어디에도 이 결과를 되먹이지 않는다. 되먹이는
     순간 "신호가 적으니 기준을 낮추자"는 경로가 생기고, 그게 이전 버전을 무너뜨린
-    실패다(CLAUDE.md 서두).
+    실패다(AGENTS.md 서두).
 
     이 집계는 원래 run_daily.py(마일스톤1 모놀리스) 안에만 있었다. 스크립트를
     decide_buys/execute_open/check_stop_loss/decide_llm_sell로 쪼갤 때 딸려가지
