@@ -125,6 +125,7 @@ def _wired(broker: FakeBroker):
         (kis, "FILL_POLL_INTERVAL_S"): kis.FILL_POLL_INTERVAL_S,
         (time, "sleep"): time.sleep,
         (pipeline, "PRE_OPEN_QUOTE_WAIT_S"): pipeline.PRE_OPEN_QUOTE_WAIT_S,
+        (pipeline, "SECONDARY_QUOTE_MODE"): pipeline.SECONDARY_QUOTE_MODE,
         (pipeline, "display_name"): pipeline.display_name,
         (notify, "send_telegram_alert"): notify.send_telegram_alert,
         (notify, "ALERT_MARKER_DIR"): notify.ALERT_MARKER_DIR,
@@ -262,6 +263,41 @@ def s_sell_response_lost_no_fill() -> Outcome:
     return Outcome("매도 응답 유실 + 체결 없음", "안 팔렸는데 판 걸로 두면 실제 보유가 손절 대상에서 사라진다", ok, f"주문 POST {_order_posts(b)}회, 남은 포지션 {len(portfolio.positions)}")
 
 
+def s_secondary_quote_active_stop_loss() -> Outcome:
+    """KIS 시세 실패를 네이버가 복구한 뒤 운영 finalize/주문 경로까지 실제로 태운다."""
+    b = FakeBroker(held_qty=30)
+    position = Position(
+        ticker=TICKER, sector="반도체", weight=0.08,
+        entry_price=12_000.0, peak_price=12_000.0, quantity=30,
+    )
+    portfolio = PortfolioState(positions=[position], cash_weight=0.92)
+    with _wired(b) as (tmp, _):
+        pipeline.SECONDARY_QUOTE_MODE = "active"
+        kis.fetch_quote = lambda ticker, policy=None: None
+        collectors.fetch_naver_quotes = lambda tickers, **kw: {
+            TICKER: kis.Quote(price=PRICE, day_high=PRICE, day_low=PRICE)
+        }
+        result = asyncio.run(
+            pipeline.evaluate_holdings(
+                portfolio, datetime.now(KST), sell.execute_sell_order,
+                log_path=tmp / "sell.jsonl", trade_journal_log_path=tmp / "journal.jsonl",
+            )
+        )
+        journal = _journal(tmp)
+    ok = (
+        result.positions == []
+        and _order_posts(b) == 1
+        and journal[-1].get("event") == "sell"
+        and journal[-1].get("reason") == "stop_loss"
+    )
+    return Outcome(
+        "네이버 2차 시세 active 손절",
+        "KIS 시세 장애 때 보조 시세가 판정만 하고 주문 경로와 끊기면 안전장치가 작동하지 않는다",
+        ok,
+        f"네이버 판정 뒤 주문 POST {_order_posts(b)}회, 남은 포지션 {len(result.positions)}, 기록 {journal[-1].get('reason')}",
+    )
+
+
 def _run_day_with_buys(portfolio: PortfolioState, universe: list[tuple[str, str]]):
     # 분석가는 항상 의견을 내는 고정 함수다. 난수 더미(make_dummy_analyst_fn)는 날짜로 시드를
     # 잡아 가끔 의견을 안 내고, 그러면 판단이 안 생겨 게이트까지 가지도 않는다 — 드릴이 시각에
@@ -311,6 +347,7 @@ SCENARIOS = [
     s_pre_open_quote,
     s_sell_response_lost_but_filled,
     s_sell_response_lost_no_fill,
+    s_secondary_quote_active_stop_loss,
     s_gate_total_exposure,
     s_gate_position_limit,
 ]

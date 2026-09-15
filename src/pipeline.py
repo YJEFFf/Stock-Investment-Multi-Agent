@@ -1064,6 +1064,15 @@ def _apply_secondary_quotes(
         logger.warning("secondary_quote_unavailable tickers=%s", unrecovered)
     for ticker, quote in secondary.items():
         if SECONDARY_QUOTE_MODE == "active":
+            # 장중 KIS가 실패했는데 네이버가 전일 값·개장 전 값·비정규장 상태를 주면
+            # 판정할 수 없는 시세다. quote_by_ticker에 넣으면 아래 판정은 traded_today에서
+            # 건너뛰면서도 공백 집계는 "가격 있음"으로 오인하므로 복구로 인정하지 않는다.
+            if not quote.traded_today:
+                logger.warning(
+                    "secondary_quote_not_tradable ticker=%s price=%s — 당일 정규장 시세 아님",
+                    ticker, quote.price,
+                )
+                continue
             quote_by_ticker[ticker] = quote
             logger.warning(
                 "evaluate_holdings_secondary_quote_used ticker=%s price=%s high=%s low=%s source=naver",
@@ -1297,7 +1306,9 @@ async def evaluate_holdings(
 
     # 정상 KIS 시세와 네이버를 비교하는 관측 작업은 손절·익절 판정 뒤에만 한다.
     # 2차 소스가 5초 상한까지 느려도 안전 주문을 늦춰서는 안 된다.
-    if not missing and SECONDARY_QUOTE_MODE == "shadow":
+    # active 전환 뒤에도 비공식 API의 필드·시장 상태가 바뀌는지 하루 두 번 계속 본다.
+    # 손절·익절 판정이 모두 끝난 뒤라 이 대조가 매도를 늦추지는 않는다.
+    if not missing:
         try:
             await _check_secondary_quote_agreement(quote_by_ticker)
         except Exception as exc:  # noqa: BLE001 - 관측 실패로 안전장치 회차를 실패시키지 않는다

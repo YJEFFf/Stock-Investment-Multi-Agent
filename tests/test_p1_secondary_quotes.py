@@ -141,7 +141,7 @@ def test_active_mode_judges_on_the_secondary_quote(monkeypatch, caplog):
     assert not any("all_prices_unavailable" in r.getMessage() for r in caplog.records)
 
 
-def test_active_mode_still_refuses_a_pre_open_secondary_quote(monkeypatch):
+def test_active_mode_still_refuses_a_pre_open_secondary_quote(monkeypatch, caplog):
     """2차 소스라고 개장 전 기준가 규약이 풀리지 않는다."""
     _kis_down_naver_up(monkeypatch)
     monkeypatch.setattr(
@@ -150,9 +150,12 @@ def test_active_mode_still_refuses_a_pre_open_secondary_quote(monkeypatch):
     sold = _capture_sells(monkeypatch)
     monkeypatch.setattr(pipeline, "SECONDARY_QUOTE_MODE", "active")
 
-    asyncio.run(pipeline.evaluate_holdings(_portfolio(), DAY, sell.execute_sell_simulated))
+    with caplog.at_level(logging.WARNING, logger="src.pipeline"):
+        asyncio.run(pipeline.evaluate_holdings(_portfolio(), DAY, sell.execute_sell_simulated))
 
     assert sold == []
+    assert any("secondary_quote_not_tradable" in r.getMessage() for r in caplog.records)
+    assert any("all_prices_unavailable" in r.getMessage() for r in caplog.records)
 
 
 def test_the_secondary_source_is_not_called_when_kis_answered(monkeypatch):
