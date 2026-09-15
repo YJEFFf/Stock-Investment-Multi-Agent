@@ -30,6 +30,10 @@
   잔여 한계: 평시 agreement는 현재가만 비교해 당일 고가·저가와 `marketStatus` 변화는
   직접 대조하지 않는다. fallback 때 값이 거래 가능하지 않으면 공백으로 실패 폐쇄하고
   로그·알림을 남긴다.
+- 최종 리뷰 승인 해시 `66e25bcf65c28a972fb15ee39b5858dc15973760`을
+  `SIMA_REVIEWED`로 고정해 18:25 KST 장후 EC2 배포 완료. 서버 **594 passed / 5 skipped**,
+  작업 트리 clean, `SECONDARY_QUOTE_MODE=active`, 실제 crontab과 원본 일치. 다음 거래일부터
+  KIS 시세 실패 종목에 적용되며 `evaluate_holdings_secondary_quote_used`와 대조 로그를 본다.
 - 08:05 ChatGPT 플랜 기반 Codex 연결 점검이 첫 자동 크론에서 성공했다. 전용
   `sima-codex` 계정의 `gpt-5.6-sol` 구조화 출력은 6.49초, 입력 14,020토큰(캐시 0),
   출력 15토큰이었다. `logs/codex_plan_calls.jsonl`에 성공 1건이 남았고 API 키를 쓰는
