@@ -169,6 +169,9 @@ async def main() -> None:
             provider_stats["attempted"] += 1
             try:
                 return await codex_plan.call_structured(*args, **kwargs)
+            except asyncio.CancelledError:
+                provider_stats["failed"] += 1
+                raise
             except Exception:
                 provider_stats["failed"] += 1
                 raise

@@ -202,6 +202,24 @@ async def _call_structured(
     }
     try:
         result, usage = await asyncio.to_thread(_call_sync, system, user, response_model, json_schema, model)
+    except asyncio.CancelledError:
+        # asyncio.to_thread의 바깥 대기는 취소돼도 이미 시작한 subprocess 스레드는 끝까지
+        # 돌 수 있다. 실제 usage는 회수할 수 없지만 호출/실패 자체를 감시에서 잃지 않는다.
+        _append_log(
+            path,
+            {
+                **base,
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "elapsed_s": round(time.monotonic() - started, 2),
+                "success": False,
+                "error": "cancelled",
+            },
+        )
+        raise
     except Exception as exc:
         _append_log(
             path,

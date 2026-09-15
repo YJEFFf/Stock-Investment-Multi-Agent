@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -121,3 +122,36 @@ def test_buy_call_rejects_an_unexpected_model_without_fallback():
                 model="claude-sonnet-5",
             )
         )
+
+
+def test_cancelled_codex_call_is_logged_as_failure(monkeypatch, tmp_path):
+    def slow_sync(*args, **kwargs):
+        time.sleep(0.05)
+        return codex_plan.HealthResponse(status="ok"), {}
+
+    monkeypatch.setattr(codex_plan, "_call_sync", slow_sync)
+    log_path = tmp_path / "calls.jsonl"
+
+    async def cancel_in_flight():
+        task = asyncio.create_task(
+            codex_plan._call_structured(
+                system="",
+                user="",
+                response_model=codex_plan.HealthResponse,
+                json_schema={},
+                label="chart",
+                model=codex_plan.DEFAULT_MODEL,
+                log_path=log_path,
+            )
+        )
+        await asyncio.sleep(0.005)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_in_flight())
+
+    entry = json.loads(log_path.read_text())
+    assert entry["success"] is False
+    assert entry["error"] == "cancelled"
+    assert entry["input_tokens"] == 0
