@@ -34,10 +34,12 @@ def _no_real_notify_or_name_lookup(monkeypatch):
         lambda day: SimpleNamespace(
             day=day,
             remaining_percent=50.0,
+            ordinary_usage_allowed=True,
             buy_judgment_allowed=True,
             model_dump=lambda mode="json": {
                 "day": day,
                 "remaining_percent": 50.0,
+                "ordinary_usage_allowed": True,
                 "buy_judgment_allowed": True,
                 "estimated_daily_runs_remaining": 25.0,
                 "estimated_token_equivalent_remaining": 92_091_700,
@@ -356,10 +358,12 @@ def test_main_skips_codex_buy_judgment_at_or_below_two_percent(monkeypatch, tmp_
     status = SimpleNamespace(
         day=db.datetime.now(db.KST).date().isoformat(),
         remaining_percent=remaining,
+        ordinary_usage_allowed=True,
         buy_judgment_allowed=False,
         model_dump=lambda mode="json": {
             "day": db.datetime.now(db.KST).date().isoformat(),
             "remaining_percent": remaining,
+            "ordinary_usage_allowed": True,
             "buy_judgment_allowed": False,
             "estimated_daily_runs_remaining": remaining / 2,
             "estimated_token_equivalent_remaining": 0,
@@ -377,7 +381,7 @@ def test_main_skips_codex_buy_judgment_at_or_below_two_percent(monkeypatch, tmp_
     payload = json.loads(db.PENDING_BUYS_PATH.read_text())
     assert payload["decisions"] == []
     assert payload["skipped"] == "codex_weekly_capacity_low"
-    assert any(f"잔여 {remaining:.1f}%" in message and "손절·익절 감시" in message for message in alerts)
+    assert any(f"잔여 {remaining:.2f}%" in message and "손절·익절 감시" in message for message in alerts)
 
 
 def test_main_fails_closed_when_today_capacity_state_is_unavailable(monkeypatch, tmp_path):
@@ -396,3 +400,34 @@ def test_main_fails_closed_when_today_capacity_state_is_unavailable(monkeypatch,
     payload = json.loads(db.PENDING_BUYS_PATH.read_text())
     assert payload["skipped"] == "codex_capacity_unavailable"
     assert any("한도 점검" in message and "신규 매수 판단 중지" in message for message in alerts)
+
+
+def test_main_reports_backend_usage_block_separately_from_low_capacity(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+    day = db.datetime.now(db.KST).date().isoformat()
+    status = SimpleNamespace(
+        day=day,
+        remaining_percent=50.0,
+        ordinary_usage_allowed=False,
+        buy_judgment_allowed=False,
+        model_dump=lambda mode="json": {
+            "day": day,
+            "remaining_percent": 50.0,
+            "ordinary_usage_allowed": False,
+            "buy_judgment_allowed": False,
+            "estimated_daily_runs_remaining": 25.0,
+            "estimated_token_equivalent_remaining": 92_091_700,
+        },
+    )
+    monkeypatch.setattr(db.codex_plan, "load_capacity_status", lambda checked_day: status)
+    alerts = []
+    monkeypatch.setattr(db.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    asyncio.run(db.main())
+
+    payload = json.loads(db.PENDING_BUYS_PATH.read_text())
+    assert payload["skipped"] == "codex_ordinary_usage_blocked"
+    assert "잔여 50.00%" in alerts[0]
+    assert "일반 사용을 허용하지 않음" in alerts[0]
+    assert "2% 이하 보호 기준 도달" not in alerts[0]

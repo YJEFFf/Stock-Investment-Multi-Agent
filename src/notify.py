@@ -209,10 +209,15 @@ def format_buy_decision_skipped_alert(day: str) -> str:
 
 
 def format_codex_capacity_alert(capacity: dict) -> str:
-    action = "08:30 매수 판단 진행" if capacity["buy_judgment_allowed"] else "오늘 신규 매수 판단 중지"
+    if capacity["buy_judgment_allowed"]:
+        action = "08:30 매수 판단 진행"
+    elif not capacity["ordinary_usage_allowed"]:
+        action = "백엔드 일반 사용 불허 — 오늘 신규 매수 판단 중지"
+    else:
+        action = "잔여 2% 이하 — 오늘 신규 매수 판단 중지"
     return (
         f"🧮 [SIMA] Codex 주간 한도 점검 ({capacity['day']})\n"
-        f"잔여 {capacity['remaining_percent']:.1f}% · 같은 일일 부하 약 "
+        f"잔여 {capacity['remaining_percent']:.2f}% · 같은 일일 부하 약 "
         f"{capacity['estimated_daily_runs_remaining']:.1f}회분 "
         f"(토큰 환산 약 {capacity['estimated_token_equivalent_remaining']:,}개)\n"
         f"판정: {action} · 2% 이하면 중지"
@@ -222,7 +227,15 @@ def format_codex_capacity_alert(capacity: dict) -> str:
 def format_codex_capacity_skip_alert(capacity: dict) -> str:
     return (
         f"⏸ [SIMA] 매수 판단 건너뜀 ({capacity['day']})\n"
-        f"Codex 주간 잔여 {capacity['remaining_percent']:.1f}% — 2% 이하 보호 기준 도달\n"
+        f"Codex 주간 잔여 {capacity['remaining_percent']:.2f}% — 2% 이하 보호 기준 도달\n"
+        "신규 매수 판단 없음 · 기존 보유 종목 손절·익절 감시는 정상 동작"
+    )
+
+
+def format_codex_usage_blocked_alert(capacity: dict) -> str:
+    return (
+        f"⏸ [SIMA] 매수 판단 건너뜀 ({capacity['day']})\n"
+        f"Codex 주간 잔여 {capacity['remaining_percent']:.2f}% · 백엔드가 일반 사용을 허용하지 않음\n"
         "신규 매수 판단 없음 · 기존 보유 종목 손절·익절 감시는 정상 동작"
     )
 

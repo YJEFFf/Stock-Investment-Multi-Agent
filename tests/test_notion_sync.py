@@ -548,14 +548,35 @@ def test_daily_report_shows_codex_capacity_and_skip_result():
                 "day": "2026-09-16",
                 "remaining_percent": 2.0,
                 "estimated_daily_runs_remaining": 1.0,
+                "ordinary_usage_allowed": True,
                 "buy_judgment_allowed": False,
             },
         )
     )
     all_text = json.dumps(blocks, ensure_ascii=False)
-    assert "Codex 주간 한도 잔여 2.0%" in all_text
+    assert "Codex 주간 한도 잔여 2.00%" in all_text
     assert "신규 매수 판단 중지" in all_text
     assert "장마감 기준 보유 종목" in all_text
+
+
+def test_daily_report_distinguishes_backend_usage_block_from_low_capacity():
+    blocks = asyncio.run(
+        notion_sync._daily_report_children(
+            "2026-09-16",
+            decisions_today=[], buys=[], sells=[], skips=[], portfolio=PortfolioState(),
+            codex_capacity={
+                "day": "2026-09-16",
+                "remaining_percent": 50.0,
+                "estimated_daily_runs_remaining": 25.0,
+                "ordinary_usage_allowed": False,
+                "buy_judgment_allowed": False,
+            },
+        )
+    )
+    all_text = json.dumps(blocks, ensure_ascii=False)
+    assert "잔여 50.00%" in all_text
+    assert "백엔드 일반 사용 불허" in all_text
+    assert "잔여 2% 이하로" not in all_text
 
 
 def test_daily_report_summary_section_uses_broker_amounts_not_cash_weight():

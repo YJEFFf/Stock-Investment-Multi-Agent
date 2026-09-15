@@ -137,7 +137,11 @@ async def main() -> None:
                 notify.format_error_alert("08:05 Codex 한도 점검을 확인할 수 없어 오늘 신규 매수 판단 중지", str(exc))
             )
             return
-        if not capacity.buy_judgment_allowed:
+        if not capacity.ordinary_usage_allowed:
+            _write_pending_state(today_kst.isoformat(), [], skipped="codex_ordinary_usage_blocked")
+            notify.send_telegram_alert(notify.format_codex_usage_blocked_alert(capacity.model_dump(mode="json")))
+            return
+        if capacity.remaining_percent <= codex_plan.BUY_CAPACITY_FLOOR_PERCENT:
             _write_pending_state(today_kst.isoformat(), [], skipped="codex_weekly_capacity_low")
             notify.send_telegram_alert(notify.format_codex_capacity_skip_alert(capacity.model_dump(mode="json")))
             return

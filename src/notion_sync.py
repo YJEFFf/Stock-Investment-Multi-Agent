@@ -1033,10 +1033,15 @@ async def _daily_report_children(
 ) -> list[dict]:
     blocks = [_heading("오늘의 판단 요약", level=2)]
     if codex_capacity and codex_capacity.get("day") == day:
-        result = "매수 판단 진행" if codex_capacity.get("buy_judgment_allowed") else "신규 매수 판단 중지"
+        if codex_capacity.get("buy_judgment_allowed"):
+            result = "매수 판단 진행"
+        elif codex_capacity.get("ordinary_usage_allowed") is False:
+            result = "백엔드 일반 사용 불허로 신규 매수 판단 중지"
+        else:
+            result = "잔여 2% 이하로 신규 매수 판단 중지"
         blocks.append(
             _paragraph(
-                f"Codex 주간 한도 잔여 {codex_capacity['remaining_percent']:.1f}% · "
+                f"Codex 주간 한도 잔여 {codex_capacity['remaining_percent']:.2f}% · "
                 f"같은 일일 부하 약 {codex_capacity['estimated_daily_runs_remaining']:.1f}회분 · {result}"
             )
         )

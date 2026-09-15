@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Literal, TypeVar
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, StrictBool, ValidationError, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -62,14 +62,16 @@ class CapacityStatus(BaseModel):
     remaining_percent: float = Field(ge=0.0, le=100.0, allow_inf_nan=False)
     window_duration_mins: Literal[10_080]
     resets_at: datetime
-    ordinary_usage_allowed: bool
-    buy_judgment_allowed: bool
+    ordinary_usage_allowed: StrictBool
+    buy_judgment_allowed: StrictBool
     threshold_percent: Literal[2.0] = BUY_CAPACITY_FLOOR_PERCENT
     estimated_daily_runs_remaining: float = Field(ge=0.0, allow_inf_nan=False)
     estimated_token_equivalent_remaining: int = Field(ge=0)
 
     @model_validator(mode="after")
     def validate_derived_fields(self):
+        if self.checked_at.astimezone(KST).date().isoformat() != self.day:
+            raise ValueError("day does not match checked_at in KST")
         expected_remaining = round(100.0 - self.used_percent, 2)
         if self.remaining_percent != expected_remaining:
             raise ValueError("remaining_percent does not match used_percent")

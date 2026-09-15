@@ -300,3 +300,19 @@ def test_reconcile_alert_survives_a_zero_local_value():
 
     assert "005930 quantity" in message
     assert "%" not in message
+
+
+def test_codex_capacity_alert_preserves_exact_two_percent_boundary():
+    message = notify.format_codex_capacity_alert(
+        {
+            "day": "2026-09-16",
+            "remaining_percent": 2.01,
+            "ordinary_usage_allowed": True,
+            "buy_judgment_allowed": True,
+            "estimated_daily_runs_remaining": 1.0,
+            "estimated_token_equivalent_remaining": 3_702_086,
+        }
+    )
+
+    assert "잔여 2.01%" in message
+    assert "08:30 매수 판단 진행" in message
