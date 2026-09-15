@@ -176,6 +176,7 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline, "DEFAULT_TRADE_JOURNAL_LOG_PATH", tmp_path / "trade_journal.jsonl")
     monkeypatch.setattr(llm, "DEFAULT_LLM_CALL_LOG_PATH", tmp_path / "llm_calls.jsonl")
     monkeypatch.setattr(codex_plan, "DEFAULT_CALL_LOG_PATH", tmp_path / "codex_plan_calls.jsonl")
+    monkeypatch.setattr(codex_plan, "DEFAULT_JUDGMENT_CALL_LOG_PATH", tmp_path / "llm_calls.jsonl")
     monkeypatch.setattr(notion_sync, "DEFAULT_PIPELINE_LOG_PATH", tmp_path / "pipeline.jsonl")
     monkeypatch.setattr(notion_sync, "DEFAULT_TRADE_JOURNAL_LOG_PATH", tmp_path / "trade_journal.jsonl")
     monkeypatch.setattr(

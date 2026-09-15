@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import judgment, llm, notify, pipeline  # noqa: E402
+from src import codex_plan, judgment, llm, notify, pipeline  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.portfolio_store import load_portfolio  # noqa: E402
 from src.schemas import Decision, GateResult, PortfolioState, RiskGateConfig  # noqa: E402
@@ -33,6 +33,10 @@ logger = logging.getLogger("decide_buys")
 
 KST = ZoneInfo("Asia/Seoul")
 PENDING_BUYS_PATH = Path("logs/pending_buys.json")
+# 2026-09-15 전체 41종목 섀도(244/244 성공, 주간 한도 약 2%p) 뒤 사용자가 다음
+# 거래일부터 모의 매수 판단에 쓰기로 결정했다. "disabled"는 즉시 정지,
+# "anthropic"은 이력·롤백용이며 llm.CLAUDE_API_ENABLED도 켜져 있어야 한다.
+BUY_LLM_PROVIDER = "codex_plan"  # "codex_plan" | "anthropic" | "disabled"
 
 
 def _make_recording_execute_fn(recorded: list[dict]):
@@ -92,24 +96,30 @@ async def main() -> None:
     # 나왔던 버그(2026-08-13 발견).
     day = datetime.now(KST)
 
-    # Claude API를 껐으면 매수 판단 자체를 건너뛴다. 분석가를 돌려 호출마다 실패시키면
+    # 판단 공급자를 껐거나 Anthropic 롤백 경로가 정지 상태면 매수 판단 자체를 건너뛴다.
+    # 분석가를 돌려 호출마다 실패시키면
     # 판단 로그에 "분석 실패로 판단 불가"가 수백 건 쌓이고, 신호율 집계가 그날을 "신호 없는
     # 날"로 센다 — 판단을 안 한 날과 판단했으나 승인 0건인 날은 다른 상태다. 그래서
     # pipeline.jsonl에는 아무것도 안 쓴다(프리필터도 안 돈다).
     # 오늘 날짜의 빈 pending_buys는 남긴다 — execute_open이 "decide_buys가 제시간에 못
     # 끝났다"는 날짜 불일치 오류 알림을 보내지 않게.
-    if not llm.CLAUDE_API_ENABLED:
-        logger.warning("decide_buys_skipped day=%s reason=claude_api_disabled", today_kst.isoformat())
+    if BUY_LLM_PROVIDER == "disabled" or (
+        BUY_LLM_PROVIDER == "anthropic" and not llm.CLAUDE_API_ENABLED
+    ):
+        skipped_reason = "buy_llm_disabled" if BUY_LLM_PROVIDER == "disabled" else "claude_api_disabled"
+        logger.warning("decide_buys_skipped day=%s reason=%s", today_kst.isoformat(), skipped_reason)
         PENDING_BUYS_PATH.parent.mkdir(parents=True, exist_ok=True)
         PENDING_BUYS_PATH.write_text(
             json.dumps(
-                {"day": today_kst.isoformat(), "decisions": [], "skipped": "claude_api_disabled"},
+                {"day": today_kst.isoformat(), "decisions": [], "skipped": skipped_reason},
                 ensure_ascii=False,
                 indent=2,
             )
         )
         notify.send_telegram_alert(notify.format_buy_decision_skipped_alert(today_kst.isoformat()))
         return
+    if BUY_LLM_PROVIDER not in {"codex_plan", "anthropic"}:
+        raise ValueError(f"unknown BUY_LLM_PROVIDER={BUY_LLM_PROVIDER!r}")
 
     config = RiskGateConfig()
     portfolio = load_portfolio()
@@ -130,15 +140,39 @@ async def main() -> None:
     )
 
     recorded: list[dict] = []
-    await pipeline.run_daily(
-        day,
-        portfolio,
-        config,
-        analyst_fn,
-        judgment.judge,
-        _make_recording_execute_fn(recorded),
-        total_expected_analysts=3,
-    )
+    original_call_structured = llm.call_structured
+    provider_stats = {"attempted": 0, "failed": 0}
+    if BUY_LLM_PROVIDER == "codex_plan":
+        async def _tracked_codex_call(*args, **kwargs):
+            provider_stats["attempted"] += 1
+            try:
+                return await codex_plan.call_structured(*args, **kwargs)
+            except Exception:
+                provider_stats["failed"] += 1
+                raise
+
+        llm.call_structured = _tracked_codex_call
+    try:
+        await pipeline.run_daily(
+            day,
+            portfolio,
+            config,
+            analyst_fn,
+            judgment.judge,
+            _make_recording_execute_fn(recorded),
+            total_expected_analysts=3,
+        )
+    finally:
+        # main()은 단발 프로세스지만 테스트·수동 import에서도 공급자 변경이 새지 않게 한다.
+        llm.call_structured = original_call_structured
+
+    if provider_stats["failed"]:
+        notify.send_telegram_alert(
+            notify.format_error_alert(
+                "Codex 매수 판단 일부 실패 — 실패한 분석가는 제외되고 degraded 기준 적용",
+                f"failed={provider_stats['failed']} attempted={provider_stats['attempted']}",
+            )
+        )
 
     PENDING_BUYS_PATH.parent.mkdir(parents=True, exist_ok=True)
     PENDING_BUYS_PATH.write_text(

@@ -82,3 +82,42 @@ def test_refuses_to_run_when_the_isolated_user_can_traverse_the_repo(monkeypatch
         asyncio.run(codex_plan.check_health(log_path=log_path))
 
     assert json.loads(log_path.read_text())["success"] is False
+
+
+def test_buy_call_uses_sol_and_the_shared_llm_monitoring_log(monkeypatch, tmp_path):
+    captured = {}
+
+    async def fake_private(**kwargs):
+        captured.update(kwargs)
+        return codex_plan.HealthResponse(status="ok")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(codex_plan, "_call_structured", fake_private)
+
+    result = asyncio.run(
+        codex_plan.call_structured(
+            system="s",
+            user="u",
+            response_model=codex_plan.HealthResponse,
+            json_schema={},
+            label="chart",
+        )
+    )
+
+    assert result.status == "ok"
+    assert captured["model"] == "gpt-5.6-sol"
+    assert captured["label"] == "chart"
+    assert captured["log_path"] == codex_plan.DEFAULT_JUDGMENT_CALL_LOG_PATH
+
+
+def test_buy_call_rejects_an_unexpected_model_without_fallback():
+    with pytest.raises(codex_plan.CodexPlanUnavailable, match="Unsupported"):
+        asyncio.run(
+            codex_plan.call_structured(
+                system="",
+                user="",
+                response_model=codex_plan.HealthResponse,
+                json_schema={},
+                model="claude-sonnet-5",
+            )
+        )

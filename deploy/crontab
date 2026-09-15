@@ -9,10 +9,10 @@
 
 # 08:05 — ChatGPT 플랜 기반 Codex 연결 상태만 확인. 주식 판단·주문 없음.
 # Claude API와 OpenAI API 키를 모두 쓰지 않고, 저장된 ChatGPT 로그인 + Sol 구조화
-# 출력이 살아 있는지만 본다. 실패하면 텔레그램, 신규 매수는 계속 정지 상태다.
+# 출력이 살아 있는지만 본다. 실패하면 텔레그램으로 08:30 판단 전에 드러난다.
 5 8 * * 1-5      /home/ubuntu/sima/scripts/check_codex_plan.sh
 
-# 08:30 — 매수 판단만. 집행 안 함. 개장 30분 전.
+# 08:30 — Codex Sol 매수 판단만. 승인분을 pending에 기록하고 집행은 안 함. 개장 30분 전.
 30 8 * * 1-5    /home/ubuntu/sima/scripts/decide_buys.sh
 
 # 09:01 — 전날 매도 → 오늘 매수 집행 + 노션 매매일지 동기화.

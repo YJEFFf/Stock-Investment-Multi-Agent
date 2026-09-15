@@ -2,7 +2,8 @@
 
 OpenAI API 키를 쓰지 않는다는 사실이 이 모듈의 핵심 계약이다. 실행 환경에서
 OPENAI_API_KEY/CODEX_API_KEY를 제거하고, 저장된 Codex 로그인이 ChatGPT 계정인지
-매 호출 전에 확인한다. 현재는 주문과 분리된 연결 상태 점검에만 사용한다.
+매 호출 전에 확인한다. 연결 점검과 매수 판단이 이 모듈을 공유하지만 Codex 프로세스는
+운영 저장소를 읽지 못하며, 매수 판단 호출은 기존 LLM 감시 로그에 함께 남긴다.
 """
 
 import asyncio
@@ -24,11 +25,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_TIMEOUT_S = 120.0
 DEFAULT_CALL_LOG_PATH = Path("logs/codex_plan_calls.jsonl")
+DEFAULT_JUDGMENT_CALL_LOG_PATH = Path("logs/llm_calls.jsonl")
+MAX_CONCURRENT_CALLS = 8
 CODEX_OS_USER = "sima-codex"
 CODEX_EXECUTABLE = "/home/sima-codex/.local/bin/codex"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 KST = ZoneInfo("Asia/Seoul")
 T = TypeVar("T", bound=BaseModel)
+
+_CALL_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
 
 
 class CodexPlanUnavailable(RuntimeError):
@@ -209,6 +214,38 @@ async def _call_structured(
     )
     logger.info("codex_plan_call label=%s model=%s usage=%s", label, model, usage)
     return result
+
+
+async def call_structured(
+    system: str,
+    user: str,
+    response_model: type[T],
+    json_schema: dict[str, Any],
+    model: str = DEFAULT_MODEL,
+    max_tokens: int | None = None,
+    effort: str | None = None,
+    label: str = "unknown",
+    log_path: Path | None = None,
+) -> T:
+    """기존 ``llm.call_structured``와 같은 형태로 매수 판단에서 쓰는 진입점.
+
+    ``max_tokens``와 ``effort``는 호환 목적으로 받는다. 모델명이 다르면 조용히 다른
+    모델로 바꾸지 않고 실패시킨다. 파이프라인이 종목을 병렬 처리할 때 CLI 프로세스가
+    한꺼번에 수백 개 뜨지 않도록 동시 실행도 제한한다.
+    """
+    del max_tokens, effort
+    if model != DEFAULT_MODEL:
+        raise CodexPlanUnavailable(f"Unsupported Codex plan model: {model}")
+    async with _CALL_SEMAPHORE:
+        return await _call_structured(
+            system=system,
+            user=user,
+            response_model=response_model,
+            json_schema=json_schema,
+            label=label,
+            model=model,
+            log_path=log_path or DEFAULT_JUDGMENT_CALL_LOG_PATH,
+        )
 
 
 async def check_health(*, log_path: Path | None = None) -> HealthResponse:

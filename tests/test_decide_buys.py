@@ -220,6 +220,7 @@ def test_main_skips_the_whole_buy_decision_when_claude_api_is_off(monkeypatch, t
     안 써야 신호율 집계가 그날을 "승인 0건인 날"로 세지 않는다 — 판단을 안 한 날이다."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+    monkeypatch.setattr(db, "BUY_LLM_PROVIDER", "anthropic")
     monkeypatch.setattr(db.llm, "CLAUDE_API_ENABLED", False)
 
     async def must_not_run(*a, **k):
@@ -237,3 +238,59 @@ def test_main_skips_the_whole_buy_decision_when_claude_api_is_off(monkeypatch, t
     assert payload["day"] == db.datetime.now(db.KST).date().isoformat()  # execute_open 날짜 불일치 알림 방지
     assert not db.pipeline.DEFAULT_LOG_PATH.exists()
     assert len(alerts) == 1 and "매수 판단 건너뜀" in alerts[0]
+
+
+def test_main_uses_codex_plan_when_claude_api_is_off(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+    monkeypatch.setattr(db, "BUY_LLM_PROVIDER", "codex_plan")
+    monkeypatch.setattr(db.llm, "CLAUDE_API_ENABLED", False)
+    monkeypatch.setattr(db, "load_portfolio", lambda: PortfolioState(cash_weight=1.0))
+
+    async def fake_codex_call(**kwargs):
+        raise AssertionError("가짜 run_daily 안에서는 실제 호출하지 않는다")
+
+    monkeypatch.setattr(db.codex_plan, "call_structured", fake_codex_call)
+    captured = {}
+
+    async def fake_run_daily(day, portfolio, config, analyst_fn, judge_fn, execute_fn, total_expected_analysts):
+        captured["provider"] = db.llm.call_structured
+        return portfolio, []
+
+    monkeypatch.setattr(db.pipeline, "run_daily", fake_run_daily)
+
+    asyncio.run(db.main())
+
+    assert captured["provider"] is not fake_codex_call  # 실패 집계 래퍼를 한 겹 둔다.
+    assert db.llm.call_structured is not fake_codex_call
+    assert json.loads(db.PENDING_BUYS_PATH.read_text())["decisions"] == []
+
+
+def test_main_reports_aggregated_codex_failures_once(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+    monkeypatch.setattr(db, "BUY_LLM_PROVIDER", "codex_plan")
+    monkeypatch.setattr(db, "load_portfolio", lambda: PortfolioState(cash_weight=1.0))
+
+    async def failed_call(**kwargs):
+        raise RuntimeError("plan limit")
+
+    monkeypatch.setattr(db.codex_plan, "call_structured", failed_call)
+    alerts = []
+    monkeypatch.setattr(db.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    async def fake_run_daily(day, portfolio, config, analyst_fn, judge_fn, execute_fn, total_expected_analysts):
+        for _ in range(2):
+            try:
+                await db.llm.call_structured()
+            except RuntimeError:
+                pass
+        return portfolio, []
+
+    monkeypatch.setattr(db.pipeline, "run_daily", fake_run_daily)
+
+    asyncio.run(db.main())
+
+    failure_alerts = [a for a in alerts if "일부 실패" in a]
+    assert len(failure_alerts) == 1
+    assert "failed=2 attempted=2" in failure_alerts[0]
