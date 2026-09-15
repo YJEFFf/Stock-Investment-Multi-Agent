@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
+from types import SimpleNamespace
 
 import scripts.decide_buys as db
 from src.schemas import AnalystOpinion, Decision, GateResult, PortfolioState
@@ -27,6 +28,22 @@ def _no_real_notify_or_name_lookup(monkeypatch):
     monkeypatch.setattr(db.notify, "send_telegram_alert", lambda message: True)
     monkeypatch.setattr(db.pipeline, "display_name", lambda ticker: ticker)
     monkeypatch.setattr(db, "_seconds_until_deadline", lambda now: 60.0)
+    monkeypatch.setattr(
+        db.codex_plan,
+        "load_capacity_status",
+        lambda day: SimpleNamespace(
+            day=day,
+            remaining_percent=50.0,
+            buy_judgment_allowed=True,
+            model_dump=lambda mode="json": {
+                "day": day,
+                "remaining_percent": 50.0,
+                "buy_judgment_allowed": True,
+                "estimated_daily_runs_remaining": 25.0,
+                "estimated_token_equivalent_remaining": 92_091_700,
+            },
+        ),
+    )
 
 
 def _decision(ticker="005930", action="BUY") -> Decision:
@@ -330,3 +347,52 @@ def test_main_discards_results_when_deadline_expires(monkeypatch, tmp_path):
     assert payload["decisions"] == []
     assert payload["skipped"] == "decision_deadline_exceeded"
     assert any("08:55" in alert for alert in alerts)
+
+
+@pytest.mark.parametrize("remaining", [2.0, 0.0])
+def test_main_skips_codex_buy_judgment_at_or_below_two_percent(monkeypatch, tmp_path, remaining):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+    status = SimpleNamespace(
+        day=db.datetime.now(db.KST).date().isoformat(),
+        remaining_percent=remaining,
+        buy_judgment_allowed=False,
+        model_dump=lambda mode="json": {
+            "day": db.datetime.now(db.KST).date().isoformat(),
+            "remaining_percent": remaining,
+            "buy_judgment_allowed": False,
+            "estimated_daily_runs_remaining": remaining / 2,
+            "estimated_token_equivalent_remaining": 0,
+        },
+    )
+    monkeypatch.setattr(db.codex_plan, "load_capacity_status", lambda day: status)
+    monkeypatch.setattr(
+        db.pipeline, "run_daily", lambda *a, **k: (_ for _ in ()).throw(AssertionError("LLM 판단 호출 금지"))
+    )
+    alerts = []
+    monkeypatch.setattr(db.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    asyncio.run(db.main())
+
+    payload = json.loads(db.PENDING_BUYS_PATH.read_text())
+    assert payload["decisions"] == []
+    assert payload["skipped"] == "codex_weekly_capacity_low"
+    assert any(f"잔여 {remaining:.1f}%" in message and "손절·익절 감시" in message for message in alerts)
+
+
+def test_main_fails_closed_when_today_capacity_state_is_unavailable(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+    monkeypatch.setattr(
+        db.codex_plan,
+        "load_capacity_status",
+        lambda day: (_ for _ in ()).throw(db.codex_plan.CodexPlanUnavailable("stale")),
+    )
+    alerts = []
+    monkeypatch.setattr(db.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    asyncio.run(db.main())
+
+    payload = json.loads(db.PENDING_BUYS_PATH.read_text())
+    assert payload["skipped"] == "codex_capacity_unavailable"
+    assert any("한도 점검" in message and "신규 매수 판단 중지" in message for message in alerts)

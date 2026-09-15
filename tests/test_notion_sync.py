@@ -539,6 +539,25 @@ def test_daily_report_shows_display_names_and_cash_weight_to_two_decimals(monkey
     assert "현금 비중: 87.65%" in all_text
 
 
+def test_daily_report_shows_codex_capacity_and_skip_result():
+    blocks = asyncio.run(
+        notion_sync._daily_report_children(
+            "2026-09-16",
+            decisions_today=[], buys=[], sells=[], skips=[], portfolio=PortfolioState(),
+            codex_capacity={
+                "day": "2026-09-16",
+                "remaining_percent": 2.0,
+                "estimated_daily_runs_remaining": 1.0,
+                "buy_judgment_allowed": False,
+            },
+        )
+    )
+    all_text = json.dumps(blocks, ensure_ascii=False)
+    assert "Codex 주간 한도 잔여 2.0%" in all_text
+    assert "신규 매수 판단 중지" in all_text
+    assert "장마감 기준 보유 종목" in all_text
+
+
 def test_daily_report_summary_section_uses_broker_amounts_not_cash_weight():
     """총정리 금액은 브로커가 준 값 그대로다 — 장부 비중으로 역산하지 않는다.
 

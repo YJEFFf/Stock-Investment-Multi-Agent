@@ -128,6 +128,20 @@ async def main() -> None:
     if BUY_LLM_PROVIDER not in {"codex_plan", "anthropic"}:
         raise ValueError(f"unknown BUY_LLM_PROVIDER={BUY_LLM_PROVIDER!r}")
 
+    if BUY_LLM_PROVIDER == "codex_plan":
+        try:
+            capacity = codex_plan.load_capacity_status(today_kst.isoformat())
+        except codex_plan.CodexPlanUnavailable as exc:
+            _write_pending_state(today_kst.isoformat(), [], skipped="codex_capacity_unavailable")
+            notify.send_telegram_alert(
+                notify.format_error_alert("08:05 Codex 한도 점검을 확인할 수 없어 오늘 신규 매수 판단 중지", str(exc))
+            )
+            return
+        if not capacity.buy_judgment_allowed:
+            _write_pending_state(today_kst.isoformat(), [], skipped="codex_weekly_capacity_low")
+            notify.send_telegram_alert(notify.format_codex_capacity_skip_alert(capacity.model_dump(mode="json")))
+            return
+
     seconds_until_deadline = _seconds_until_deadline(day)
     if seconds_until_deadline <= 0:
         _write_pending_state(today_kst.isoformat(), [], skipped="decision_started_after_deadline")

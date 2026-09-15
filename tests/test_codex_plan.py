@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -155,3 +156,90 @@ def test_cancelled_codex_call_is_logged_as_failure(monkeypatch, tmp_path):
     assert entry["success"] is False
     assert entry["error"] == "cancelled"
     assert entry["input_tokens"] == 0
+
+
+def test_reads_weekly_capacity_without_an_llm_turn(monkeypatch):
+    monkeypatch.setattr(codex_plan, "_ensure_filesystem_isolation", lambda env: None)
+    monkeypatch.setattr(codex_plan, "_ensure_chatgpt_login", lambda env: None)
+    responses = [
+        {"id": 1, "result": {"userAgent": "test"}},
+        {
+            "id": 2,
+            "result": {
+                "ordinaryUsageAllowed": True,
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "primary": {
+                            "usedPercent": 83,
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1789975211,
+                        }
+                    }
+                },
+            },
+        },
+    ]
+
+    class FakeProcess:
+        def __init__(self, *args, **kwargs):
+            self.stdin = StringIO()
+            self.stdout = StringIO("".join(json.dumps(r) + "\n" for r in responses))
+            self.stderr = StringIO()
+
+        def terminate(self): pass
+        def wait(self, timeout=None): return 0
+        def kill(self): pass
+
+    monkeypatch.setattr(codex_plan.subprocess, "Popen", FakeProcess)
+
+    status = codex_plan._read_capacity_sync()
+
+    assert status.used_percent == 83
+    assert status.remaining_percent == 17
+    assert status.window_duration_mins == 10080
+    assert status.buy_judgment_allowed is True
+    assert status.estimated_daily_runs_remaining == 8.5
+    assert status.estimated_token_equivalent_remaining == round(8.5 * 3_683_668)
+
+
+def test_capacity_two_percent_is_not_allowed(monkeypatch):
+    monkeypatch.setattr(codex_plan, "_ensure_filesystem_isolation", lambda env: None)
+    monkeypatch.setattr(codex_plan, "_ensure_chatgpt_login", lambda env: None)
+    responses = [
+        {"id": 1, "result": {}},
+        {"id": 2, "result": {"ordinaryUsageAllowed": True, "rateLimits": {"primary": {
+            "usedPercent": 98, "windowDurationMins": 10080, "resetsAt": 1789975211
+        }}}},
+    ]
+
+    class FakeProcess:
+        def __init__(self, *args, **kwargs):
+            self.stdin, self.stderr = StringIO(), StringIO()
+            self.stdout = StringIO("".join(json.dumps(r) + "\n" for r in responses))
+        def terminate(self): pass
+        def wait(self, timeout=None): return 0
+        def kill(self): pass
+
+    monkeypatch.setattr(codex_plan.subprocess, "Popen", FakeProcess)
+    assert codex_plan._read_capacity_sync().buy_judgment_allowed is False
+
+
+def test_capacity_state_must_be_for_today(tmp_path):
+    path = tmp_path / "capacity.json"
+    status = codex_plan.CapacityStatus(
+        checked_at="2026-09-15T08:05:00+09:00",
+        day="2026-09-15",
+        used_percent=83,
+        remaining_percent=17,
+        window_duration_mins=10080,
+        resets_at="2026-09-21T00:00:00+00:00",
+        ordinary_usage_allowed=True,
+        buy_judgment_allowed=True,
+        estimated_daily_runs_remaining=8.5,
+        estimated_token_equivalent_remaining=31_311_178,
+    )
+    codex_plan.save_capacity_status(status, path)
+
+    assert codex_plan.load_capacity_status("2026-09-15", path) == status
+    with pytest.raises(codex_plan.CodexPlanUnavailable, match="stale"):
+        codex_plan.load_capacity_status("2026-09-16", path)

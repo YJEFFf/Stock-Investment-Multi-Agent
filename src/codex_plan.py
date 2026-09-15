@@ -10,15 +10,17 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +28,20 @@ DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_TIMEOUT_S = 120.0
 DEFAULT_CALL_LOG_PATH = Path("logs/codex_plan_calls.jsonl")
 DEFAULT_JUDGMENT_CALL_LOG_PATH = Path("logs/llm_calls.jsonl")
+DEFAULT_CAPACITY_STATE_PATH = Path("logs/codex_plan_capacity.json")
 MAX_CONCURRENT_CALLS = 8
 CODEX_OS_USER = "sima-codex"
 CODEX_EXECUTABLE = "/home/sima-codex/.local/bin/codex"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 KST = ZoneInfo("Asia/Seoul")
 T = TypeVar("T", bound=BaseModel)
+
+# 2026-09-15 전체 일일 섀도 실측(input 3,645,441 + output 38,227)이 Codex의
+# 7일 한도 표시를 약 2%p 사용했다. 절대 토큰 한도는 제품이 공개하지 않으므로,
+# 아래 값은 현재와 같은 모델·프롬프트 부하를 몇 번 더 돌릴 수 있는지 환산할 때만 쓴다.
+FULL_DAILY_REFERENCE_TOKENS = 3_683_668
+FULL_DAILY_REFERENCE_PERCENT_POINTS = 2.0
+BUY_CAPACITY_FLOOR_PERCENT = 2.0
 
 _CALL_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
 
@@ -42,6 +52,30 @@ class CodexPlanUnavailable(RuntimeError):
 
 class HealthResponse(BaseModel):
     status: Literal["ok"]
+
+
+class CapacityStatus(BaseModel):
+    checked_at: datetime
+    day: str
+    used_percent: float
+    remaining_percent: float
+    window_duration_mins: int
+    resets_at: datetime
+    ordinary_usage_allowed: bool
+    buy_judgment_allowed: bool
+    threshold_percent: float = BUY_CAPACITY_FLOOR_PERCENT
+    estimated_daily_runs_remaining: float
+    estimated_token_equivalent_remaining: int
+
+    @model_validator(mode="after")
+    def validate_derived_fields(self):
+        expected_remaining = round(100.0 - self.used_percent, 2)
+        if self.remaining_percent != expected_remaining:
+            raise ValueError("remaining_percent does not match used_percent")
+        expected_allowed = self.ordinary_usage_allowed and self.remaining_percent > self.threshold_percent
+        if self.buy_judgment_allowed != expected_allowed:
+            raise ValueError("buy_judgment_allowed does not match the capacity floor")
+        return self
 
 
 _HEALTH_SCHEMA = {
@@ -101,6 +135,143 @@ def _ensure_filesystem_isolation(env: dict[str, str]) -> None:
         raise CodexPlanUnavailable(f"Codex isolation check unavailable: {exc}") from exc
     if result.returncode != 0:
         raise CodexPlanUnavailable("Codex OS user can access the production repository")
+
+
+def _app_server_response(
+    process: subprocess.Popen, responses: queue.Queue, request: dict, request_id: int
+) -> dict:
+    """app-server JSONL 응답 하나를 읽는다. 계정 ID·인증 토큰은 저장하지 않는다."""
+    assert process.stdin is not None
+    process.stdin.write(json.dumps(request) + "\n")
+    process.stdin.flush()
+    deadline = time.monotonic() + DEFAULT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            line = responses.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty as exc:
+            raise CodexPlanUnavailable(f"Codex app-server response timed out for request {request_id}") from exc
+        if line is None:
+            break
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("id") != request_id:
+            continue
+        if message.get("error"):
+            raise CodexPlanUnavailable(f"Codex app-server request failed: {message['error']}")
+        if isinstance(message.get("result"), dict):
+            return message["result"]
+        break
+    raise CodexPlanUnavailable(f"Codex app-server response missing for request {request_id}")
+
+
+def _read_capacity_sync() -> CapacityStatus:
+    """ChatGPT 계정의 일반 Codex 7일 한도를 조회한다(LLM 추론 호출 없음)."""
+    env = _subscription_environment()
+    _ensure_filesystem_isolation(env)
+    _ensure_chatgpt_login(env)
+    try:
+        process = subprocess.Popen(
+            _codex_command("app-server", "--stdio"),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+    except OSError as exc:
+        raise CodexPlanUnavailable(f"Codex app-server unavailable: {exc}") from exc
+    responses: queue.Queue[str | None] = queue.Queue()
+
+    def _read_stdout() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            responses.put(line)
+        responses.put(None)
+
+    threading.Thread(target=_read_stdout, daemon=True, name="codex-capacity-reader").start()
+    try:
+        _app_server_response(
+            process,
+            responses,
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "sima-capacity-check", "version": "1.0"},
+                    "capabilities": {},
+                },
+            },
+            1,
+        )
+        result = _app_server_response(
+            process,
+            responses,
+            {
+                "id": 2,
+                "method": "account/rateLimits/read",
+                "params": {"excludeResetCreditDetails": True},
+            },
+            2,
+        )
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+
+    rate_limits = (result.get("rateLimitsByLimitId") or {}).get("codex") or result.get("rateLimits")
+    primary = rate_limits.get("primary") if isinstance(rate_limits, dict) else None
+    if not isinstance(primary, dict) or primary.get("windowDurationMins") != 10_080:
+        raise CodexPlanUnavailable("Codex weekly rate-limit window is unavailable")
+    try:
+        used = min(100.0, max(0.0, float(primary["usedPercent"])))
+        reset_at = datetime.fromtimestamp(int(primary["resetsAt"]), timezone.utc)
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        raise CodexPlanUnavailable(f"Codex weekly rate-limit payload is invalid: {exc}") from exc
+    remaining = round(100.0 - used, 2)
+    ordinary_allowed = result.get("ordinaryUsageAllowed") is True
+    runs = remaining / FULL_DAILY_REFERENCE_PERCENT_POINTS
+    return CapacityStatus(
+        checked_at=datetime.now(timezone.utc),
+        day=datetime.now(KST).date().isoformat(),
+        used_percent=used,
+        remaining_percent=remaining,
+        window_duration_mins=10_080,
+        resets_at=reset_at,
+        ordinary_usage_allowed=ordinary_allowed,
+        buy_judgment_allowed=ordinary_allowed and remaining > BUY_CAPACITY_FLOOR_PERCENT,
+        estimated_daily_runs_remaining=round(runs, 1),
+        estimated_token_equivalent_remaining=round(runs * FULL_DAILY_REFERENCE_TOKENS),
+    )
+
+
+def save_capacity_status(status: CapacityStatus, path: Path | None = None) -> None:
+    """08:30 판단이 부분 파일을 읽지 않도록 원자적으로 교체한다."""
+    path = path or DEFAULT_CAPACITY_STATE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(status.model_dump_json(indent=2))
+    temp_path.replace(path)
+
+
+def load_capacity_status(day: str, path: Path | None = None) -> CapacityStatus:
+    """당일 08:05 상태만 허용한다. 없거나 낡거나 손상되면 매수 판단을 실패 폐쇄한다."""
+    path = path or DEFAULT_CAPACITY_STATE_PATH
+    try:
+        status = CapacityStatus.model_validate_json(path.read_text())
+    except (OSError, ValidationError, ValueError) as exc:
+        raise CodexPlanUnavailable(f"Codex capacity state unavailable: {exc}") from exc
+    if status.day != day:
+        raise CodexPlanUnavailable(f"Codex capacity state is stale: checked_day={status.day} today={day}")
+    return status
+
+
+async def read_capacity() -> CapacityStatus:
+    return await asyncio.to_thread(_read_capacity_sync)
 
 
 def _usage_from_events(stdout: str) -> dict[str, int]:

@@ -119,7 +119,7 @@ class GateResult(BaseModel):
 src/
   schemas.py      # 계약 (처음부터 분리)
   llm.py          # 정지된 기존 Anthropic API 래퍼 — 이력·롤백용
-  codex_plan.py   # ChatGPT 플랜 기반 Codex 연결 점검 — 주문과 격리
+  codex_plan.py   # ChatGPT 플랜 기반 Codex 연결·주간 한도·구조화 호출 — 주문과 격리
   collectors.py   # 수집 전부
   analysts.py     # 분석가 전부
   pipeline.py     # 토론 → 매니저 → 게이트 → 집행

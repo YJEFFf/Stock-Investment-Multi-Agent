@@ -44,6 +44,7 @@ GITHUB_URL = "https://github.com/YJEFFf/Stock-Investment-Multi-Agent"
 DEFAULT_PIPELINE_LOG_PATH = Path("logs/pipeline.jsonl")
 DEFAULT_TRADE_JOURNAL_LOG_PATH = Path("logs/trade_journal.jsonl")
 DEFAULT_DAILY_REPORT_STATE_PATH = Path("logs/notion_daily_report_state.json")
+DEFAULT_CODEX_CAPACITY_STATE_PATH = Path("logs/codex_plan_capacity.json")
 
 # AGENTS.md/PLAN.md와 다른 파일로 관리하는 이유: 코드가 아니라 노션 표시용
 # 텍스트라 손보는 이유가 다르다(문서 내용이 아니라 노션 블록 포맷을 고치게 됨).
@@ -1028,8 +1029,17 @@ async def _daily_report_children(
     skips: list[dict],
     portfolio: PortfolioState,
     account: kis.AccountSnapshot | None = None,
+    codex_capacity: dict | None = None,
 ) -> list[dict]:
     blocks = [_heading("오늘의 판단 요약", level=2)]
+    if codex_capacity and codex_capacity.get("day") == day:
+        result = "매수 판단 진행" if codex_capacity.get("buy_judgment_allowed") else "신규 매수 판단 중지"
+        blocks.append(
+            _paragraph(
+                f"Codex 주간 한도 잔여 {codex_capacity['remaining_percent']:.1f}% · "
+                f"같은 일일 부하 약 {codex_capacity['estimated_daily_runs_remaining']:.1f}회분 · {result}"
+            )
+        )
     if decisions_today:
         approved_buy_decisions = [d for d in decisions_today if d["action"] == "BUY" and d["approved"]]
         # 게이트 거부는 rejected_by가 있는 것만이다. approved=False로 세면 HOLD가
@@ -1154,6 +1164,7 @@ async def sync_daily_report(
     trade_journal_log_path: Path | None = None,
     state_path: Path | None = None,
     account: kis.AccountSnapshot | None = None,
+    codex_capacity_path: Path | None = None,
 ) -> bool:
     """하루에 한 번, 장 마감 뒤 그날의 판단·매수·매도·최종 보유 종목을 요약해
     노션에 한 페이지로 남긴다. logs/pipeline.jsonl(그날의 모든 판단)과
@@ -1174,6 +1185,7 @@ async def sync_daily_report(
     pipeline_log_path = pipeline_log_path or DEFAULT_PIPELINE_LOG_PATH
     trade_journal_log_path = trade_journal_log_path or DEFAULT_TRADE_JOURNAL_LOG_PATH
     state_path = state_path or DEFAULT_DAILY_REPORT_STATE_PATH
+    codex_capacity_path = codex_capacity_path or DEFAULT_CODEX_CAPACITY_STATE_PATH
     synced_days = _load_synced_days(state_path)
     if day in synced_days:
         logger.info("notion_daily_report_skipped day=%s reason=already_synced", day)
@@ -1189,11 +1201,20 @@ async def sync_daily_report(
     buys = [e for e in trades_today if e["event"] == "buy"]
     sells = [e for e in trades_today if e["event"] == "sell"]
     skips = [e for e in trades_today if e["event"] == "buy_skipped"]
+    codex_capacity = None
+    try:
+        raw_capacity = json.loads(codex_capacity_path.read_text())
+        if raw_capacity.get("day") == day:
+            codex_capacity = raw_capacity
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
 
     body = {
         "parent": {"database_id": database_id},
         "properties": _daily_report_properties(day, buys, sells, portfolio),
-        "children": await _daily_report_children(day, decisions_today, buys, sells, skips, portfolio, account),
+        "children": await _daily_report_children(
+            day, decisions_today, buys, sells, skips, portfolio, account, codex_capacity
+        ),
     }
     result = _notion_request("POST", "/pages", body)
     if result is None:

@@ -177,10 +177,14 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(llm, "DEFAULT_LLM_CALL_LOG_PATH", tmp_path / "llm_calls.jsonl")
     monkeypatch.setattr(codex_plan, "DEFAULT_CALL_LOG_PATH", tmp_path / "codex_plan_calls.jsonl")
     monkeypatch.setattr(codex_plan, "DEFAULT_JUDGMENT_CALL_LOG_PATH", tmp_path / "llm_calls.jsonl")
+    monkeypatch.setattr(codex_plan, "DEFAULT_CAPACITY_STATE_PATH", tmp_path / "codex_plan_capacity.json")
     monkeypatch.setattr(notion_sync, "DEFAULT_PIPELINE_LOG_PATH", tmp_path / "pipeline.jsonl")
     monkeypatch.setattr(notion_sync, "DEFAULT_TRADE_JOURNAL_LOG_PATH", tmp_path / "trade_journal.jsonl")
     monkeypatch.setattr(
         notion_sync, "DEFAULT_DAILY_REPORT_STATE_PATH", tmp_path / "notion_daily_report_state.json"
+    )
+    monkeypatch.setattr(
+        notion_sync, "DEFAULT_CODEX_CAPACITY_STATE_PATH", tmp_path / "codex_plan_capacity.json"
     )
     monkeypatch.setattr(notion_sync, "DEFAULT_SYNC_STATE_PATH", tmp_path / "notion_sync_state.json")
     monkeypatch.setattr(portfolio_store, "PORTFOLIO_STATE_PATH", tmp_path / "portfolio_state.json")
@@ -196,6 +200,7 @@ def _never_spend_the_chatgpt_plan(monkeypatch):
         raise AssertionError("test attempted to start a real Codex process")
 
     monkeypatch.setattr(codex_plan.subprocess, "run", blocked)
+    monkeypatch.setattr(codex_plan.subprocess, "Popen", blocked)
 
 
 @pytest.fixture(autouse=True)
