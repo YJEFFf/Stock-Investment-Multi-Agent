@@ -9,6 +9,7 @@ OPENAI_API_KEY/CODEX_API_KEY를 제거하고, 저장된 Codex 로그인이 ChatG
 import asyncio
 import json
 import logging
+import math
 import os
 import queue
 import subprocess
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Any, Literal, TypeVar
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -57,15 +58,15 @@ class HealthResponse(BaseModel):
 class CapacityStatus(BaseModel):
     checked_at: datetime
     day: str
-    used_percent: float
-    remaining_percent: float
-    window_duration_mins: int
+    used_percent: float = Field(ge=0.0, le=100.0, allow_inf_nan=False)
+    remaining_percent: float = Field(ge=0.0, le=100.0, allow_inf_nan=False)
+    window_duration_mins: Literal[10_080]
     resets_at: datetime
     ordinary_usage_allowed: bool
     buy_judgment_allowed: bool
-    threshold_percent: float = BUY_CAPACITY_FLOOR_PERCENT
-    estimated_daily_runs_remaining: float
-    estimated_token_equivalent_remaining: int
+    threshold_percent: Literal[2.0] = BUY_CAPACITY_FLOOR_PERCENT
+    estimated_daily_runs_remaining: float = Field(ge=0.0, allow_inf_nan=False)
+    estimated_token_equivalent_remaining: int = Field(ge=0)
 
     @model_validator(mode="after")
     def validate_derived_fields(self):
@@ -75,6 +76,16 @@ class CapacityStatus(BaseModel):
         expected_allowed = self.ordinary_usage_allowed and self.remaining_percent > self.threshold_percent
         if self.buy_judgment_allowed != expected_allowed:
             raise ValueError("buy_judgment_allowed does not match the capacity floor")
+        expected_runs = round(self.remaining_percent / FULL_DAILY_REFERENCE_PERCENT_POINTS, 1)
+        if self.estimated_daily_runs_remaining != expected_runs:
+            raise ValueError("estimated_daily_runs_remaining does not match remaining_percent")
+        expected_tokens = round(
+            self.remaining_percent
+            / FULL_DAILY_REFERENCE_PERCENT_POINTS
+            * FULL_DAILY_REFERENCE_TOKENS
+        )
+        if self.estimated_token_equivalent_remaining != expected_tokens:
+            raise ValueError("estimated_token_equivalent_remaining does not match remaining_percent")
         return self
 
 
@@ -228,7 +239,9 @@ def _read_capacity_sync() -> CapacityStatus:
     if not isinstance(primary, dict) or primary.get("windowDurationMins") != 10_080:
         raise CodexPlanUnavailable("Codex weekly rate-limit window is unavailable")
     try:
-        used = min(100.0, max(0.0, float(primary["usedPercent"])))
+        used = float(primary["usedPercent"])
+        if not math.isfinite(used) or not 0.0 <= used <= 100.0:
+            raise ValueError(f"usedPercent is outside 0..100: {used!r}")
         reset_at = datetime.fromtimestamp(int(primary["resetsAt"]), timezone.utc)
     except (KeyError, TypeError, ValueError, OSError) as exc:
         raise CodexPlanUnavailable(f"Codex weekly rate-limit payload is invalid: {exc}") from exc

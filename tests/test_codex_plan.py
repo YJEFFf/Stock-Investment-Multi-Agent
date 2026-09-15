@@ -243,3 +243,47 @@ def test_capacity_state_must_be_for_today(tmp_path):
     assert codex_plan.load_capacity_status("2026-09-15", path) == status
     with pytest.raises(codex_plan.CodexPlanUnavailable, match="stale"):
         codex_plan.load_capacity_status("2026-09-16", path)
+
+
+@pytest.mark.parametrize("invalid_used", [-1, 101, "NaN"])
+def test_invalid_backend_capacity_fails_closed(monkeypatch, invalid_used):
+    monkeypatch.setattr(codex_plan, "_ensure_filesystem_isolation", lambda env: None)
+    monkeypatch.setattr(codex_plan, "_ensure_chatgpt_login", lambda env: None)
+    responses = [
+        {"id": 1, "result": {}},
+        {"id": 2, "result": {"ordinaryUsageAllowed": True, "rateLimits": {"primary": {
+            "usedPercent": invalid_used, "windowDurationMins": 10080, "resetsAt": 1789975211
+        }}}},
+    ]
+
+    class FakeProcess:
+        def __init__(self, *args, **kwargs):
+            self.stdin, self.stderr = StringIO(), StringIO()
+            self.stdout = StringIO("".join(json.dumps(r) + "\n" for r in responses))
+        def terminate(self): pass
+        def wait(self, timeout=None): return 0
+        def kill(self): pass
+
+    monkeypatch.setattr(codex_plan.subprocess, "Popen", FakeProcess)
+    with pytest.raises(codex_plan.CodexPlanUnavailable, match="payload is invalid"):
+        codex_plan._read_capacity_sync()
+
+
+def test_tampered_capacity_state_cannot_authorize(tmp_path):
+    path = tmp_path / "capacity.json"
+    path.write_text(json.dumps({
+        "checked_at": "2026-09-15T08:05:00+09:00",
+        "day": "2026-09-15",
+        "used_percent": 98,
+        "remaining_percent": 2,
+        "window_duration_mins": 10080,
+        "resets_at": "2026-09-21T00:00:00+00:00",
+        "ordinary_usage_allowed": True,
+        "buy_judgment_allowed": True,
+        "threshold_percent": 0,
+        "estimated_daily_runs_remaining": 1,
+        "estimated_token_equivalent_remaining": 3_683_668,
+    }))
+
+    with pytest.raises(codex_plan.CodexPlanUnavailable, match="state unavailable"):
+        codex_plan.load_capacity_status("2026-09-15", path)
