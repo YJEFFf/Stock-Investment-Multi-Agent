@@ -32,7 +32,12 @@
   재검토에서 마감시각에 취소된 최대 8개 in-flight 호출이 `CancelledError`로 감시 로그를
   우회하는 MEDIUM을 추가 발견했다. 취소도 label별 실패·0 usage로 기록하고 다시 전파하도록
   고쳤으며 전체 **604 passed / 5 skipped**, 수정 커밋 `2e322c4` 주문 경로 드릴
-  **11/11 통과(브로커 주문 0건)**. 같은 리뷰어의 최종 재검토를 진행한다.
+  **11/11 통과(브로커 주문 0건)**. 같은 리뷰어가 최종 해시
+  `3c84681500e01b6b34b49a5b1e28ed31f781c69d`를 추가 결함 없이 승인했다. 22:39 KST
+  `SIMA_REVIEWED`를 그 해시에 고정해 EC2 배포 완료: 서버 **604 passed / 5 skipped**,
+  crontab 원본 일치, `BUY_LLM_PROVIDER=codex_plan`, 모델 `gpt-5.6-sol`, 동시성 8,
+  마감 08:55, 전용 계정 `Logged in using ChatGPT`, 작업 트리 clean. pending은 없고
+  포트폴리오 상태 mtime은 15:30 그대로라 배포 중 판단·주문·상태 변경은 없었다.
 - 19:12~19:23 KST 사용자 지시에 따라 ChatGPT Pro 5x의 일일 소모율을 실측하려고
   **오늘 정량 필터 전체를 Codex Sol로 일회성 섀도 실행**했다. KOSPI200 198종목 중
   절대 문턱을 통과한 41종목을 종목별로 독립 판정했고 244/244회 성공(분석가 데이터가
