@@ -164,9 +164,9 @@ def test_the_secondary_source_is_not_called_when_kis_answered(monkeypatch):
     asyncio.run(pipeline.evaluate_holdings(_portfolio(), DAY, sell.execute_sell_simulated))
 
 
-def test_the_default_mode_is_shadow_until_the_soak_is_reviewed():
-    """매매 경로 변경은 최소 1거래일 섀도로 돌린 뒤 켠다(docs/PLAN.md 매매 경로 변경 절차)."""
-    assert pipeline.SECONDARY_QUOTE_MODE == "shadow"
+def test_the_default_mode_is_active_after_the_soak_was_reviewed():
+    """9/14~9/15 섀도 증거와 사용자 결정을 거쳐 KIS 시세 공백을 실제로 메운다."""
+    assert pipeline.SECONDARY_QUOTE_MODE == "active"
 
 
 @pytest.mark.parametrize("phase", ["open", "close"])
@@ -195,6 +195,7 @@ def test_agreement_observation_runs_after_stop_loss_evaluation(monkeypatch):
     quote = kis.Quote(price=85.0, day_high=85.0, day_low=85.0)
     monkeypatch.setattr(kis, "fetch_quote", lambda ticker, policy=None: quote)
     monkeypatch.setattr(pipeline, "_kst_today", lambda: TODAY)
+    monkeypatch.setattr(pipeline, "SECONDARY_QUOTE_MODE", "shadow")
 
     async def fake_finalize(portfolio, action, *args, **kwargs):
         events.append("stop_loss")

@@ -80,10 +80,10 @@ BLACKOUT_CONTEXT = "holdings_all_prices_unavailable"
 
 # KIS 시세가 실패한 종목의 2차 소스(collectors.fetch_naver_quotes) 사용 모드.
 # "shadow": 받아서 기록만 한다(판정은 KIS가 된 종목만). "active": 판정에 쓴다.
-# 2026-09-14 도입 시 shadow로 시작한다 — 매매 경로 변경은 최소 1거래일 섀도로 돌려 증거를
-# 본 뒤 켠다(docs/PLAN.md "매매 경로 변경 절차"). 켜기 전에 cron.log의
-# secondary_quote_shadow / secondary_quote_agreement 줄을 볼 것.
-SECONDARY_QUOTE_MODE = "shadow"
+# 2026-09-14 도입 뒤 shadow로 시작했고, 9/14~9/15 운영 증거를 확인한 뒤 사용자가 active
+# 전환을 확정했다. KIS가 시세 재시도를 소진한 종목만 네이버 KRX 시세로 판정한다.
+# 근거와 독립 리뷰 기록은 docs/CHANGELOG.md 2026-09-15 항목에 남긴다.
+SECONDARY_QUOTE_MODE = "active"
 # 섀도 기간에 KIS·네이버 가격이 실제로 같은지 개장 직후와 장 마감 직전에 대조한다.
 # 개장 직후 표본은 넥스트레이드·전일 기준가가 섞이지 않는지 확인하기 위한 것이고,
 # 15:20 표본은 하루 가격 범위가 쌓인 뒤에도 KRX 필드가 일치하는지 확인한다.
