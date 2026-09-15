@@ -26,6 +26,7 @@ def _no_real_notify_or_name_lookup(monkeypatch):
     # execute_buy_order 쪽에서 실수로 한 번 겪은 것과 같은 함정, 2026-08-11 재발).
     monkeypatch.setattr(db.notify, "send_telegram_alert", lambda message: True)
     monkeypatch.setattr(db.pipeline, "display_name", lambda ticker: ticker)
+    monkeypatch.setattr(db, "_seconds_until_deadline", lambda now: 60.0)
 
 
 def _decision(ticker="005930", action="BUY") -> Decision:
@@ -294,3 +295,38 @@ def test_main_reports_aggregated_codex_failures_once(monkeypatch, tmp_path):
     failure_alerts = [a for a in alerts if "일부 실패" in a]
     assert len(failure_alerts) == 1
     assert "failed=2 attempted=2" in failure_alerts[0]
+
+
+def test_main_marks_in_progress_before_collecting(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+    monkeypatch.setattr(db, "load_portfolio", lambda: PortfolioState(cash_weight=1.0))
+
+    async def fake_run_daily(*args, **kwargs):
+        payload = json.loads(db.PENDING_BUYS_PATH.read_text())
+        assert payload["decisions"] == []
+        assert payload["skipped"] == "decision_in_progress"
+        return args[1], []
+
+    monkeypatch.setattr(db.pipeline, "run_daily", fake_run_daily)
+    asyncio.run(db.main())
+
+
+def test_main_discards_results_when_deadline_expires(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+    monkeypatch.setattr(db, "load_portfolio", lambda: PortfolioState(cash_weight=1.0))
+    monkeypatch.setattr(db, "_seconds_until_deadline", lambda now: 0.001)
+    alerts = []
+    monkeypatch.setattr(db.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    async def slow_run_daily(*args, **kwargs):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(db.pipeline, "run_daily", slow_run_daily)
+    asyncio.run(db.main())
+
+    payload = json.loads(db.PENDING_BUYS_PATH.read_text())
+    assert payload["decisions"] == []
+    assert payload["skipped"] == "decision_deadline_exceeded"
+    assert any("08:55" in alert for alert in alerts)

@@ -7,6 +7,7 @@ pipeline.finalize_sell/execute_buy_order 자체의 동작(체결가 조회, 로�
 3. 파일이 아예 없을 때 조용히 넘어가는지
 4. 다 쓴 pending 파일을 소비(삭제)하는지
 5. pending_sells.json이 너무 오래됐으면 실행하지 않고 지우는지
+6. 09:01에도 매수 판단이 진행 중이면 주문 없이 즉시 알리는지
 만 확인한다 — 그래서 pipeline.finalize_sell/execute_buy_order를 직접 가짜로
 바꿔치기해서 호출 순서/인자만 관찰한다.
 """
@@ -168,6 +169,27 @@ def test_skips_buys_when_pending_day_does_not_match_today(monkeypatch, tmp_path)
     # 날짜가 안 맞는 pending_buys.json은 지우지 않는다 — decide_buys가 뒤늦게라도
     # 같은 날 다시 성공하면 그걸로 덮어써질 수 있어야 하고, 원인 파악용으로도 남겨둔다.
     assert eo.PENDING_BUYS_PATH.exists()
+
+
+def test_in_progress_buy_decision_at_open_alerts_and_places_no_order(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    portfolio_store.save_portfolio(PortfolioState(cash_weight=1.0))
+    eo.PENDING_BUYS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    eo.PENDING_BUYS_PATH.write_text(
+        json.dumps({"day": TODAY.isoformat(), "decisions": [], "skipped": "decision_in_progress"})
+    )
+
+    def fail(*args, **kwargs):
+        raise AssertionError("판단 중 상태에서는 매수 주문을 내면 안 된다")
+
+    monkeypatch.setattr(eo.pipeline, "execute_buy_order", fail)
+    alerts = []
+    monkeypatch.setattr(eo.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
+
+    asyncio.run(eo.main())
+
+    assert any("09:01" in alert and "끝나지 않아" in alert for alert in alerts)
+    assert not eo.PENDING_BUYS_PATH.exists()
 
 
 def test_stale_pending_sells_are_skipped_and_removed(monkeypatch, tmp_path):

@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -37,6 +37,20 @@ PENDING_BUYS_PATH = Path("logs/pending_buys.json")
 # 거래일부터 모의 매수 판단에 쓰기로 결정했다. "disabled"는 즉시 정지,
 # "anthropic"은 이력·롤백용이며 llm.CLAUDE_API_ENABLED도 켜져 있어야 한다.
 BUY_LLM_PROVIDER = "codex_plan"  # "codex_plan" | "anthropic" | "disabled"
+DECISION_DEADLINE = time(8, 55)  # 09:01 execute_open보다 6분 먼저 실패 폐쇄
+
+
+def _seconds_until_deadline(now: datetime) -> float:
+    deadline = datetime.combine(now.date(), DECISION_DEADLINE, tzinfo=KST)
+    return (deadline - now).total_seconds()
+
+
+def _write_pending_state(day: str, decisions: list[dict], *, skipped: str | None = None) -> None:
+    payload = {"day": day, "decisions": decisions}
+    if skipped is not None:
+        payload["skipped"] = skipped
+    PENDING_BUYS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PENDING_BUYS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _make_recording_execute_fn(recorded: list[dict]):
@@ -108,18 +122,26 @@ async def main() -> None:
     ):
         skipped_reason = "buy_llm_disabled" if BUY_LLM_PROVIDER == "disabled" else "claude_api_disabled"
         logger.warning("decide_buys_skipped day=%s reason=%s", today_kst.isoformat(), skipped_reason)
-        PENDING_BUYS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        PENDING_BUYS_PATH.write_text(
-            json.dumps(
-                {"day": today_kst.isoformat(), "decisions": [], "skipped": skipped_reason},
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
+        _write_pending_state(today_kst.isoformat(), [], skipped=skipped_reason)
         notify.send_telegram_alert(notify.format_buy_decision_skipped_alert(today_kst.isoformat()))
         return
     if BUY_LLM_PROVIDER not in {"codex_plan", "anthropic"}:
         raise ValueError(f"unknown BUY_LLM_PROVIDER={BUY_LLM_PROVIDER!r}")
+
+    seconds_until_deadline = _seconds_until_deadline(day)
+    if seconds_until_deadline <= 0:
+        _write_pending_state(today_kst.isoformat(), [], skipped="decision_started_after_deadline")
+        notify.send_telegram_alert(
+            notify.format_error_alert(
+                "매수 판단 시작 시각이 08:55를 지나 오늘 신규 매수를 건너뜁니다",
+                f"started_at={day.isoformat()}",
+            )
+        )
+        return
+
+    # 09:01 집행이 판단 진행 중/실패를 '파일 없음'으로 오해하지 않게 시작 상태부터 남긴다.
+    # 08:55까지 완료하지 못하면 이 파일은 빈 decisions 상태로 유지돼 주문이 나가지 않는다.
+    _write_pending_state(today_kst.isoformat(), [], skipped="decision_in_progress")
 
     config = RiskGateConfig()
     portfolio = load_portfolio()
@@ -152,19 +174,34 @@ async def main() -> None:
                 raise
 
         llm.call_structured = _tracked_codex_call
+    deadline_exceeded = False
     try:
-        await pipeline.run_daily(
-            day,
-            portfolio,
-            config,
-            analyst_fn,
-            judgment.judge,
-            _make_recording_execute_fn(recorded),
-            total_expected_analysts=3,
-        )
+        try:
+            async with asyncio.timeout(seconds_until_deadline):
+                await pipeline.run_daily(
+                    day,
+                    portfolio,
+                    config,
+                    analyst_fn,
+                    judgment.judge,
+                    _make_recording_execute_fn(recorded),
+                    total_expected_analysts=3,
+                )
+        except TimeoutError:
+            deadline_exceeded = True
     finally:
         # main()은 단발 프로세스지만 테스트·수동 import에서도 공급자 변경이 새지 않게 한다.
         llm.call_structured = original_call_structured
+
+    if deadline_exceeded:
+        _write_pending_state(today_kst.isoformat(), [], skipped="decision_deadline_exceeded")
+        notify.send_telegram_alert(
+            notify.format_error_alert(
+                "Codex 매수 판단이 08:55까지 끝나지 않아 오늘 신규 매수를 건너뜁니다",
+                f"attempted={provider_stats['attempted']} failed={provider_stats['failed']}",
+            )
+        )
+        return
 
     if provider_stats["failed"]:
         notify.send_telegram_alert(
@@ -174,10 +211,7 @@ async def main() -> None:
             )
         )
 
-    PENDING_BUYS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PENDING_BUYS_PATH.write_text(
-        json.dumps({"day": today_kst.isoformat(), "decisions": recorded}, ensure_ascii=False, indent=2)
-    )
+    _write_pending_state(today_kst.isoformat(), recorded)
 
     names = [pipeline.display_name(d["ticker"]) for d in recorded]
     notify.send_telegram_alert(notify.format_buy_decision_alert(today_kst.isoformat(), names))

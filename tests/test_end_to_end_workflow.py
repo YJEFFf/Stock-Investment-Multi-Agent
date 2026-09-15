@@ -1,6 +1,6 @@
 """cron이 매일 아침 실제로 도는 경로(scripts/run_daily.py의 main())를 처음부터
-끝까지 한 번 통째로 돌려본다 — 유니버스 수집 → 정량 필터 → 분석가(차트만 실제
-의견, 뉴스/공시는 데이터 없음으로 자연 스킵) → 토론+매니저 → 게이트 → 실주문 →
+끝까지 한 번 통째로 돌려본다 — 유니버스 수집 → 정량 필터 → 분석가 3개 →
+토론+매니저 → 게이트 → 실주문 →
 매매일지 로그 → 텔레그램 알림, 그리고 보유 종목 쪽은 결정론적 손절까지.
 
 각 단계는 이미 자기 테스트 파일에서 개별적으로 충분히 검증돼 있다 — 여기서
@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import scripts.run_daily as rd
 from src import analysts, collectors, kis
-from src.schemas import OHLCVBar, PortfolioState, Position
+from src.schemas import DisclosureItem, NewsItem, OHLCVBar, PortfolioState, Position
 
 NEW_BUY_TICKER = "005930"
 HELD_TICKER = "000660"
@@ -49,6 +49,10 @@ async def _fake_call_structured(*, system, user, response_model, json_schema, **
     name = response_model.__name__
     if name == "_ChartAnalysisResponse":
         return response_model(score=0.9, confidence=0.85, reasoning="거래량 급증 + 상승 추세")
+    if name == "_NewsAnalysisResponse":
+        return response_model(score=0.8, confidence=0.8, reasoning="긍정 뉴스")
+    if name == "_DisclosureAnalysisResponse":
+        return response_model(score=0.8, confidence=0.8, reasoning="긍정 공시")
     if name == "_DebateResponse":
         return response_model(argument="분석가 근거가 뚜렷하다", strength=0.75)
     if name == "_ManagerResponse":
@@ -100,9 +104,33 @@ def test_full_daily_workflow_sell_then_buy_end_to_end(monkeypatch, tmp_path):
     monkeypatch.setattr(collectors, "fetch_kospi200_universe", lambda: [(NEW_BUY_TICKER, "삼성전자")])
     monkeypatch.setattr(collectors, "fetch_kospi200_sector_map", lambda: {NEW_BUY_TICKER: "반도체"})
     monkeypatch.setattr(collectors, "fetch_kospi200_index_bars", lambda lookback_days=60: None)
-    monkeypatch.setattr(collectors, "fetch_company_news", lambda ticker, limit=10: [])
+    monkeypatch.setattr(
+        collectors,
+        "fetch_company_news",
+        lambda ticker, limit=10: [
+            NewsItem(
+                title="테스트 뉴스",
+                press="테스트",
+                published_at=datetime(2026, 1, 10, tzinfo=timezone.utc),
+                url="https://example.test/news",
+            )
+        ],
+    )
     monkeypatch.setattr(collectors, "fetch_sector_news", lambda sector, limit=10: [])
-    monkeypatch.setattr(collectors, "fetch_disclosures", lambda ticker, lookback_days=30, limit=10: [])
+    monkeypatch.setattr(
+        collectors,
+        "fetch_disclosures",
+        lambda ticker, lookback_days=30, limit=10: [
+            DisclosureItem(
+                report_name="테스트 공시",
+                submitter="삼성전자",
+                received_at=date(2026, 1, 10),
+                receipt_no="20260110000001",
+                remark=None,
+                url="https://example.test/disclosure",
+            )
+        ],
+    )
 
     # --- 네트워크 경계 목킹: kis ---
     fake_bars = _flat_bars()

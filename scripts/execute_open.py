@@ -143,6 +143,18 @@ async def _execute_pending_buys(portfolio, today_kst):
         )
         return portfolio
 
+    skipped = payload.get("skipped")
+    if skipped == "decision_in_progress":
+        logger.error("pending_buys_still_in_progress — 09:01 집행 시각까지 판단 미완료, 매수 없음")
+        notify.send_telegram_alert(
+            notify.format_error_alert(
+                "09:01까지 Codex 매수 판단이 끝나지 않아 오늘 신규 매수를 건너뜁니다",
+                "pending_state=decision_in_progress",
+            )
+        )
+    elif skipped:
+        logger.info("pending_buys_skipped reason=%s", skipped)
+
     for item in payload["decisions"]:
         decision = Decision.model_validate(item["decision"])
         gate_result = GateResult.model_validate(item["gate_result"])

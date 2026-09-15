@@ -201,12 +201,18 @@ def check_gate(
     받아들일 위험의 모양을 바꾼 것이다. 되돌리려면 이 함수와 RiskGateConfig 두 곳만
     보면 된다.
 
-    남은 것은 종목당 비중(`position_limit`)과 총 노출(`total_exposure`) 둘뿐이다.
+    남은 수치 한도는 종목당 비중(`position_limit`)과 총 노출(`total_exposure`) 둘뿐이다.
+    분석가가 빠진 `degraded` BUY는 수치를 임의로 완화하거나 강화하지 않고
+    `degraded_analysis`로 거부한다. 일부 데이터만 보고 낸 BUY가 주문으로 이어지지 않게
+    하는 실패 폐쇄 규칙이며, 완전한 입력의 다음 날 판단까지 문턱을 고정한다.
     `sector`를 인자에서 뺀 것도 같은 이유다 — 안 쓰는 인자를 남겨두면 이 함수가
     아직 섹터를 본다고 읽힌다. 업종 정보 자체는 계속 쓰인다(뉴스 분석가, Position.sector).
     """
     if decision.action != "BUY":
         return GateResult(approved=False, rejected_by=None)
+
+    if decision.degraded:
+        return GateResult(approved=False, rejected_by="degraded_analysis")
 
     existing = next((p for p in portfolio.positions if p.ticker == decision.ticker), None)
     existing_weight = existing.weight if existing else 0.0
@@ -1664,8 +1670,10 @@ def summarize_llm_calls(log_path: Path, since: datetime | None = None) -> dict:
         stats["calls"] += 1
         if not e["success"]:
             stats["failures"] += 1
-        stats["input_tokens"] += e["input_tokens"]
-        stats["output_tokens"] += e["output_tokens"]
+        # Codex 실패는 모델 응답 전에 끝날 수 있어 usage 키 자체가 없다. 실패율은
+        # 남기되 소모가 확인되지 않은 토큰은 0으로 집계한다.
+        stats["input_tokens"] += e.get("input_tokens", 0)
+        stats["output_tokens"] += e.get("output_tokens", 0)
 
     for stats in by_label.values():
         stats["failure_rate"] = stats["failures"] / stats["calls"] if stats["calls"] else 0.0

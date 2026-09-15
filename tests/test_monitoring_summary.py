@@ -117,6 +117,36 @@ def test_summarize_llm_calls_missing_file_returns_empty_dict(tmp_path):
     assert summarize_llm_calls(tmp_path / "does_not_exist.jsonl") == {}
 
 
+def test_summarize_llm_calls_handles_codex_entries_without_usage_keys(tmp_path):
+    log_path = tmp_path / "llm_calls.jsonl"
+    entries = [
+        {
+            "timestamp": "2026-09-15T09:59:00+00:00",
+            "day": "2026-09-15",
+            "label": "chart",
+            "model": "gpt-5.6-sol",
+            "success": True,
+        },
+        {
+            "timestamp": "2026-09-15T10:00:00+00:00",
+            "day": "2026-09-15",
+            "label": "chart",
+            "model": "gpt-5.6-sol",
+            "success": False,
+            "error": "plan limit",
+        },
+    ]
+    log_path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+
+    assert summarize_llm_calls(log_path)["chart"] == {
+        "calls": 2,
+        "failures": 1,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "failure_rate": 0.5,
+    }
+
+
 def test_decision_entries_deduped_by_day_and_ticker_keeping_the_later_record(tmp_path):
     """같은 날 같은 종목이 두 번 판단되면 나중 기록만 센다.
 
@@ -179,4 +209,3 @@ def test_summarize_llm_calls_excludes_non_production_labels(tmp_path):
     assert set(summary) == {"chart"}
     assert summary["chart"]["calls"] == 1
     assert summary["chart"]["input_tokens"] == 100
-

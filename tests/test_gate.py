@@ -37,6 +37,16 @@ def test_passes_when_within_all_limits():
     assert result.rejected_by is None
 
 
+def test_degraded_buy_is_rejected_before_position_limits():
+    decision = _buy_decision()
+    decision.degraded = True
+
+    result = check_gate(decision, PortfolioState(), CONFIG, trade_weight=0.08)
+
+    assert result.approved is False
+    assert result.rejected_by == "degraded_analysis"
+
+
 def test_position_limit_rejects_when_exceeded():
     portfolio = PortfolioState(
         positions=[Position(ticker="005930", sector="반도체", weight=0.10)],
