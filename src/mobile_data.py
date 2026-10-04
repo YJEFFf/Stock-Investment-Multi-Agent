@@ -114,6 +114,19 @@ def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float 
                              "quantity": number(h.get("hldg_qty")), "entry_price": number(h.get("pchs_avg_pric")),
                              "price": number(h.get("prpr")), "value": number(h.get("evlu_amt")),
                              "pnl": number(h.get("evlu_pfls_amt")), "pnl_pct": number(h.get("evlu_pfls_rt"))})
+        # 같은 잔고 관측의 평가손익을 합산한다. 종목 수익률을 단순 평균하지 않는다.
+        account.update(securities_pnl=None, securities_return_pct=None)
+        securities = number(latest.get("securities"))
+        if securities == 0 and not latest.get("holdings"):
+            account["securities_pnl"] = 0.0
+        elif (holdings and len(holdings) == len(latest.get("holdings", []))
+              and all(h["value"] is not None and h["pnl"] is not None for h in holdings)
+              and securities is not None
+              and math.isclose(sum(h["value"] for h in holdings), securities, rel_tol=0, abs_tol=1)):
+            stock_pnl = sum(h["pnl"] for h in holdings)
+            stock_cost = securities - stock_pnl
+            account["securities_pnl"] = stock_pnl
+            account["securities_return_pct"] = stock_pnl / stock_cost * 100 if stock_cost > 0 else None
     if nav_by_day and list(sorted(nav_by_day.items()))[-1][1].get("status") != "ok":
         data.warnings.append("최근 계좌 조회가 실패했습니다. 마지막으로 확인한 금액을 표시합니다.")
 

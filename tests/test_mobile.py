@@ -256,6 +256,26 @@ def test_nav_uses_broker_cash_not_book_weights_and_marks_old_values(tmp_path):
     assert any("갱신되지" in x for x in result.warnings)
 
 
+@pytest.mark.parametrize("holdings,securities,pnl,rate", [
+    ([{"evlu_amt":1200,"evlu_pfls_amt":200,"evlu_pfls_rt":20},
+      {"evlu_amt":7200,"evlu_pfls_amt":-800,"evlu_pfls_rt":-10}], 8400, -600, -600/9000*100),
+    ([{"evlu_amt":1100,"evlu_pfls_amt":100}], 1100, 100, 10),
+    ([{"evlu_amt":1100}], 1100, None, None),
+    ([{"evlu_amt":1100,"evlu_pfls_amt":100}], 2200, None, None),
+    ([], 0, 0, None),
+    ([], 1100, None, None),
+])
+def test_stock_pnl_uses_complete_same_snapshot_and_weighted_cost(tmp_path, holdings, securities, pnl, rate):
+    write_rows(tmp_path, "account_nav.jsonl", [{"day":"2026-10-02", "status":"ok",
+        "total":10000, "cash":10000-securities, "securities":securities, "holdings":holdings}])
+    result = snapshot(tmp_path, now=datetime(2026,10,5,16,0,tzinfo=KST))
+    assert result.account["securities_pnl"] == pnl
+    if rate is None:
+        assert result.account["securities_return_pct"] is None
+    else:
+        assert result.account["securities_return_pct"] == pytest.approx(rate)
+
+
 def test_analysis_failure_is_not_counted_as_signal_or_normal_sample(tmp_path):
     write_rows(tmp_path, "daily_runs.jsonl", [
         {"day":"2026-10-06","status":"failed","cohort":"kis_master_naver_json_20261005"},
