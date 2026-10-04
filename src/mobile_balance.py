@@ -17,6 +17,10 @@ from src.schemas import MobileAccountObservation
 KST = ZoneInfo("Asia/Seoul")
 
 
+class BalanceDeadline(Exception):
+    """네트워크 라이브러리가 재시도 대상으로 흡수하지 않는 전체 기한."""
+
+
 def save_observation(fetch, destination: Path) -> bool:
     account = fetch()
     if account is None:
@@ -43,7 +47,7 @@ def serve():
     last_request = -float("inf")
 
     def deadline(*_):
-        raise TimeoutError("balance deadline")
+        raise BalanceDeadline("balance deadline")
 
     signal.signal(signal.SIGALRM, deadline)
 

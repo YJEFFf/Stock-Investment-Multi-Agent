@@ -127,14 +127,15 @@ SIMA_LIVE_TEST=1 .venv/bin/pytest tests/test_live_smoke.py -v -s  # 실제 API �
 접속: [SIMA 열기](https://sima.3-35-112-100.sslip.io)
 
 홈·보유 종목·거래·알림·검증 화면에서 운영 EC2의 저장된 기록을 읽는다. 금액은
-마지막 브로커 관측 시각 기준이며, 화면 새로고침이 주문·분석·시세 API를 실행하지 않는다.
+마지막 브로커 관측 시각 기준이며, 수동 새로고침은 증권사 잔고를 다시 조회한다.
 아이폰은 Safari에서 **공유 → 홈 화면에 추가 → SIMA 실행 → 연결 코드 입력** 순서다.
 ‘웹 앱으로 열기’ 옵션이 보이면 켠다. 연결 입력은 설치 감지 결과와 관계없이 표시되며,
 Safari와 홈 화면 앱을 각각 연결하려면 별도 일회용 코드가 필요할 수 있다.
 앱의 **알림 → 알림 켜기 → 테스트 알림 보내기**로 실제 수신을 확인한다.
 브라우저에서 열었다면 상단 **앱 설치**에서 아이폰 설치 순서를 볼 수 있다.
-상단 새로고침은 저장된 최신 기록을 다시 읽고 완료/실패를 표시한다. 계좌 금액은
-장 마감 관측값이며, 화면의 서버 확인 시각과 계좌 관측 시각을 구별한다.
+상단 새로고침은 증권사 잔고 조회 완료/실패를 표시한다. 성공한 조회 시각만 갱신하며,
+실패하면 기존 금액·시각을 유지한다. 모의투자 시세는 지연될 수 있다. 자동 갱신은 저장된
+기록만 읽는다. 수동 관측은 일별 NAV와 별도 파일로 저장한다.
 
 운영 설치는 매매 경로 독립 리뷰 및 `deploy/pull.sh` 배포 뒤에 한다:
 
@@ -147,6 +148,9 @@ sudo -u sima-web /opt/sima-pwa/current/.venv/bin/python /opt/sima-pwa/current/sc
   git 밖 `/var/lib/sima-pwa/`에 저장한다. 분실 시 같은 CLI의 `revoke-all`로 연결을 해제한다.
 - `sima-pwa.service`와 `sima-push.service`는 전용 OS 계정으로 실행하며 거래 로그를
   읽기 전용으로 마운트한다. `.env`·브로커 키·운영 체크아웃에는 접근하지 않는다.
+- `sima-balance.service`는 별도 프로세스에서 고정 잔고 조회만 처리한다. 필수 KIS 키는
+  root 전용 `/etc/sima-balance.env`, 관측 파일은 `/var/lib/sima-balance/account.json`이다.
+  Unix socket은 sima-web 그룹만 사용하며 요청은 15초 간격·앱 전체 분당 3회로 제한한다.
 - HTTPS는 Caddy가 제공한다. AWS 보안그룹에서 TCP 80/443이 필요하다. 주소는 기존 고정
   IP를 가리키는 무료 DNS이며, 해당 DNS 제공자에 의존한다. 별도 EC2는 만들지 않는다.
 - 운영 `.env`의 `SIMA_APP_ALERTS_ENABLED=1`이면 기존 알림을 앱 발송함에도 남긴다.
