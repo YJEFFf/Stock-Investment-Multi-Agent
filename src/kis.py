@@ -530,13 +530,13 @@ def _balance_params() -> dict:
     }
 
 
-def fetch_account_snapshot() -> AccountSnapshot | None:
+def fetch_account_snapshot(*, policy: RetryPolicy = DEFAULT_POLICY) -> AccountSnapshot | None:
     """계좌 총평가금액·예수금·유가증권 평가금액을 한 번에 (AccountSnapshot).
 
     셋 중 하나라도 못 읽으면 통째로 None이다 — 일부만 돌려주면 호출부가 나머지를
     빼기로 만들어내게 되고, 그게 지금 걷어내는 그 계산이다.
     """
-    data = _kis_get(BALANCE_PATH, BALANCE_TR_ID, _balance_params())
+    data = _kis_get(BALANCE_PATH, BALANCE_TR_ID, _balance_params(), policy=policy)
     if data is None:
         return None
 

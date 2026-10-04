@@ -41,19 +41,40 @@ EOF
 chmod 644 /etc/sima-pwa.env
 sudo -u sima-web "$PWA_RELEASE/.venv/bin/python" "$PWA_RELEASE/scripts/mobile.py" init
 
+# 웹 서비스와 분리된 잔고 조회 프로세스에 KIS 필수 키만 제공한다.
+"$PWA_RELEASE/.venv/bin/python" - <<'PYENV'
+import os
+from pathlib import Path
+from dotenv import dotenv_values
+values = dotenv_values("/home/ubuntu/sima/.env")
+path = Path("/etc/sima-balance.env")
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as output:
+    for key in ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO"):
+        value = values.get(key)
+        if not value or any(c in value for c in '\n\r"\\'):
+            raise ValueError("Invalid broker configuration")
+        output.write(f'{key}="{value}"\n')
+path.chmod(0o600)
+PYENV
+touch "$PWA_REPO/.kis_token_cache.json"
+chown ubuntu:ubuntu "$PWA_REPO/.kis_token_cache.json"
+chmod 600 "$PWA_REPO/.kis_token_cache.json"
+
 rollback() {
   if [ -n "$PWA_PREVIOUS" ] && [ -d "$PWA_PREVIOUS" ]; then
     ln -sfn "$PWA_PREVIOUS" /opt/sima-pwa/current
-    systemctl restart sima-pwa sima-push || true
+    systemctl restart sima-balance sima-pwa sima-push || true
   fi
 }
 trap 'rollback' ERR
+install -m 644 deploy/sima-balance.service /etc/systemd/system/sima-balance.service
 install -m 644 deploy/sima-pwa.service /etc/systemd/system/sima-pwa.service
 install -m 644 deploy/sima-push.service /etc/systemd/system/sima-push.service
 ln -sfn "$PWA_RELEASE" /opt/sima-pwa/current
 systemctl daemon-reload
-systemctl enable --now sima-pwa sima-push
-systemctl restart sima-pwa sima-push
+systemctl enable --now sima-balance sima-pwa sima-push
+systemctl restart sima-balance sima-pwa sima-push
 
 if ! command -v caddy >/dev/null; then
   apt-get update -qq

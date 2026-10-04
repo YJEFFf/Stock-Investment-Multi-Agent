@@ -343,3 +343,69 @@ def test_analysis_usage_is_grouped_by_korean_trading_day(tmp_path, extra):
                                              "input_tokens":100,"output_tokens":20, **extra}])
     result = snapshot(tmp_path, now=datetime(2026,10,6,16,0,tzinfo=KST))
     assert result.monitoring["analysts"]["chart"]["calls"] == 1
+
+
+def test_manual_account_does_not_change_daily_nav(tmp_path):
+    from src.kis import AccountSnapshot
+    from src.mobile_balance import save_observation
+    nav = {"day": "2026-10-02", "observed_at": "2026-10-02T15:35:00+09:00", "status": "ok", "total": 100, "cash": 100, "securities": 0, "holdings": []}
+    write_rows(tmp_path, "account_nav.jsonl", [nav])
+    before = (tmp_path / "account_nav.jsonl").read_bytes()
+    target = tmp_path / "manual.json"
+    assert save_observation(lambda: AccountSnapshot(110, 110, 0), target)
+    result = snapshot(tmp_path, account_path=target)
+    assert result.account["total"] == 110
+    assert result.account["observed_at"] != nav["observed_at"]
+    assert (tmp_path / "account_nav.jsonl").read_bytes() == before
+    saved = target.read_bytes()
+    assert not save_observation(lambda: None, target)
+    assert target.read_bytes() == saved
+    with pytest.raises(ValueError):
+        save_observation(lambda: AccountSnapshot(float("nan"), 0, 0), target)
+    assert target.read_bytes() == saved
+
+
+def test_newer_daily_nav_wins_over_manual_observation(tmp_path):
+    manual = {"day": "2026-10-01", "observed_at": "2026-10-01T15:35:00+09:00", "status": "ok", "total": 80, "cash": 80, "securities": 0, "holdings": []}
+    target = tmp_path / "manual.json"
+    target.write_text(json.dumps(manual))
+    write_rows(tmp_path, "account_nav.jsonl", [{**manual, "day": "2026-10-02", "observed_at": "2026-10-02T15:35:00+09:00", "total": 100}])
+    assert snapshot(tmp_path, account_path=target).account["total"] == 100
+
+
+def test_broker_refresh_requires_authentication_and_csrf(web):
+    assert request(web[1], "POST", "/api/account/refresh", json={}, headers=HEADERS).status_code == 401
+    login(web)
+    assert request(web[1], "POST", "/api/account/refresh", json={}).status_code == 403
+
+
+@pytest.mark.parametrize("reply,expected", [(b"ok\n", 200), (b"failed\n", 503), (b"busy\n", 429)])
+def test_broker_refresh_fixed_socket_request(web, monkeypatch, tmp_path, reply, expected):
+    import io
+    from src.kis import AccountSnapshot
+    from src.mobile_balance import save_observation
+    target = tmp_path / "manual.json"
+    web[0].config["ACCOUNT_PATH"] = target
+    assert save_observation(lambda: AccountSnapshot(110, 110, 0), target)
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def settimeout(self, timeout): assert timeout == 23
+        def connect(self, path): assert path == web[0].config["BALANCE_SOCKET"]
+        def sendall(self, data): assert data == b"refresh\n"
+        def makefile(self, mode): return io.BytesIO(reply)
+    monkeypatch.setattr(mobile_app.socket, "socket", lambda *_: Connection())
+    login(web)
+    response = request(web[1], "POST", "/api/account/refresh", json={"command": "ignored"}, headers=HEADERS)
+    assert response.status_code == expected
+    if expected == 200:
+        assert response.json["account"]["total"] == 110
+    for _ in range(2):
+        request(web[1], "POST", "/api/account/refresh", json={}, headers=HEADERS)
+    assert request(web[1], "POST", "/api/account/refresh", json={}, headers=HEADERS).status_code == 429
+
+
+def test_unavailable_balance_service_returns_failure(web):
+    login(web)
+    web[0].config["BALANCE_SOCKET"] = "/nonexistent/sima.sock"
+    assert request(web[1], "POST", "/api/account/refresh", json={}, headers=HEADERS).status_code == 503

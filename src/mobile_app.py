@@ -2,6 +2,7 @@
 
 import base64
 import os
+import socket
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -51,6 +52,8 @@ def create_app(config: dict | None = None) -> Flask:
         STATE_DIR=os.environ.get("SIMA_WEB_STATE_DIR", "/var/lib/sima-pwa"),
         ORIGIN=os.environ.get("SIMA_WEB_ORIGIN", "http://localhost:8765").rstrip("/"),
         INITIAL_CAPITAL=float(os.environ.get("SIMA_INITIAL_CAPITAL", "100000000")),
+        BALANCE_SOCKET=os.environ.get("SIMA_BALANCE_SOCKET", "/run/sima-balance/reader.sock"),
+        ACCOUNT_PATH=os.environ.get("SIMA_ACCOUNT_PATH", "/var/lib/sima-balance/account.json"),
         MAX_CONTENT_LENGTH=12_000,
     )
     if config:
@@ -157,7 +160,29 @@ def create_app(config: dict | None = None) -> Flask:
         # 수동 새로고침은 저장 기록을 즉시 다시 읽는다. 브로커/분석을 호출하지 않는다.
         if request.args.get("refresh") == "1" or time.monotonic() - cached["at"] > 10 or cached["data"] is None:
             cached.update(at=time.monotonic(), data=snapshot(Path(app.config["DATA_DIR"]),
-                          initial_capital=app.config["INITIAL_CAPITAL"]).model_dump(mode="json"))
+                          initial_capital=app.config["INITIAL_CAPITAL"],
+                          account_path=Path(app.config["ACCOUNT_PATH"])).model_dump(mode="json"))
+        return jsonify(cached["data"])
+
+    @app.post("/api/account/refresh")
+    def refresh_account():
+        if not store.allow("broker-refresh", limit=3):
+            abort(429)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(23)
+                connection.connect(app.config["BALANCE_SOCKET"])
+                connection.sendall(b"refresh\n")
+                result = connection.makefile("rb").readline(64)
+            if result == b"busy\n":
+                abort(429)
+            if result != b"ok\n":
+                return jsonify(error="Broker balance refresh failed"), 503
+        except (OSError, TimeoutError):
+            return jsonify(error="Broker balance refresh unavailable"), 503
+        cached.update(at=time.monotonic(), data=snapshot(Path(app.config["DATA_DIR"]),
+                      initial_capital=app.config["INITIAL_CAPITAL"],
+                      account_path=Path(app.config["ACCOUNT_PATH"])).model_dump(mode="json"))
         return jsonify(cached["data"])
 
     @app.get("/api/alerts")

@@ -79,7 +79,7 @@ def trading_days(through: date, count: int) -> list[str]:
     return list(reversed(days))
 
 
-def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float = 100_000_000) -> MobileSnapshot:
+def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float = 100_000_000, account_path: Path | None = None) -> MobileSnapshot:
     now = (now or datetime.now(KST)).astimezone(KST)
     today = now.date().isoformat()
     data = Records(root)
@@ -87,6 +87,17 @@ def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float 
     nav_by_day = {r["day"]: r for r in nav_rows if isinstance(r.get("day"), str) and r["day"] <= today}
     valid_nav = [r for _, r in sorted(nav_by_day.items()) if r.get("status") == "ok" and number(r.get("total")) is not None]
     latest = valid_nav[-1] if valid_nav else None
+    daily_latest = latest
+    if account_path and account_path.exists():
+        from src.schemas import MobileAccountObservation
+        try:
+            observation = MobileAccountObservation.model_validate_json(account_path.read_text())
+            observed = observation.observed_at
+            previous = datetime.fromisoformat(latest["observed_at"]) if latest else None
+            if observed.tzinfo and observed <= now and (previous is None or observed > previous):
+                latest = observation.model_dump(mode="json")
+        except (ValueError, TypeError, KeyError, OSError):
+            data.warnings.append("수동 잔고 조회 기록을 읽지 못했습니다.")
     account = None
     holdings = []
     names: dict[str, str] = {}
@@ -136,8 +147,8 @@ def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float 
         market_open_day = is_krx_trading_day(now.date())
         days = trading_days(now.date(), 20)
         expected_nav_day = trading_days(now.date() if now.time() >= time(15, 40) else now.date() - timedelta(days=1), 1)[0]
-        if latest and latest["day"] < expected_nav_day:
-            data.warnings.append(f"계좌 자료가 {latest['day']} 이후 갱신되지 않았습니다.")
+        if daily_latest and daily_latest["day"] < expected_nav_day:
+            data.warnings.append(f"일별 계좌 기록이 {daily_latest['day']} 이후 갱신되지 않았습니다.")
         next_day = now.date() + timedelta(days=1)
         while not is_krx_trading_day(next_day):
             next_day += timedelta(days=1)

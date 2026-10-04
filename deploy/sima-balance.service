@@ -1,0 +1,31 @@
+[Unit]
+Description=SIMA read-only broker balance reader
+After=network.target
+
+[Service]
+User=ubuntu
+Group=sima-web
+WorkingDirectory=/opt/sima-pwa/current
+EnvironmentFile=/etc/sima-balance.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/sima-pwa/current/.venv/bin/python -m src.mobile_balance
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=sima-balance
+RuntimeDirectoryMode=0750
+StateDirectory=sima-balance
+StateDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+BindPaths=/home/ubuntu/sima/.kis_token_cache.json:/var/lib/sima-balance/token.json
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=192M
+CPUQuota=20%
+
+[Install]
+WantedBy=multi-user.target

@@ -294,3 +294,15 @@ class SellAction(BaseModel):
 class PortfolioState(BaseModel):
     positions: list[Position] = Field(default_factory=list)
     cash_weight: float = 1.0
+
+
+class MobileAccountObservation(BaseModel):
+    """수동 잔고 조회 전용. 일별 NAV·매매 장부에 합치지 않는다."""
+
+    observed_at: datetime
+    day: date
+    status: Literal["ok"] = "ok"
+    total: float = Field(allow_inf_nan=False)
+    cash: float = Field(allow_inf_nan=False)
+    securities: float = Field(ge=0, allow_inf_nan=False)
+    holdings: list[dict]
