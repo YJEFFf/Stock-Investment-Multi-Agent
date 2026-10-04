@@ -10,7 +10,8 @@ const stamp = value => { if (!value) return '기록 없음'; const d = new Date(
 const shortDay = value => value ? `${Number(value.slice(5,7))}.${Number(value.slice(8,10))}` : '—';
 const standalone = () => window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 const isiOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-const state = {data:null, alerts:[], push:null, key:null, authenticated:false, offline:false, filter:'all', loading:false};
+const state = {data:null, alerts:[], push:null, key:null, authenticated:false, offline:false, filter:'all', loading:false, checkedAt:null};
+const checkedTime = value => value ? new Intl.DateTimeFormat('ko-KR', {timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date(value)) : '아직 확인 전';
 const icons = {
   home:'<path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1Z"/>',
   holdings:'<path d="M12 3a9 9 0 1 0 9 9h-9Z"/><path d="M16 3v5h5a7 7 0 0 0-5-5Z"/>',
@@ -24,17 +25,32 @@ function seenAt() { try { return localStorage.getItem('sima-seen-at') || ''; } c
 function hasUnread() { return state.alerts.some(a => a.created_at > seenAt()); }
 function toast(text) { $('#toast').textContent = text; $('#toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('#toast').hidden = true, 5000); }
 async function api(path, options = {}) {
-  const response = await fetch(path, {credentials:'same-origin', cache:'no-store', ...options,
-    headers:{'Content-Type':'application/json','X-SIMA-Request':'1', ...options.headers}});
-  if (!response.ok) { const error = new Error(`HTTP ${response.status}`); error.status = response.status; throw error; }
-  return response.json();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(path, {credentials:'same-origin', cache:'no-store', ...options, signal:controller.signal,
+      headers:{'Content-Type':'application/json','X-SIMA-Request':'1', ...options.headers}});
+    if (!response.ok) { const error = new Error(`HTTP ${response.status}`); error.status = response.status; throw error; }
+    return await response.json();
+  } finally { clearTimeout(timeout); }
 }
 function empty(title, detail, name = 'insights') { return `<div class="empty">${icon(name)}<h3>${esc(title)}</h3><p>${esc(detail)}</p></div>`; }
 function heading(title, detail) { return `<div class="page-title"><p class="eyebrow">MY PAPER PORTFOLIO</p><h1>${esc(title)}</h1><p class="subtitle">${esc(detail)}</p></div>`; }
 function progress(value, total) { return `<svg class="progress-svg" viewBox="0 0 100 8" preserveAspectRatio="none" role="img" aria-label="${value}/${total}"><rect class="progress-bg" width="100" height="8" rx="4"/><rect class="progress-fill" width="${Math.max(0, Math.min(100, value / total * 100))}" height="8" rx="4"/></svg>`; }
 function installSteps() { return '<ol class="install-steps"><li>Safari의 공유 메뉴를 열어주세요.</li><li>‘홈 화면에 추가’를 선택하고, ‘웹 앱으로 열기’가 보이면 켜주세요.</li><li>홈 화면의 SIMA를 열고 연결 코드를 입력하세요.</li></ol>'; }
+function showInstall() {
+  const dialog = $('#install-dialog');
+  dialog.innerHTML = `<div class="row"><h2 id="install-title">아이폰에 SIMA 설치하기</h2><form method="dialog"><button class="text-button" aria-label="설치 안내 닫기">닫기</button></form></div><p class="subtitle">아이폰 Safari에서 아래 주소를 열고 홈 화면에 추가하면 앱 아이콘으로 실행할 수 있어요.</p><p class="install-address">${esc(location.origin)}</p>${installSteps()}<p class="fine">이미 홈 화면에 SIMA가 있다면 그 아이콘으로 열어주세요. 처음 연결할 때는 새 연결 코드가 필요할 수 있어요.</p><a class="text-button" href="https://support.apple.com/ko-kr/guide/iphone/iphea86e5236/ios" target="_blank" rel="noreferrer">Apple 설치 안내 ↗</a>`;
+  dialog.showModal();
+}
+function refreshBusy(busy) {
+  const button = $('#refresh');
+  button.disabled = busy;
+  button.setAttribute('aria-busy', String(busy));
+  button.setAttribute('aria-label', busy ? '최신 기록 확인 중' : '최신 기록 불러오기');
+}
 function showLogin(message = '') {
-  state.data = null; state.alerts = []; state.authenticated = false;
+  state.data = null; state.alerts = []; state.authenticated = false; state.checkedAt = null;
   $('#navigation').hidden = true; $('#refresh').hidden = true;
   // 설치 감지는 안내에만 사용한다. 감지 결과 때문에 개인 인증을 막지 않는다.
   const installHelp = isiOS && !standalone() ? `<details class="card disclosure"><summary>아이폰에서 푸시 알림도 받으려면</summary><p>홈 화면에 설치한 SIMA에서 연결해주세요. Safari와 홈 화면 앱은 별도 연결 코드가 필요할 수 있어요.</p>${installSteps()}</details>` : '';
@@ -105,21 +121,24 @@ function insightsPage() {
 function render() {
   if (!state.authenticated || !state.data) return;
   const pages = {home,holdings:holdingsPage,trades:tradesPage,alerts:alertsPage,insights:insightsPage};
-  const warnings = [...(state.offline ? ['연결이 끊겼어요. 화면은 마지막으로 불러온 기록이에요.'] : []), ...state.data.warnings];
-  $('#main').innerHTML = warnings.map(w => `<div class="warning-banner">${esc(w)}</div>`).join('') + (pages[route()] || home)() + `<p class="footer-note">기록 불러온 시각 ${stamp(state.data.generated_at)}</p>`;
+  const warnings = [...(state.offline ? ['최신 기록 확인에 실패했어요. 화면은 마지막으로 불러온 기록이에요.'] : []), ...state.data.warnings];
+  $('#main').innerHTML = warnings.map(w => `<div class="warning-banner">${esc(w)}</div>`).join('') + (pages[route()] || home)() + `<p class="footer-note">서버 기록 확인 ${checkedTime(state.checkedAt)}<br>계좌 금액은 장 마감 기록 기준 · 새로고침으로 저장된 기록을 확인해요.</p>`;
   nav(); bind();
 }
-async function refresh() {
-  if (state.loading) return;
-  state.loading = true;
+async function refresh({manual = false} = {}) {
+  if (state.loading) { if (manual) toast('기록을 확인하고 있어요. 잠시 기다려주세요.'); return; }
+  state.loading = true; refreshBusy(true);
+  if (manual) toast('서버의 최신 기록을 확인하고 있어요…');
   try {
-    const [data, alerts, push] = await Promise.all([api('/api/snapshot'),api('/api/alerts'),api('/api/push')]);
-    state.data = data; state.alerts = alerts.alerts; state.push = push; state.offline = false; render();
+    const [data, alerts, push] = await Promise.all([api(manual ? '/api/snapshot?refresh=1' : '/api/snapshot'),api('/api/alerts'),api('/api/push')]);
+    if (!state.authenticated) return;
+    state.data = data; state.alerts = alerts.alerts; state.push = push; state.offline = false; state.checkedAt = new Date().toISOString(); render();
+    if (manual) toast(`새로고침 완료 · ${checkedTime(state.checkedAt)} 저장 기록을 확인했어요.`);
   } catch (error) {
-    if (error.status === 401) showLogin('기기 연결이 만료됐어요. 새 연결 코드로 다시 연결해주세요.');
-    else if (state.data) { state.offline = true; render(); toast('최신 기록을 불러오지 못했어요.'); }
-    else { $('#main').innerHTML = `<div class="card">${empty('기록을 불러오지 못했어요','인터넷 연결을 확인한 뒤 다시 시도해주세요.')}<button class="button" id="retry">다시 불러오기</button></div>`; $('#retry').onclick = refresh; }
-  } finally { state.loading = false; }
+    if (error.status === 401) { showLogin('기기 연결이 만료됐어요. 새 연결 코드로 다시 연결해주세요.'); if (manual) toast('기기 연결이 만료됐어요. 다시 연결해주세요.'); }
+    else if (state.data) { state.offline = true; render(); toast(error.name === 'AbortError' ? '응답이 늦어 확인을 마치지 못했어요. 다시 눌러주세요.' : error.status === 429 ? '요청이 많아요. 잠시 후 다시 눌러주세요.' : '새로고침에 실패했어요. 인터넷 연결을 확인해주세요.'); }
+    else { $('#main').innerHTML = `<div class="card">${empty('기록을 불러오지 못했어요','인터넷 연결을 확인한 뒤 다시 시도해주세요.')}<button class="button" id="retry">다시 불러오기</button></div>`; $('#retry').onclick = () => refresh({manual:true}); if (manual) toast('새로고침에 실패했어요. 다시 시도해주세요.'); }
+  } finally { state.loading = false; refreshBusy(false); }
 }
 function decodeKey(value) { const raw = atob(value.replace(/-/g,'+').replace(/_/g,'/') + '='.repeat((4 - value.length % 4) % 4)); return Uint8Array.from(raw,c => c.charCodeAt(0)); }
 async function enablePush() {
@@ -157,7 +176,9 @@ async function boot() {
   try { const session = await api('/api/session'); state.authenticated = session.authenticated; state.key = session.vapid_public_key; if (session.authenticated) await refresh(); else showLogin(); }
   catch (_) { $('#main').innerHTML = `<div class="connect">${empty('연결을 기다리고 있어요','인터넷에 연결하면 SIMA 기록을 볼 수 있어요.')}<button class="button" id="retry">다시 연결하기</button></div>`; $('#retry').onclick = boot; }
 }
-$('#refresh').onclick = refresh;
+$('#refresh').onclick = () => refresh({manual:true});
+$('#install').hidden = standalone();
+$('#install').onclick = showInstall;
 window.addEventListener('hashchange', () => { render(); window.scrollTo(0,0); const selected = location.hash.split('/')[1]; if (selected) document.getElementById('alert-' + selected)?.scrollIntoView({block:'center'}); });
 document.addEventListener('visibilitychange', () => { if (!document.hidden && state.authenticated) refresh(); });
 setInterval(() => { if (!document.hidden && state.authenticated) refresh(); },60000);

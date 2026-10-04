@@ -154,7 +154,8 @@ def create_app(config: dict | None = None) -> Flask:
     def dashboard():
         if not store.allow("snapshot:" + g.session, limit=30):
             abort(429)
-        if time.monotonic() - cached["at"] > 10 or cached["data"] is None:
+        # 수동 새로고침은 저장 기록을 즉시 다시 읽는다. 브로커/분석을 호출하지 않는다.
+        if request.args.get("refresh") == "1" or time.monotonic() - cached["at"] > 10 or cached["data"] is None:
             cached.update(at=time.monotonic(), data=snapshot(Path(app.config["DATA_DIR"]),
                           initial_capital=app.config["INITIAL_CAPITAL"]).model_dump(mode="json"))
         return jsonify(cached["data"])

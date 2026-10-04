@@ -1,5 +1,5 @@
 /* 금융 데이터와 로그인 응답은 캐시하지 않는다. 캐시에는 공개 앱 외형만 들어간다. */
-const CACHE = 'sima-shell-v2';
+const CACHE = 'sima-shell-v3';
 const SHELL = ['/', '/assets/app.css', '/assets/app.js', '/assets/icon.svg', '/assets/icon-192.png', '/assets/apple-touch-icon.png'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));

@@ -11,7 +11,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from src import app_notifications, mobile_push, notify
+from src import app_notifications, mobile_app, mobile_push, notify
 from src.mobile_app import create_app, valid_subscription
 from src.mobile_data import snapshot
 from src.mobile_store import Store
@@ -55,7 +55,7 @@ def write_rows(root, name, rows):
     (root / name).write_text("".join(json.dumps(row) + "\n" for row in rows))
 
 
-@pytest.mark.parametrize("path", ["/api/snapshot", "/api/alerts", "/api/push"])
+@pytest.mark.parametrize("path", ["/api/snapshot", "/api/snapshot?refresh=1", "/api/alerts", "/api/push"])
 def test_private_routes_require_a_device_session(web, path):
     assert request(web[1], "GET", path).status_code == 401
 
@@ -228,6 +228,22 @@ def test_missing_nav_is_not_a_zero_balance_and_missing_run_is_not_hold(tmp_path)
     assert result.operation["status"] == "missing"
     assert result.measurements["normal_days"] == 0
     assert all(day["status"] == "unknown" for day in result.monitoring["days"])
+
+
+def test_manual_refresh_reads_new_saved_nav_before_cache_expires(web, monkeypatch):
+    app, client, _ = web
+    monkeypatch.setattr(mobile_app, "time", SimpleNamespace(monotonic=lambda: 123.0))
+    login(web)
+    root = app.config["DATA_DIR"]
+    nav = {"day":"2026-10-02", "status":"ok", "total":9500, "cash":5500, "securities":4000, "holdings":[]}
+    write_rows(root, "account_nav.jsonl", [nav])
+    assert request(client, "GET", "/api/snapshot").json["account"]["total"] == 9500
+    write_rows(root, "account_nav.jsonl", [{**nav, "total":9700, "securities":4200}])
+    assert request(client, "GET", "/api/snapshot").json["account"]["total"] == 9500
+    response = request(client, "GET", "/api/snapshot?refresh=1")
+    assert response.status_code == 200
+    assert response.json["account"]["total"] == 9700
+    assert response.headers["Cache-Control"] == "no-store"
 
 
 def test_nav_uses_broker_cash_not_book_weights_and_marks_old_values(tmp_path):

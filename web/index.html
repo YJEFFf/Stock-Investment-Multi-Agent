@@ -16,10 +16,11 @@
 </head>
 <body>
   <div id="root" class="app-shell">
-    <header class="brand-bar"><a class="brand" href="#home" aria-label="SIMA 홈"><img src="/assets/icon.svg" alt="" width="30" height="30"><span>SIMA</span></a><span class="paper-badge">모의투자</span><button id="refresh" class="icon-button" aria-label="최신 기록 불러오기" hidden>↻</button></header>
+    <header class="brand-bar"><a class="brand" href="#home" aria-label="SIMA 홈"><img src="/assets/icon.svg" alt="" width="30" height="30"><span>SIMA</span></a><span class="paper-badge">모의투자</span><div class="header-actions"><button id="install" class="install-button" aria-haspopup="dialog" hidden>앱 설치</button><button id="refresh" class="icon-button" aria-label="최신 기록 불러오기" aria-busy="false" hidden><span class="refresh-icon" aria-hidden="true">↻</span></button></div></header>
     <main id="main" tabindex="-1"><div class="loading"><span class="spinner"></span><p>투자 기록을 불러오는 중</p></div></main>
     <nav id="navigation" class="bottom-nav" aria-label="주 메뉴" hidden></nav>
     <div id="toast" class="toast" role="status" hidden></div>
+    <dialog id="install-dialog" aria-labelledby="install-title"></dialog>
   </div>
   <script src="/assets/app.js" defer></script>
 </body>
