@@ -124,6 +124,8 @@ SIMA_LIVE_TEST=1 .venv/bin/pytest tests/test_live_smoke.py -v -s  # 실제 API �
 
 ## 개인용 PWA (iPhone 홈 화면 앱)
 
+접속: [SIMA 열기](https://sima.3-35-112-100.sslip.io)
+
 홈·보유 종목·거래·알림·검증 화면에서 운영 EC2의 저장된 기록을 읽는다. 금액은
 마지막 브로커 관측 시각 기준이며, 화면 새로고침이 주문·분석·시세 API를 실행하지 않는다.
 아이폰은 Safari에서 **공유 → 홈 화면에 추가 → SIMA 실행 → 연결 코드 입력** 순서다.

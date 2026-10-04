@@ -14,7 +14,36 @@
 
 ---
 
-## 2026-10-05 (개인용 PWA — 구현 시작)
+## 2026-10-05 (개인용 PWA — 구현·서버 반영)
+
+### 운영 반영 — 05:00 KST
+
+- 문서까지 포함한 **`1083ae500a7bde440093ca7708a3bc19516bb492`**를 독립 리뷰어가
+  재확인했다. `SIMA_REVIEWED`에 이 해시를 넘겨 `deploy/pull.sh`로 EC2에 반영했고
+  서버 **684 passed, 5 skipped**. 크론 실행 시각·매매 문턱은 동일하다.
+- 기존 EC2 보안그룹 `sg-02ab61e388184a59d`에 IPv4 TCP 80/443을 추가했다.
+  규칙 ID는 각각 `sgr-008d02298f2cf1151`, `sgr-072cceb2229050fad`이며 기존 SSH 규칙은
+  보존했다. 무료 주소는 `https://sima.3-35-112-100.sslip.io`다.
+- `deploy/install_pwa.sh`로 별도 OS 계정 `sima-web`, `/opt/sima-pwa`의 고정 릴리스,
+  앱 상태 `/var/lib/sima-pwa`, API·푸시 systemd 서비스와 Caddy HTTPS를 설치했다.
+  서비스는 운영 로그만 read-only mount하며 운영 저장소·API 키가 있는 home은 숨긴다.
+- 05:00:27 Let's Encrypt 인증서 발급 성공. 외부 HTTPS 인증서 검증·health 200,
+  비인증 API 401을 확인했다. API·푸시·Caddy 모두 active, 재시작 0회이며 서비스
+  mount namespace 안에서 `.env`/운영 checkout 접근 불가, NAV 읽기 가능·쓰기 불가를
+  실제 확인했다. `deploy/crontab`과 설치된 크론은 일치한다.
+- 운영 `.env`에 `SIMA_APP_ALERTS_ENABLED=1`, `SIMA_TELEGRAM_ENABLED=1`을 원자적으로
+  반영했다. 원본은 `/home/ubuntu/.local/state/sima-pwa/env-before-20261005-pwa`에 0600으로
+  보존했다. 연결 점검임을 명시한 앱 알림 1건만 발송함에 기록했고 worker가 앱 DB로
+  가져오는 것을 확인했다. Telegram 테스트 메시지·주문·LLM 호출은 하지 않았다.
+- 실제 HTTPS 주소를 iPhone 15 Pro WebKit으로 열어 일회용 로그인 → 총평가
+  **95,517,446원 / 6종목 / 거래 41건 / 정상 표본 0일** → 연결 점검 알림함 → 로그아웃
+  후 401을 확인했다. JS 오류 0, 서비스 워커 activated, 금융 API 캐시 없음,
+  `.env`·원본 로그·경로 이탈 요청은 404다. 검증용 세션은 로그아웃했다.
+- 사용자 기기 연결용 48시간·1회 코드를 발급해 대화로만 전달했다. 실제 아이폰 설치와
+  잠금 화면 푸시 수신은 사용자 확인 대기 중이다. 확인 전에는 Telegram을 유지한다.
+  PWA 실행 릴리스는 위 검토 해시로 고정하며, 이후 운영 기록만 문서 커밋에 추가한다.
+
+### 구현·검토 과정
 
 - 사용자 요청으로 iPhone 15 Pro 홈 화면에 설치하는 PWA와 앱 알림을 구현한다.
   기존 EC2 기록 조회, 개인 기기 인증, HTTPS, Web Push를 연결한다. 실제 기기에서
