@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#102d32">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="SIMA">
+  <meta name="description" content="나의 모의투자, 한눈에. SIMA 개인 투자 현황과 알림.">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+  <link rel="icon" type="image/svg+xml" href="/assets/icon.svg">
+  <link rel="stylesheet" href="/assets/app.css">
+  <title>SIMA · 나의 투자</title>
+</head>
+<body>
+  <div id="root" class="app-shell">
+    <header class="brand-bar"><a class="brand" href="#home" aria-label="SIMA 홈"><img src="/assets/icon.svg" alt="" width="30" height="30"><span>SIMA</span></a><span class="paper-badge">모의투자</span><button id="refresh" class="icon-button" aria-label="최신 기록 불러오기" hidden>↻</button></header>
+    <main id="main" tabindex="-1"><div class="loading"><span class="spinner"></span><p>투자 기록을 불러오는 중</p></div></main>
+    <nav id="navigation" class="bottom-nav" aria-label="주 메뉴" hidden></nav>
+    <div id="toast" class="toast" role="status" hidden></div>
+  </div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

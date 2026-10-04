@@ -280,12 +280,20 @@ def format_reconcile_drift_alert(day: str, drifts: list) -> str:
 
 
 def send_telegram_alert(message: str) -> bool:
-    """성공하면 True, 토큰/chat_id 미설정이거나 전송 실패면 False (예외를 던지지 않는다)."""
+    """기존 호출명 유지. 앱 발송함 저장 또는 텔레그램 전송 성공 시 True.
+
+    앱 전송은 별도 프로세스가 담당한다. 전환 전에는 두 경로를 함께 사용한다.
+    """
+    from src.app_notifications import enqueue
+
+    queued = enqueue(message)
+    if os.environ.get("SIMA_TELEGRAM_ENABLED", "1") == "0":
+        return queued
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         logger.warning("telegram_alert_skipped reason=missing_token_or_chat_id")
-        return False
+        return queued
 
     try:
         response = requests.post(
@@ -302,7 +310,7 @@ def send_telegram_alert(message: str) -> bool:
         return True
     except Exception:
         logger.exception("telegram_alert_failed")
-        return False
+        return queued
 
 
 # 매분 도는 잡(check_stop_loss)이 지속 장애를 만나면 텔레그램이 하루 수백 번

@@ -75,6 +75,16 @@ def _never_send_telegram(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _never_send_web_push(monkeypatch):
+    from src import mobile_push
+
+    def blocked(*args, **kwargs):
+        raise AssertionError("test attempted a real Web Push request")
+
+    monkeypatch.setattr(mobile_push, "webpush", blocked)
+
+
+@pytest.fixture(autouse=True)
 def _never_reach_notion(monkeypatch):
     """노션은 requests.request 지점에서 막는다. _notion_request는 400 이상을 재시도
     없이 None으로 돌려주므로 599를 주면 대기 없이 곧바로 실패한다."""
@@ -164,7 +174,11 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     `trade_journal.jsonl`에 적힌 뒤 다음 날 노션 매매일지까지 동기화됐다.
     그래서 이제 **`src` 전체의 `logs/` 기본값을 빠짐없이 등록한다.**
     """
-    from src import codex_plan, evaluation, judgment, llm, notion_sync, order_guard, pipeline, portfolio_store, run_history
+    from src import app_notifications, codex_plan, evaluation, judgment, llm, notion_sync, order_guard, pipeline, portfolio_store, run_history
+
+    monkeypatch.delenv("SIMA_APP_ALERTS_ENABLED", raising=False)
+    monkeypatch.delenv("SIMA_TELEGRAM_ENABLED", raising=False)
+    monkeypatch.setattr(app_notifications, "DEFAULT_APP_ALERTS_PATH", tmp_path / "app_alerts.jsonl")
 
     monkeypatch.setattr(order_guard, "STATE_PATH", tmp_path / "unconfirmed_orders.json")
     monkeypatch.setattr(run_history, "RUN_LOG_PATH", tmp_path / "daily_runs.jsonl")

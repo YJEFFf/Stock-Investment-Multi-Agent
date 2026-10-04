@@ -122,6 +122,33 @@ ChatGPT 플랜 기반 Codex 점검은 API 키를 읽지 않는다. EC2의 자격
 SIMA_LIVE_TEST=1 .venv/bin/pytest tests/test_live_smoke.py -v -s  # 실제 API 확인용, 최소 비용
 ```
 
+## 개인용 PWA (iPhone 홈 화면 앱)
+
+홈·보유 종목·거래·알림·검증 화면에서 운영 EC2의 저장된 기록을 읽는다. 금액은
+마지막 브로커 관측 시각 기준이며, 화면 새로고침이 주문·분석·시세 API를 실행하지 않는다.
+아이폰은 Safari에서 **공유 → 홈 화면에 추가 → SIMA 실행 → 연결 코드 입력** 순서다.
+앱의 **알림 → 알림 켜기 → 테스트 알림 보내기**로 실제 수신을 확인한다.
+
+운영 설치는 매매 경로 독립 리뷰 및 `deploy/pull.sh` 배포 뒤에 한다:
+
+```bash
+sudo env SIMA_PWA_HOST=sima.3-35-112-100.sslip.io bash deploy/install_pwa.sh
+sudo -u sima-web /opt/sima-pwa/current/.venv/bin/python /opt/sima-pwa/current/scripts/mobile.py pair
+```
+
+- 기기 연결 코드는 48시간 내 1회 사용, 로그인은 90일이다. 코드·푸시 비밀키·기기 정보는
+  git 밖 `/var/lib/sima-pwa/`에 저장한다. 분실 시 같은 CLI의 `revoke-all`로 연결을 해제한다.
+- `sima-pwa.service`와 `sima-push.service`는 전용 OS 계정으로 실행하며 거래 로그를
+  읽기 전용으로 마운트한다. `.env`·브로커 키·운영 체크아웃에는 접근하지 않는다.
+- HTTPS는 Caddy가 제공한다. AWS 보안그룹에서 TCP 80/443이 필요하다. 주소는 기존 고정
+  IP를 가리키는 무료 DNS이며, 해당 DNS 제공자에 의존한다. 별도 EC2는 만들지 않는다.
+- 운영 `.env`의 `SIMA_APP_ALERTS_ENABLED=1`이면 기존 알림을 앱 발송함에도 남긴다.
+  `SIMA_TELEGRAM_ENABLED` 기본값은 `1`이다. 실제 아이폰 알림을 확인하기 전에는 유지한다.
+  앱 단독 전환은 확인 후 `SIMA_TELEGRAM_ENABLED=0`으로 한다.
+- 푸시 서비스의 접수 성공과 실제 아이폰 수신은 다르다. 알림함에 이력을 보존하고,
+  만료 구독은 해제하며 일시 전송 실패는 최대 24시간 범위에서 재시도한다.
+- 서비스 워커는 공개 화면 파일만 캐시한다. 금융 데이터·로그인·알림 API는 캐시하지 않는다.
+
 ## 현재 상태
 
 - 마일스톤 1 (아무것도 사지 않는 시스템): 완료

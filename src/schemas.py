@@ -4,6 +4,40 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class AppAlert(BaseModel):
+    """매매 프로세스의 발송함 → 개인용 앱 알림함 계약."""
+
+    id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    created_at: datetime
+    title: str = Field(max_length=240)
+    body: str = Field(max_length=6000)
+    kind: Literal["buy", "sell", "analysis", "error", "warning", "summary", "measurement", "info"]
+
+
+class WebPushKeys(BaseModel):
+    p256dh: str = Field(min_length=80, max_length=100)
+    auth: str = Field(min_length=20, max_length=30)
+
+
+class WebPushSubscription(BaseModel):
+    endpoint: str = Field(max_length=2048)
+    keys: WebPushKeys
+
+
+class MobileSnapshot(BaseModel):
+    """브로커를 호출하지 않고 저장된 관측 기록만으로 구성하는 조회 결과."""
+
+    generated_at: datetime
+    account: dict | None
+    nav_history: list[dict]
+    holdings: list[dict]
+    trades: list[dict]
+    operation: dict
+    monitoring: dict
+    measurements: dict
+    warnings: list[str] = Field(default_factory=list)
+
+
 class DataCollectionUnavailable(RuntimeError):
     """분석을 시작할 수 없는 수집 실패. 정상 관망과 구분해 상위 실행기에 전파한다."""
 

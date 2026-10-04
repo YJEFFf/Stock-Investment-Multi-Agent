@@ -1,0 +1,29 @@
+[Unit]
+Description=SIMA personal app notification worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=sima-web
+Group=sima-web
+WorkingDirectory=/opt/sima-pwa/current
+EnvironmentFile=/etc/sima-pwa.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/sima-pwa/current/.venv/bin/python scripts/mobile.py worker
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sima-pwa
+BindReadOnlyPaths=/home/ubuntu/sima/logs:/var/lib/sima-pwa/data
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=192M
+CPUQuota=20%
+
+[Install]
+WantedBy=multi-user.target
