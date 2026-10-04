@@ -16,6 +16,7 @@
 import asyncio
 import json
 import logging
+import os
 import sys
 from datetime import datetime, time
 from pathlib import Path
@@ -23,10 +24,10 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import codex_plan, judgment, llm, notify, pipeline  # noqa: E402
+from src import codex_plan, judgment, llm, notify, pipeline, run_history  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
-from src.portfolio_store import load_portfolio  # noqa: E402
-from src.schemas import Decision, GateResult, PortfolioState, RiskGateConfig  # noqa: E402
+from src.portfolio_store import load_portfolio, portfolio_lock, PortfolioLockBusy  # noqa: E402
+from src.schemas import DataCollectionUnavailable, Decision, GateResult, PortfolioState, RiskGateConfig  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("decide_buys")
@@ -49,8 +50,21 @@ def _write_pending_state(day: str, decisions: list[dict], *, skipped: str | None
     payload = {"day": day, "decisions": decisions}
     if skipped is not None:
         payload["skipped"] = skipped
+    record = run_history.CURRENT.get()
+    if record is not None:
+        record.pending = len(decisions)
+        if skipped == "decision_in_progress":
+            record.status = "collecting"
+        elif skipped:
+            record.status = "failed" if any(x in skipped for x in ("failed", "unavailable", "deadline")) else "skipped"
+            record.reason = skipped
+        else:
+            # 정상 공시 없음([])으로 Decision.degraded가 된 것과 수집·호출 장애는 다르다.
+            record.status = "degraded" if run_history.input_failed(record) else "completed"
     PENDING_BUYS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PENDING_BUYS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    tmp = PENDING_BUYS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    os.replace(tmp, PENDING_BUYS_PATH)
 
 
 def _make_recording_execute_fn(recorded: list[dict]):
@@ -98,7 +112,7 @@ def _make_recording_execute_fn(recorded: list[dict]):
     return _record
 
 
-async def main() -> None:
+async def _main() -> None:
     today_kst = datetime.now(KST).date()
     if not is_krx_trading_day(today_kst):
         logger.info("not_a_trading_day day=%s — skip (주말/공휴일, LLM 호출 없음)", today_kst.isoformat())
@@ -210,9 +224,20 @@ async def main() -> None:
                 )
         except TimeoutError:
             deadline_exceeded = True
+        except DataCollectionUnavailable as exc:
+            _write_pending_state(today_kst.isoformat(), [], skipped=str(exc))
+            notify.send_telegram_alert(
+                notify.format_error_alert("매수 판단용 데이터 수집 실패 — 오늘 신규 판단 중지", str(exc))
+            )
+            logger.error("decide_buys_collection_failed day=%s reason=%s", today_kst.isoformat(), exc)
+            return
     finally:
         # main()은 단발 프로세스지만 테스트·수동 import에서도 공급자 변경이 새지 않게 한다.
         llm.call_structured = original_call_structured
+        record = run_history.CURRENT.get()
+        if record is not None:
+            record.provider_attempted = provider_stats["attempted"]
+            record.provider_failed = provider_stats["failed"]
 
     if deadline_exceeded:
         _write_pending_state(today_kst.isoformat(), [], skipped="decision_deadline_exceeded")
@@ -243,6 +268,45 @@ async def main() -> None:
         len(recorded),
         [d["ticker"] for d in recorded],
     )
+
+
+async def main() -> None:
+    now = datetime.now(KST)
+    if not is_krx_trading_day(now.date()):
+        logger.info("not_a_trading_day day=%s — skip", now.date())
+        return
+    # 포트폴리오 락과 다른 파일이다. 매분 안전장치는 이 분석 작업을 기다리지 않는다.
+    try:
+        with portfolio_lock(run_history.RUN_LOCK_PATH, blocking=False):
+            if run_history.already_analyzed(now.date().isoformat(), pipeline.DEFAULT_LOG_PATH):
+                logger.warning("decide_buys_duplicate_blocked day=%s — 기존 pending 보존", now.date())
+                return
+            record = run_history.new_run(now, BUY_LLM_PROVIDER,
+                                        codex_plan.DEFAULT_MODEL if BUY_LLM_PROVIDER == "codex_plan" else "anthropic")
+            token = run_history.CURRENT.set(record)
+            try:
+                run_history.write(record)
+                await _main()
+            except BaseException as exc:
+                record.status = "failed"
+                record.reason = type(exc).__name__
+                _write_pending_state(record.day, [], skipped="unexpected_failure")
+                record.status = "failed"
+                record.reason = type(exc).__name__
+                raise
+            finally:
+                record.ended_at = datetime.now(KST)
+                record.elapsed_seconds = (record.ended_at - record.started_at).total_seconds()
+                record.deadline_margin_seconds = _seconds_until_deadline(record.ended_at)
+                try:
+                    run_history.write(record)
+                except Exception:
+                    _write_pending_state(record.day, [], skipped="run_history_write_failed")
+                    raise
+                finally:
+                    run_history.CURRENT.reset(token)
+    except PortfolioLockBusy:
+        logger.warning("decide_buys_already_running — 기존 pending 보존")
 
 
 if __name__ == "__main__":

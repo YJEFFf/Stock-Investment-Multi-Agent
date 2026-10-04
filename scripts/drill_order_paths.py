@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import requests  # noqa: E402
 
-from src import collectors, kis, notify, pipeline, sell, translate  # noqa: E402
+from src import collectors, kis, notify, order_guard, pipeline, sell, translate  # noqa: E402
 from src.schemas import AnalystOpinion, Decision, GateResult, PortfolioState, Position, RiskGateConfig, SellAction  # noqa: E402
 
 KST = ZoneInfo("Asia/Seoul")
@@ -117,6 +117,7 @@ class FakeBroker:
 def _wired(broker: FakeBroker):
     """운영 코드는 그대로, HTTP·토큰·대기·알림만 바꿔 끼운다. 끝나면 전부 되돌린다."""
     saved = {
+        (order_guard, "STATE_PATH"): order_guard.STATE_PATH,
         (kis, "get_access_token"): kis.get_access_token,
         (kis.requests, "get"): kis.requests.get,
         (kis.requests, "post"): kis.requests.post,
@@ -138,6 +139,7 @@ def _wired(broker: FakeBroker):
     tmp = tempfile.mkdtemp(prefix="sima_drill_")
     try:
         os.chdir(tmp)
+        order_guard.STATE_PATH = Path(tmp) / "unconfirmed_orders.json"
         kis.get_access_token = lambda: "drill-token"
         kis.requests.get = broker.get
         kis.requests.post = broker.post

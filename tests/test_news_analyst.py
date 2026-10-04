@@ -46,7 +46,8 @@ def test_news_analyst_builds_opinion_with_prompt_version(monkeypatch):
     assert opinion.ticker == "005930"
     assert opinion.score == -0.3
     assert opinion.confidence == 0.6
-    assert opinion.evidence == [f"prompt:news@{expected_version}"]
+    assert opinion.evidence[0] == f"prompt:news@{expected_version}"
+    assert set(opinion.evidence[1:]) == {n.url for n in context.company_news + context.sector_news}
     assert opinion.as_of == context.as_of
 
 

@@ -113,7 +113,8 @@ async def chart_analyst(context: MarketContext) -> AnalystOpinion | None:
         ticker=context.ticker,
         score=result.score,
         confidence=result.confidence,
-        evidence=[f"prompt:chart@{version}"],
+        evidence=[f"prompt:chart@{version}",
+                  f"kis:daily_ohlcv:{context.ticker}:" + hashlib.sha256(context.model_dump_json().encode()).hexdigest()],
         as_of=context.as_of,
     )
 
@@ -184,7 +185,7 @@ async def news_analyst(context: NewsContext) -> AnalystOpinion | None:
         ticker=context.ticker,
         score=result.score,
         confidence=result.confidence,
-        evidence=[f"prompt:news@{version}"],
+        evidence=[f"prompt:news@{version}", *dict.fromkeys(n.url for n in context.company_news + context.sector_news)],
         as_of=context.as_of,
     )
 
@@ -253,6 +254,6 @@ async def disclosure_analyst(context: DisclosureContext) -> AnalystOpinion | Non
         ticker=context.ticker,
         score=result.score,
         confidence=result.confidence,
-        evidence=[f"prompt:disclosure@{version}"],
+        evidence=[f"prompt:disclosure@{version}", *dict.fromkeys(d.url for d in context.disclosures)],
         as_of=context.as_of,
     )

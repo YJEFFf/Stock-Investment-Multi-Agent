@@ -28,15 +28,16 @@ NAVER_CHART_URL = "https://fchart.stock.naver.com/sise.nhn"
 NAVER_REALTIME_QUOTE_URL = "https://polling.finance.naver.com/api/realtime/domestic/stock/{codes}"
 NAVER_REALTIME_TIMEOUT_S = 3.0
 NAVER_STOCK_NEWS_URL = "https://finance.naver.com/item/news_news.naver"
+NAVER_STOCK_NEWS_API_URL = "https://m.stock.naver.com/api/news/stock/{ticker}"
 NAVER_NEWS_HUB_URL = "https://finance.naver.com/news/"
-NAVER_KOSPI200_CONSTITUENTS_URL = "https://finance.naver.com/sise/entryJongmok.naver"
+KIS_KOSPI_MASTER_URL = "https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip"
+KOSPI_MASTER_MAX_AGE_DAYS = 7  # 휴장일을 포함한 파일 생성일 검사. 오래된 목록으로 폴백하지 않는다.
 NAVER_SECTOR_GROUP_LIST_URL = "https://finance.naver.com/sise/sise_group.naver"
 NAVER_SECTOR_GROUP_DETAIL_URL = "https://finance.naver.com/sise/sise_group_detail.naver"
 DART_CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 
 KOSPI200_INDEX_SYMBOL = "KPI200"
-KOSPI200_CONSTITUENT_PAGES = 20  # 페이지당 10종목 x 20페이지 = 200종목
 
 SECTOR_CACHE_PATH = Path(__file__).resolve().parent.parent / ".kospi200_sector_cache.json"
 SECTOR_CACHE_TTL_DAYS = 30  # 업종 분류는 실질적으로 거의 안 바뀌는 데이터 (docs/PLAN.md §5)
@@ -198,8 +199,8 @@ def fetch_market_context(ticker: str, lookback_days: int = 60) -> MarketContext 
 
     네이버 스크래핑 대신 KIS를 쓰는 이유는 실시간성이다 — 모의투자 계좌로도
     실제 매매 판단에 쓸 시세이니 지연이 적은 공식 API 쪽을 신뢰한다. 종목
-    리스트(fetch_kospi200_universe)와 지수 시계열(fetch_kospi200_index_bars)은
-    개별 종목 시세가 아니라서 계속 네이버를 쓴다.
+    리스트는 한투 공식 종목 마스터, 지수 시계열(fetch_kospi200_index_bars)은
+    네이버 차트 API를 쓴다.
     """
     bars = kis.fetch_daily_ohlcv(ticker, lookback_days)
     if bars is None:
@@ -241,35 +242,49 @@ def _parse_kospi200_constituent_page(html_text: str) -> list[tuple[str, str]]:
     ]
 
 
-def fetch_kospi200_universe() -> list[tuple[str, str]] | None:
-    """네이버 금융에서 코스피200 편입종목 전체를 스크래핑한다.
+def _parse_kospi_master(payload: bytes) -> list[tuple[str, str]]:
+    """KIS 공식 코스피 master의 KOSPI200 편입 필드로 전체 목록을 읽는다.
 
-    반환값은 (종목코드, 종목명)이다 — 업종(섹터)이 아니다. 뉴스 분석가가 쓰는
-    sector는 fetch_kospi200_sector_map()으로 별도로 채운다.
-
-    페이지 하나라도 수집 실패하면 전체를 None으로 실패 처리한다. 유니버스가
-    일부만 채워진 채로 조용히 넘어가면 이후 전체 판단이 왜곡되므로, 개별 종목
-    조회 실패(빈 리스트로 넘어감)보다 엄격하게 다룬다.
+    공식 stocks_info/kis_kospi_code_mst.py 및 종목마스터정보(코스피).h 규격:
+    9바이트 단축코드 + 12바이트 ISIN + 40바이트 종목명 + 227바이트 부가정보.
+    부가정보의 18번 offset은 0=비편입, 1~9/A/B=KOSPI200 섹터다.
+    후보 개수에 맞춰 자르거나 오래된 목록을 사용하지 않는다.
     """
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        try:
+            info = archive.getinfo("kospi_code.mst")
+        except KeyError as exc:
+            raise ValueError("KIS master member missing") from exc
+        generated = date(*info.date_time[:3])
+        age = (datetime.now(ZoneInfo("Asia/Seoul")).date() - generated).days
+        if not 0 <= age <= KOSPI_MASTER_MAX_AGE_DAYS:
+            raise ValueError(f"KIS master stale or future dated: {generated}")
+        rows = archive.read(info).splitlines()
     constituents: list[tuple[str, str]] = []
     seen: set[str] = set()
-
-    for page in range(1, KOSPI200_CONSTITUENT_PAGES + 1):
-        page_items = _fetch_with_retries(
-            NAVER_KOSPI200_CONSTITUENTS_URL,
-            _parse_kospi200_constituent_page,
-            params={"type": "KPI200", "page": page},
-        )
-        if page_items is None:
-            logger.error("kospi200_universe_fetch_failed page=%d", page)
-            return None
-
-        for code, name in page_items:
-            if code not in seen:
-                seen.add(code)
-                constituents.append((code, name))
-
+    for raw in rows:
+        if len(raw) != 288:
+            raise ValueError("KIS master record width changed")
+        sector = raw[61 + 18:61 + 19].decode("ascii")
+        if sector not in "0123456789AB":
+            raise ValueError("KIS master membership field changed")
+        if sector == "0":
+            continue
+        code = raw[:9].decode("ascii").strip()
+        name = raw[21:61].decode("cp949").strip()
+        if not re.fullmatch(r"[0-9A-Z]{6}", code) or not name or code in seen:
+            raise ValueError("KIS master invalid or duplicate constituent")
+        seen.add(code)
+        constituents.append((code, name))
+    if not constituents:
+        raise ValueError("KIS master has no KOSPI200 constituents")
+    logger.info("kospi200_universe_source source=kis_master generated=%s constituents=%d", generated, len(constituents))
     return constituents
+
+
+def fetch_kospi200_universe() -> list[tuple[str, str]] | None:
+    """KIS 공식 종목 파일에서 편입종목 전체를 가져온다. 부분·빈·낡은 파일은 실패다."""
+    return _fetch_with_retries(KIS_KOSPI_MASTER_URL, _parse_kospi_master, binary=True)
 
 
 _SECTOR_GROUP_PATTERN = re.compile(
@@ -289,6 +304,8 @@ def _parse_sector_members(html_text: str) -> list[str]:
 def _read_sector_cache() -> tuple[dict[str, str], datetime] | None:
     try:
         payload = json.loads(SECTOR_CACHE_PATH.read_text())
+        if not isinstance(payload.get("sector_map"), dict) or not payload["sector_map"]:
+            return None
         return payload["sector_map"], datetime.fromisoformat(payload["fetched_at"])
     except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError, ValueError):
         return None
@@ -313,7 +330,8 @@ def _fetch_sector_map_live() -> dict[str, str] | None:
     같은 이유(부분적으로 채워진 맵으로 조용히 넘어가는 게 더 위험하다).
     """
     groups = _fetch_with_retries(NAVER_SECTOR_GROUP_LIST_URL, _parse_sector_groups, params={"type": "upjong"})
-    if groups is None:
+    if not groups:
+        logger.error("sector_groups_missing_or_layout_changed")
         return None
 
     sector_map: dict[str, str] = {}
@@ -433,17 +451,40 @@ def _parse_company_news(html_text: str) -> list[NewsItem]:
     return items
 
 
+def _parse_company_news_api(text: str) -> list[NewsItem]:
+    groups = json.loads(text)
+    if not isinstance(groups, list):
+        raise ValueError("company news payload must be a list")
+    items: list[NewsItem] = []
+    seen: set[str] = set()
+    for group in groups:
+        if not isinstance(group, dict) or not isinstance(group.get("items"), list):
+            raise ValueError("company news group missing items")
+        for row in group["items"]:
+            if not isinstance(row, dict):
+                raise ValueError("company news item must be an object")
+            title, url, timestamp = row.get("title"), row.get("mobileNewsUrl"), row.get("datetime")
+            if not all(isinstance(v, str) and v for v in (title, url, timestamp)):
+                raise ValueError("company news item missing title/url/time")
+            if not url.startswith("https://n.news.naver.com/"):
+                raise ValueError("unexpected company news URL")
+            published_at = datetime.strptime(timestamp, "%Y%m%d%H%M").replace(tzinfo=ZoneInfo("Asia/Seoul"))
+            if url in seen:
+                continue
+            seen.add(url)
+            items.append(NewsItem(title=html.unescape(title), press=row.get("officeName") or None,
+                                  published_at=published_at, url=url))
+    return items
+
+
 def fetch_company_news(ticker: str, limit: int = 10) -> list[NewsItem] | None:
-    """종목별 뉴스 탭을 스크래핑한다.
-
-    Referer 헤더가 없으면 빈 결과만 온다 (실제로 확인됨) — 부모 페이지를 거쳐 온
-    요청처럼 보이게 한다. 뉴스가 0건인 것과 수집 자체가 실패한 것은 다르게 취급한다
-    (0건은 정상 상태로 빈 리스트, 수집 실패만 None).
-    """
-    params = {"code": ticker, "page": 1, "clusterId": ""}
-    headers = {"Referer": f"https://finance.naver.com/item/news.naver?code={ticker}"}
-
-    items = _fetch_with_retries(NAVER_STOCK_NEWS_URL, _parse_company_news, params=params, headers=headers)
+    """폐쇄된 HTML 대신 같은 네이버 종목 뉴스의 JSON을 읽는다. 본문은 사용하지 않는다."""
+    if not re.fullmatch(r"[0-9A-Z]{6}", ticker):
+        raise ValueError("invalid stock code")
+    items = _fetch_with_retries(
+        NAVER_STOCK_NEWS_API_URL.format(ticker=ticker), _parse_company_news_api,
+        params={"page": 1, "pageSize": limit},
+    )
     if items is None:
         return None
     return items[:limit]

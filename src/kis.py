@@ -44,7 +44,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -503,6 +503,7 @@ class AccountSnapshot:
     total: float  # tot_evlu_amt — 총평가금액(예수금 + 유가증권 평가)
     cash: float  # dnca_tot_amt — 예수금 총금액
     securities: float  # scts_evlu_amt — 유가증권 평가금액
+    holdings: list[dict] = field(default_factory=list)
 
 
 def _balance_params() -> dict:
@@ -540,6 +541,8 @@ def fetch_account_snapshot() -> AccountSnapshot | None:
             total=float(row["tot_evlu_amt"]),
             cash=float(row["dnca_tot_amt"]),
             securities=float(row["scts_evlu_amt"]),
+            holdings=[{k: h[k] for k in ("pdno", "prdt_name", "hldg_qty", "pchs_avg_pric", "prpr", "evlu_amt", "evlu_pfls_amt", "evlu_pfls_rt") if k in h}
+                      for h in data.get("output1", []) if int(h.get("hldg_qty") or 0) > 0],
         )
     except (KeyError, TypeError, ValueError):
         logger.warning("kis_account_snapshot_unparseable row_keys=%s", sorted(row))

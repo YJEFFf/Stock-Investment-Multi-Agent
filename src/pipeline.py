@@ -7,9 +7,10 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from src import collectors, kis, llm, notify, sell, translate
+from src import collectors, kis, llm, notify, order_guard, run_history, sell, translate
 from src.analysts import chart_analyst, disclosure_analyst, dummy_analyst, news_analyst
 from src.schemas import (
+    DataCollectionUnavailable,
     AnalystOpinion,
     Decision,
     DisclosureContext,
@@ -367,7 +368,11 @@ async def execute_buy_order(
     # 주문 직전/직후의 누적 체결 집계를 사이에 두고 재면 이 주문 하나의 체결
     # 수량·금액이 정확히 나온다 — 같은 종목을 같은 날 두 번 매수해도(추가매수)
     # 섞이지 않는다. 집계 하나만 사후 조회하면 두 건이 합산돼버린다.
+    if order_guard.is_blocked(ticker):
+        _log_buy_skip(log_path, today, ticker, "unconfirmed_previous_order")
+        return portfolio
     fills_before = await asyncio.to_thread(kis.fetch_daily_fill_totals, ticker, _kst_today(), "buy")
+    order_guard.begin(ticker, "buy", quantity, fills_before)
 
     try:
         order_no = await asyncio.to_thread(kis.place_market_buy_order, ticker, quantity)
@@ -381,6 +386,7 @@ async def execute_buy_order(
     else:
         if order_no is None:
             # 브로커가 응답으로 거부했다 — 주문이 안 나간 게 확실하다.
+            order_guard.clear(ticker)
             logger.error("execute_buy_order_failed ticker=%s reason=order_rejected", ticker)
             _log_buy_skip(log_path, today, ticker, "order_rejected")
             return portfolio
@@ -397,12 +403,19 @@ async def execute_buy_order(
         kis.fill_after_order, ticker, _kst_today(), "buy", fills_before, quantity
     )
     if order_no is None and fill is None:
-        # 응답 유실 + 원장에 체결 흔적 없음 = 주문이 접수되지 않았다고 본다.
-        # 체결이 잡혔다면(fill is not None) 주문은 살아 있는 것이므로 아래 정상
-        # 경로로 그대로 내려가 포지션으로 기록된다.
+        # 원장 조회 실패/지연은 미접수 증거가 아니다. 이후 회차도 재전송을 차단한다.
         logger.error("execute_buy_order_failed ticker=%s reason=order_response_lost", ticker)
         _log_buy_skip(log_path, today, ticker, "order_response_lost")
+        notify.send_telegram_alert(notify.format_error_alert(
+            "매수 주문 확인 필요 — 해당 종목 추가 주문 차단", f"ticker={ticker}; 원장·보유 수량 대조 필요"
+        ))
         return portfolio
+
+    if order_no is None and fill is not None and not fill.complete:
+        # 응답 유실 뒤 일부 체결만 보이면 확인된 수량은 장부에 남긴다. 나머지는
+        # 미체결/조회 지연 중 무엇인지 모르므로 마커는 해제하지 않는다.
+        trade_weight *= fill.quantity / quantity
+        quantity = fill.quantity
 
     fill_price = fill.price if fill is not None else None
     # 체결 조회가 주문 수량을 다 따라잡았는지로 갈라 적는다. 부분 체결이어도 평균가는
@@ -525,10 +538,17 @@ async def execute_buy_order(
     reason_ko = await translate.to_korean(decision.reason, label="translate_buy_reason")
     notify.send_telegram_alert(notify.format_buy_alert(display_name(ticker), entry_price, quantity, reason_ko))
 
-    return PortfolioState(
+    updated = PortfolioState(
         positions=positions,
         cash_weight=portfolio.cash_weight - trade_weight,
     )
+    if fill is not None and fill.complete:
+        order_guard.mark_settled(ticker, updated)
+    else:
+        notify.send_telegram_alert(notify.format_error_alert(
+            "매수 체결 확인 미완료 — 원장 대조까지 추가 주문 차단", f"ticker={ticker}"
+        ))
+    return updated
 
 
 def _append_log(log_path: Path, entry: dict) -> None:
@@ -616,6 +636,8 @@ def make_chart_analyst_fn(lookback_days: int = 60) -> AnalystFn:
 
     async def _fn(ticker: str, sector: str, day: datetime) -> list[AnalystOpinion]:
         context = await asyncio.to_thread(collectors.fetch_market_context, ticker, lookback_days)
+        run_history.observe(ticker, "chart", context.bars if context is not None else None,
+                            latest=context.bars[-1].date if context and context.bars else None)
         if context is None:
             return []
         opinion = await chart_analyst(context)
@@ -633,6 +655,10 @@ def make_news_analyst_fn(news_limit: int = 10) -> AnalystFn:
             asyncio.to_thread(collectors.fetch_company_news, ticker, news_limit),
             asyncio.to_thread(collectors.fetch_sector_news, sector, news_limit),
         )
+        run_history.observe(ticker, "company_news", company_news,
+                            latest=max((n.published_at for n in company_news or [] if n.published_at), default=None))
+        run_history.observe(ticker, "sector_news", sector_news, required=False,
+                            latest=max((n.published_at for n in sector_news or [] if n.published_at), default=None))
         if company_news is None and sector_news is None:
             return []
 
@@ -654,6 +680,8 @@ def make_disclosure_analyst_fn(lookback_days: int = 30, limit: int = 10) -> Anal
 
     async def _fn(ticker: str, sector: str, day: datetime) -> list[AnalystOpinion]:
         disclosures = await asyncio.to_thread(collectors.fetch_disclosures, ticker, lookback_days, limit)
+        run_history.observe(ticker, "disclosure", disclosures,
+                            latest=max((d.received_at for d in disclosures or []), default=None))
         if disclosures is None:
             return []
 
@@ -680,6 +708,9 @@ def make_combined_analyst_fn(component_fns: list[AnalystFn]) -> AnalystFn:
         for fn, raw in zip(component_fns, raw_results):
             if isinstance(raw, BaseException):
                 logger.warning("component_analyst_fn_failed ticker=%s fn=%s error=%s", ticker, fn, raw)
+                record = run_history.CURRENT.get()
+                if record is not None:
+                    record.analyst_failed += 1
                 continue
             opinions.extend(raw)
         return opinions
@@ -753,14 +784,15 @@ async def quant_prefilter(
     index_bars = await asyncio.to_thread(collectors.fetch_kospi200_index_bars, lookback_days)
     index_indicators = collectors.compute_indicators(index_bars) if index_bars else {}
     index_return_5d_pct = index_indicators.get("return_5d_pct")
+    record = run_history.CURRENT.get()
+    if record is not None:
+        record.index_unavailable = index_return_5d_pct is None
 
     async def _check(ticker: str, sector: str) -> tuple[str, str, list[str], dict[str, float]] | None:
         context = await asyncio.to_thread(collectors.fetch_market_context, ticker, lookback_days)
         if context is None:
             return None
         reasons = quant_filter_reasons(context.indicators, index_return_5d_pct)
-        if not reasons:
-            return None
         snapshot = {k: context.indicators[k] for k in PREFILTER_LOGGED_INDICATORS if k in context.indicators}
         return (ticker, sector, reasons, snapshot)
 
@@ -768,21 +800,30 @@ async def quant_prefilter(
 
     today = _kst_today().isoformat()
     passed: list[tuple[str, str]] = []
+    failed = 0
     for (ticker, _), result in zip(universe, raw_results):
-        if isinstance(result, BaseException):
+        if isinstance(result, BaseException) or result is None:
             logger.warning("quant_prefilter_failed ticker=%s error=%s", ticker, result)
+            failed += 1
             continue
         if result is not None:
             ticker, sector, reasons, snapshot = result
+            if not reasons:
+                continue
             passed.append((ticker, sector))
             _append_log(log_path, {"day": today, "ticker": ticker, "reasons": reasons, **snapshot})
+
+    if record is not None:
+        record.collection_failed = failed
+    if universe and failed == len(universe):
+        raise DataCollectionUnavailable("all_market_contexts_unavailable")
 
     logger.info("quant_prefilter_done universe=%d passed=%d", len(universe), len(passed))
     return passed
 
 
 async def build_universe_with_sectors() -> list[tuple[str, str]] | None:
-    """코스피200 유니버스(네이버)에 업종(네이버, 캐시됨)을 붙여 run_day가 기대하는
+    """코스피200 유니버스(한투 마스터)에 업종(네이버, 캐시됨)을 붙여 run_day가 기대하는
     (종목코드, 업종) 형태로 만든다.
 
     유니버스 조회 자체가 실패하면 None — 유니버스가 틀리면 그날 전체 판단이
@@ -803,6 +844,8 @@ async def build_universe_with_sectors() -> list[tuple[str, str]] | None:
         logger.warning("build_universe_with_sectors_degraded reason=sector_map_unavailable")
         sector_map = {}
 
+    run_history.observe("", "sector_map", sector_map or None, required=False)
+
     return [(code, sector_map.get(code, "")) for code, _name in universe]
 
 
@@ -817,8 +860,8 @@ async def run_daily(
     log_path: Path | None = None,
 ) -> tuple[PortfolioState, list[tuple[Decision, GateResult]]]:
     """하루치 전체 파이프라인 진입점: 코스피200 유니버스 구성 -> 정량 필터 ->
-    run_day(analyst_fn, judge_fn, execute_fn). 유니버스 조회 자체가 실패하면(네이버
-    접근 불가 등) 그날은 빈 결과로 관망한다 — 매수 없음이 기본 상태다(규칙 1).
+    run_day(analyst_fn, judge_fn, execute_fn). 유니버스 수집 실패는 예외로 전파해
+    정상 관망과 구분한다. 상위 실행기는 빈 pending과 실패 사유를 기록한다.
 
     analyst_fn/judge_fn/execute_fn은 run_day와 마찬가지로 기본값이 없다 — 실제 LLM
     경로(judgment.judge, 비용 발생)·실제 주문 집행(execute_buy_order, 실거래 발생)을
@@ -827,11 +870,16 @@ async def run_daily(
     """
     log_path = log_path or DEFAULT_LOG_PATH
     universe = await build_universe_with_sectors()
-    if universe is None:
+    if not universe:
         logger.error("run_daily_aborted day=%s reason=universe_fetch_failed", day.date().isoformat())
-        return portfolio, []
+        raise DataCollectionUnavailable("universe_fetch_failed")
 
+    record = run_history.CURRENT.get()
+    if record is not None:
+        record.universe = len(universe)
     filtered = await quant_prefilter(universe)
+    if record is not None:
+        record.candidates = len(filtered)
     logger.info(
         "run_daily_filtered day=%s universe=%d filtered=%d",
         day.date().isoformat(),
@@ -839,6 +887,7 @@ async def run_daily(
         len(filtered),
     )
 
+    run_history.claim_analysis()
     return await run_day(
         filtered, day, portfolio, config, analyst_fn, judge_fn, execute_fn, total_expected_analysts, log_path
     )
@@ -872,6 +921,8 @@ async def run_day(
     for (ticker, _), raw in zip(universe, raw_results):
         if isinstance(raw, BaseException):
             logger.warning("analyst_fn_failed ticker=%s error=%s", ticker, raw)
+            if run_history.CURRENT.get() is not None:
+                run_history.CURRENT.get().analyst_failed += 1
             opinions_per_ticker.append([])
         else:
             opinions_per_ticker.append(raw)
@@ -885,14 +936,19 @@ async def run_day(
     for (ticker, _), raw in zip(universe, judge_raw_results):
         if isinstance(raw, BaseException):
             logger.warning("judge_fn_failed ticker=%s error=%s", ticker, raw)
+            if run_history.CURRENT.get() is not None:
+                run_history.CURRENT.get().analyst_failed += 1
             decisions.append(None)
         else:
             decisions.append(raw)
 
     results: list[tuple[Decision, GateResult]] = []
+    record = run_history.CURRENT.get()
 
     for (ticker, sector), decision in zip(universe, decisions):
         if decision is None:
+            if record is not None:
+                record.unavailable_decisions += 1
             continue  # 의견이 없음 — 관망. score=0 등으로 대체하지 않는다.
 
         if decision.action == "BUY":
@@ -902,6 +958,14 @@ async def run_day(
 
         portfolio = await execute_fn(decision, gate_result, portfolio, sector, TRADE_WEIGHT)
         results.append((decision, gate_result))
+        if record is not None:
+            record.decisions += 1
+            record.hold += int(decision.action == "HOLD")
+            record.buy += int(decision.action == "BUY")
+            record.degraded_decisions += int(decision.degraded)
+            if gate_result.rejected_by:
+                reason = gate_result.rejected_by
+                record.gate_rejected[reason] = record.gate_rejected.get(reason, 0) + 1
 
         # avg_score/avg_confidence는 마일스톤 3 IC 계산의 원재료 — decision.inputs에서
         # 다시 뽑아낸다 (propose_decision의 반환 계약은 안 건드림).
@@ -918,6 +982,7 @@ async def run_day(
                 "rejected_by": gate_result.rejected_by,
                 "avg_score": avg_score,
                 "avg_confidence": avg_confidence,
+                **run_history.metadata(),
                 "reason": decision.reason,
                 # 분석가가 빠진 채 나온 판단인가(스키마 계약의 Decision.degraded), 그리고
                 # 실제로 어떤 분석가가 기여했는가. 이 두 필드가 없어서 2026-08-24 점검 때
@@ -937,6 +1002,8 @@ async def run_day(
                         "score": o.score,
                         "confidence": o.confidence,
                         "prompt": next((x for x in o.evidence if x.startswith("prompt:")), None),
+                        "as_of": o.as_of.isoformat(),
+                        "evidence": o.evidence,
                     }
                     for o in sorted(decision.inputs, key=lambda o: o.agent)
                 ],
@@ -1308,7 +1375,9 @@ async def evaluate_holdings(
         portfolio = await finalize_sell(
             portfolio, action, position, current_price, day, sell_execute_fn, log_path, trade_journal_log_path
         )
-        sells += 1
+        after = next((p for p in portfolio.positions if p.ticker == ticker), None)
+        if after is None or after.quantity != position.quantity or after.weight != position.weight:
+            sells += 1
 
     # 정상 KIS 시세와 네이버를 비교하는 관측 작업은 손절·익절 판정 뒤에만 한다.
     # 2차 소스가 5초 상한까지 느려도 안전 주문을 늦춰서는 안 된다.
@@ -1430,6 +1499,10 @@ async def finalize_sell(
     판단이 언제 내려졌는지와 무관하게 항상 같아야 한다.
     """
     portfolio, fill = await sell_execute_fn(portfolio, action, current_price)
+    after = next((p for p in portfolio.positions if p.ticker == action.ticker), None)
+    if fill is None and after is not None and after.quantity == position.quantity and after.weight == position.weight:
+        logger.warning("sell_not_executed ticker=%s — 체결 없는 회차는 매매일지에 쓰지 않음", action.ticker)
+        return portfolio
 
     # 매매일지에 적히는 값은 판단 시점 호가가 아니라 **실제 체결 내역**이다
     # (사용자 확정 2026-08-15). 시장가 주문이라 둘은 항상 다를 수 있고, 호가를
@@ -1611,38 +1684,32 @@ def load_decision_entries(log_path: Path) -> list[dict]:
     return list(deduped.values())
 
 
-def summarize_recent_trading_days(log_path: Path, n_days: int) -> dict:
-    """cron이 매일 같은 파일에 계속 이어 쓰는 실환경용 래퍼.
-
-    summarize_log(total_days=N)는 파일 안의 모든 기록을 N으로 나누는데, 이는
-    "정확히 N일치만 담긴 로그"를 전제한다(마일스톤1 시뮬레이션·실측 테스트가 그렇게
-    썼다). 실제 cron 로그는 배포 이후 계속 누적되므로 그 가정이 깨진다 — 최근
-    n_days개의 서로 다른 날짜만 추려서 그 위에서 같은 집계를 돌린다. 로그에 아직
-    n_days보다 적은 날짜만 쌓여있으면 있는 만큼만으로 계산한다(허수로 채우지 않음).
-    """
-    if not log_path.exists():
-        return {"total_days": 0, "signal_days": 0, "signal_day_ratio": 0.0, "rejected_by_counts": {}}
-
-    entries = load_decision_entries(log_path)
-
-    distinct_days = sorted({e["day"] for e in entries})
-    recent_days = set(distinct_days[-n_days:])
-    recent_entries = [e for e in entries if e["day"] in recent_days]
-
+def summarize_recent_trading_days(log_path: Path, n_days: int, *, as_of: date | None = None) -> dict:
+    """현재 거래일 달력의 창을 쓴다. 로그 없는 날을 정상 HOLD로 세지 않는다."""
+    as_of = as_of or _kst_today()
+    recent_days = set(run_history.trading_days(as_of, n_days))
+    runs = {r.day: r for r in run_history.load_runs() if r.day in recent_days}
+    entries = [e for e in load_decision_entries(log_path) if e["day"] in recent_days]
+    decision_days = {e["day"] for e in entries}
     signal_days: set[str] = set()
     rejected_by_counts: dict[str, int] = {}
-    for e in recent_entries:
-        if e["action"] == "BUY" and e["approved"]:
+    for e in entries:
+        run = runs.get(e["day"])
+        # 마감초과 등으로 pending을 폐기한 부분 실행의 BUY는 승인 신호일에 넣지 않는다.
+        published = run is None or run.status in {"completed", "degraded"}
+        if e["action"] == "BUY" and e["approved"] and published:
             signal_days.add(e["day"])
-        if not e["approved"] and e["rejected_by"]:
-            rejected_by_counts[e["rejected_by"]] = rejected_by_counts.get(e["rejected_by"], 0) + 1
-
-    total_days = len(recent_days)
+        if not e["approved"] and e.get("rejected_by"):
+            reason = e["rejected_by"]
+            rejected_by_counts[reason] = rejected_by_counts.get(reason, 0) + 1
     return {
-        "total_days": total_days,
+        "total_days": len(recent_days),
         "signal_days": len(signal_days),
-        "signal_day_ratio": (len(signal_days) / total_days) if total_days else 0.0,
+        "signal_day_ratio": len(signal_days) / len(recent_days) if recent_days else 0.0,
+        "decision_days": len(decision_days),
+        "days_without_decision_log": len(recent_days - decision_days),
         "rejected_by_counts": rejected_by_counts,
+        "coverage": run_history.coverage(as_of, n_days),
     }
 
 
@@ -1831,6 +1898,8 @@ def log_monitoring_summary(
         signal["signal_day_ratio"],
         signal["rejected_by_counts"],
     )
+
+    logger.info("monitoring_execution_coverage %s", json.dumps(signal["coverage"], ensure_ascii=False))
 
     since = datetime.now(timezone.utc) - timedelta(days=MONITORING_WINDOW_CALENDAR_DAYS)
     for label, stats in sorted(summarize_llm_calls(llm_log_path, since=since).items()):

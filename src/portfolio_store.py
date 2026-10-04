@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from src.schemas import PortfolioState
+from src import order_guard
 
 PORTFOLIO_STATE_PATH = Path("logs/portfolio_state.json")
 PORTFOLIO_LOCK_PATH = Path("logs/portfolio_state.lock")
@@ -39,8 +40,13 @@ def save_portfolio(portfolio: PortfolioState, path: Path | None = None) -> None:
     path = path or PORTFOLIO_STATE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(portfolio.model_dump_json(indent=2))
+    with tmp_path.open("w") as f:
+        f.write(portfolio.model_dump_json(indent=2))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp_path, path)
+    if path == PORTFOLIO_STATE_PATH:
+        order_guard.release_committed(portfolio)
 
 
 class PortfolioLockBusy(Exception):

@@ -3,8 +3,9 @@
 이 스크립트가 생긴 이유: 마일스톤 3(IC 측정)이 목표인 시스템이 2026-08-12부터
 09-11까지 22거래일을 **IC를 한 번도 재지 않고** 돌았다(src/evaluation.py docstring).
 첫 1개월 평가는 신호가 모든 지평에서 음의 IC(−0.07~−0.11)라는 것을 사후에야 밝혔다.
-앞으로는 매일 숫자가 남고, 60거래일이 쌓이는 시점(2026-11 중순)에 이 숫자로
-실거래 전환 여부를 판단한다 — IC ≥ 0.03, t ≥ 2가 조건이고, 정직하게 음이면 시스템을
+앞으로는 매일 숫자가 남고, 정상 분석 표본 60거래일이 쌓이는 시점에 이 숫자로
+실거래 전환 여부를 판단한다 — 기존 기준은 IC ≥ 0.03, t ≥ 2이고, 단순 t값은 수익률
+중첩에 따른 자기상관을 조정하지 않았으므로 독립 유의성 증거로 단정하지 않는다. 음이면 시스템을
 멈추는 것이 결론이다(docs/evaluations/2026-09-13-first-month.md §7).
 
 읽기 전용이다: pipeline.jsonl을 읽고, 가격을 받아 logs/price_history/에 누적하고,
@@ -23,7 +24,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import collectors, evaluation, kis, notify, pipeline  # noqa: E402
+from src import collectors, evaluation, kis, notify, pipeline, run_history  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -74,6 +75,28 @@ def main() -> int:
             summary = evaluation.summarize_ic(segment_entries, prices, index, k)
             segments[segment]["horizons"][str(k)] = summary
             _log_summary(segment, k, summary)
+
+    # 복구 이후에는 데이터 출처·모델이 같은 완주 표본을 따로 본다. 장애일의 부분
+    # 판단을 60개 정상 거래일에 넣지 않으며, 예전 구간의 IC도 그대로 남긴다.
+    completed = {r.run_id: r for r in run_history.load_runs()
+                 if r.status == "completed" and r.cohort == run_history.COHORT}
+    recovered = [e for e in entries if e.get("run_id") in completed and e.get("cohort") == run_history.COHORT]
+    segments[run_history.COHORT] = {
+        "since": "2026-10-06", "label": "수집 복구 후 동일 조건의 정상 실행",
+        "normal_days": len({r.day for r in completed.values()}),
+        "decisions": len(recovered), "horizons": {},
+    }
+    for k in evaluation.HORIZONS:
+        summary = evaluation.summarize_ic(recovered, prices, index, k)
+        segments[run_history.COHORT]["horizons"][str(k)] = summary
+        _log_summary(run_history.COHORT, k, summary)
+
+    run_history.append(run_history.IC_HISTORY_PATH, {
+        "as_of": today.isoformat(), "observed_at": datetime.now(KST), "segments": segments,
+        "coverage": run_history.coverage(today),
+        "price_collection_failed": len(tickers) - len(added), "index_collection_failed": not bool(index_bars),
+        "t_stat_note": "단순 일별 t값. 5/10/20일 수익률 중첩에 따른 자기상관 미조정",
+    })
 
     evaluation.DEFAULT_IC_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
     evaluation.DEFAULT_IC_SUMMARY_PATH.write_text(

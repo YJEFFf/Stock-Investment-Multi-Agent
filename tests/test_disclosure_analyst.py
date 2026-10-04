@@ -54,7 +54,8 @@ def test_disclosure_analyst_builds_opinion_with_prompt_version(monkeypatch):
     assert opinion.ticker == "005930"
     assert opinion.score == 0.4
     assert opinion.confidence == 0.7
-    assert opinion.evidence == [f"prompt:disclosure@{expected_version}"]
+    assert opinion.evidence[0] == f"prompt:disclosure@{expected_version}"
+    assert set(opinion.evidence[1:]) == {d.url for d in context.disclosures}
     assert opinion.as_of == context.as_of
 
 

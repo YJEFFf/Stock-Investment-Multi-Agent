@@ -38,7 +38,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import judgment, kis, llm, notify, notion_sync, pipeline  # noqa: E402
+from src import judgment, kis, llm, notify, notion_sync, pipeline, run_history  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.portfolio_store import load_portfolio  # noqa: E402
 
@@ -67,12 +67,13 @@ async def _sync_daily_report(today_kst, portfolio) -> None:
     브로커의 예수금·유가증권 평가금액·총평가금액을 그대로 조회해서 넘긴다.
     비중으로 역산하면 안 되는 이유는 kis.AccountSnapshot docstring에 있다.
     조회 실패해도(None) 리포트 자체는 만든다 — 그 절만 생략된다."""
+    account = kis.fetch_account_snapshot()
+    run_history.record_nav((today_kst or datetime.now(KST).date()).isoformat(), account)
     daily_report_db_id = os.environ.get("NOTION_DAILY_REPORT_DB_ID")
     if not daily_report_db_id:
         logger.info("notion_daily_report_sync_skipped reason=not_configured")
         return
 
-    account = kis.fetch_account_snapshot()
     if account is None:
         logger.warning("notion_daily_report_account_unavailable — 금액 총정리 절만 생략된다")
 

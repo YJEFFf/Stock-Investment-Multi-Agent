@@ -39,10 +39,13 @@ PY
 # 리뷰했는가"를 명시하게 하고, 검사한 그 커밋만 배포되게 하는 것이다.
 TRADING_PATHS=(
   src/sell.py src/pipeline.py src/kis.py src/collectors.py src/schemas.py src/portfolio_store.py
-  src/notify.py src/judgment.py src/translate.py src/llm.py
+  src/notify.py src/judgment.py src/translate.py src/llm.py src/analysts.py
   src/codex_plan.py
+  src/order_guard.py
+  src/run_history.py
   scripts/execute_open.py scripts/check_stop_loss.py scripts/decide_buys.py scripts/decide_llm_sell.py
   scripts/check_codex_plan.py
+  scripts/repair_20261005.py
   scripts/check_stop_loss.sh scripts/execute_open.sh scripts/decide_buys.sh scripts/decide_llm_sell.sh
   scripts/check_codex_plan.sh
   deploy/crontab

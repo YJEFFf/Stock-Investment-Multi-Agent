@@ -164,7 +164,13 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     `trade_journal.jsonl`에 적힌 뒤 다음 날 노션 매매일지까지 동기화됐다.
     그래서 이제 **`src` 전체의 `logs/` 기본값을 빠짐없이 등록한다.**
     """
-    from src import codex_plan, evaluation, judgment, llm, notion_sync, pipeline, portfolio_store
+    from src import codex_plan, evaluation, judgment, llm, notion_sync, order_guard, pipeline, portfolio_store, run_history
+
+    monkeypatch.setattr(order_guard, "STATE_PATH", tmp_path / "unconfirmed_orders.json")
+    monkeypatch.setattr(run_history, "RUN_LOG_PATH", tmp_path / "daily_runs.jsonl")
+    monkeypatch.setattr(run_history, "RUN_LOCK_PATH", tmp_path / "decide_buys.lock")
+    monkeypatch.setattr(run_history, "NAV_LOG_PATH", tmp_path / "account_nav.jsonl")
+    monkeypatch.setattr(run_history, "IC_HISTORY_PATH", tmp_path / "ic_history.jsonl")
 
     monkeypatch.setattr(judgment, "DEFAULT_SELL_JUDGMENT_LOG_PATH", tmp_path / "sell_judgment.jsonl")
     monkeypatch.setattr(pipeline, "DEFAULT_LOG_PATH", tmp_path / "pipeline.jsonl")

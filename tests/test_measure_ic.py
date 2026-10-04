@@ -47,7 +47,9 @@ def test_writes_both_segments_and_alerts_without_touching_trading_state(monkeypa
     assert mic.main() == 0
 
     summary = json.loads(evaluation.DEFAULT_IC_SUMMARY_PATH.read_text())
-    assert set(summary["segments"]) == set(evaluation.SEGMENTS)
+    assert set(summary["segments"]) == set(evaluation.SEGMENTS) | {mic.run_history.COHORT}
+    history = [json.loads(line) for line in mic.run_history.IC_HISTORY_PATH.read_text().splitlines()]
+    assert history[-1]["segments"] == summary["segments"]
     assert set(summary["segments"]["all"]["horizons"]) == {str(k) for k in evaluation.HORIZONS}
     assert (evaluation.DEFAULT_PRICE_HISTORY_DIR / "A.json").exists()
     assert (evaluation.DEFAULT_PRICE_HISTORY_DIR / f"{evaluation.INDEX_KEY}.json").exists()

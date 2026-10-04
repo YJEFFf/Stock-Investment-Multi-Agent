@@ -20,7 +20,7 @@ import logging
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from src import kis
+from src import kis, notify, order_guard
 from src.schemas import ExitPlan, FillRecord, OHLCVBar, PortfolioState, Position, SellAction
 
 logger = logging.getLogger(__name__)
@@ -407,7 +407,11 @@ async def execute_sell_order(
         shares_to_sell = position.quantity
 
     today = datetime.now(KST).date()
+    if order_guard.is_blocked(action.ticker):
+        logger.error("execute_sell_order_blocked ticker=%s reason=unconfirmed_previous_order", action.ticker)
+        return portfolio, None
     before = await asyncio.to_thread(kis.fetch_daily_fill_totals, action.ticker, today, "sell")
+    order_guard.begin(action.ticker, "sell", shares_to_sell, before)
 
     try:
         order_no = await asyncio.to_thread(kis.place_market_sell_order, action.ticker, shares_to_sell)
@@ -422,6 +426,7 @@ async def execute_sell_order(
         order_no = None
     else:
         if order_no is None:
+            order_guard.clear(action.ticker)
             logger.error("execute_sell_order_failed ticker=%s reason=order_rejected", action.ticker)
             return portfolio, None
 
@@ -431,11 +436,15 @@ async def execute_sell_order(
         kis.fill_after_order, action.ticker, today, "sell", before, shares_to_sell
     )
     if order_no is None and fill is None:
-        # 응답 유실 + 원장에 체결 흔적 없음 = 주문이 접수되지 않았다고 본다.
-        # 포지션을 그대로 두는 쪽이 안전하다 — 안 팔렸는데 판 걸로 기록하면
-        # 실제로는 남아 있는 주식이 리스크 관리에서 사라진다.
+        # 조회 실패/지연을 미접수로 단정하지 않는다. 표시를 남겨 다음 분 재주문도 막는다.
         logger.error("execute_sell_order_failed ticker=%s reason=order_response_lost", action.ticker)
+        notify.send_telegram_alert(notify.format_error_alert(
+            "매도 주문 확인 필요 — 해당 종목 추가 주문 차단", f"ticker={action.ticker}; 원장·보유 수량 대조 필요"
+        ))
         return portfolio, None
+
+    if order_no is None and fill is not None and not fill.complete:
+        shares_to_sell = fill.quantity
 
     if fill is None:
         logger.warning(
@@ -464,10 +473,14 @@ async def execute_sell_order(
         p.model_copy(update={"quantity": position.quantity - shares_to_sell}) if p.ticker == action.ticker else p
         for p in updated_portfolio.positions
     ]
-    return (
-        PortfolioState(
-            positions=updated_positions,
-            cash_weight=updated_portfolio.cash_weight,
-        ),
-        fill,
+    updated = PortfolioState(
+        positions=updated_positions,
+        cash_weight=updated_portfolio.cash_weight,
     )
+    if fill is not None and fill.complete:
+        order_guard.mark_settled(action.ticker, updated)
+    else:
+        notify.send_telegram_alert(notify.format_error_alert(
+            "매도 체결 확인 미완료 — 원장 대조까지 추가 주문 차단", f"ticker={action.ticker}"
+        ))
+    return updated, fill

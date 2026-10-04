@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import kis, notify, reconcile  # noqa: E402
+from src import kis, notify, order_guard, reconcile  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.pipeline import _kst_today  # noqa: E402
 from src.portfolio_store import load_portfolio, portfolio_lock, save_portfolio  # noqa: E402
@@ -58,6 +58,12 @@ def main() -> int:
 
     with portfolio_lock():
         portfolio = load_portfolio()
+        uncertain = order_guard.load_orders()
+        if uncertain:
+            detail = ", ".join(f"{t} {o.side} {o.quantity}주 ({o.created_at.date()})" for t, o in uncertain.items())
+            print(f"주문 확인 미완료 — 원장·장부 대조 후 수동 해제 필요: {detail}")
+            if ALERT:
+                notify.send_telegram_alert(notify.format_error_alert("미확인 주문으로 추가 주문 차단 중", detail))
         corrected, drifts = reconcile.reconcile(portfolio, holdings)
 
         print(f"보유 포지션 {len(portfolio.positions)}개, 브로커 보유 종목 {len(holdings)}개\n")

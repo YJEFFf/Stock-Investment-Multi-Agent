@@ -18,7 +18,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-from src import collectors, kis, notify, translate
+from src import collectors, kis, notify, run_history, translate
 from src.schemas import PortfolioState
 
 load_dotenv()
@@ -534,6 +534,8 @@ def _trigger_explanation(entry: dict) -> str | None:
     있었고, "왜 팔렸나"는 속성의 숫자들로 독자가 직접 역산해야 했다. 매매일지는
     사람이 읽으라고 쓰는 것이므로 그 역산을 여기서 대신 해준다.
     """
+    if entry.get("aggregation") == "broker_daily":
+        return entry.get("correction_note")
     entry_price, exit_price = entry.get("entry_price"), entry.get("exit_price")
     plan = entry.get("exit_plan") or {}
     reason = entry.get("reason")
@@ -1032,9 +1034,17 @@ async def _daily_report_children(
     codex_capacity: dict | None = None,
 ) -> list[dict]:
     blocks = [_heading("오늘의 판단 요약", level=2)]
+    runs = [r for r in run_history.load_runs() if r.day == day]
+    actual_run = runs[-1] if runs else None
+    if actual_run is not None:
+        label = {"completed": "정상 실행 완료", "degraded": "일부 입력·호출 장애",
+                 "failed": "실행 실패", "skipped": "실행 생략"}.get(actual_run.status, "완료 확인 안 됨")
+        blocks.append(_paragraph(f"{label} · 후보 {actual_run.candidates}개 · 판단 {actual_run.decisions}개 · "
+                                 f"발행 매수 {actual_run.pending}개" +
+                                 (f" · 사유: {actual_run.reason}" if actual_run.reason else "")))
     if codex_capacity and codex_capacity.get("day") == day:
         if codex_capacity.get("buy_judgment_allowed"):
-            result = "매수 판단 진행"
+            result = "한도 점검 통과"
         elif codex_capacity.get("ordinary_usage_allowed") is False:
             result = "백엔드 일반 사용 불허로 신규 매수 판단 중지"
         else:
@@ -1075,6 +1085,9 @@ async def _daily_report_children(
                 )
         else:
             blocks.append(_paragraph("오늘은 승인된 매수 없음."))
+    elif actual_run is not None:
+        blocks.append(_paragraph("정량 필터 통과 종목 없음 — 정상 관망." if actual_run.status == "completed" and actual_run.candidates == 0
+                                 else "판단 결과 없음. 위 실행 상태를 확인하세요."))
     else:
         blocks.append(_paragraph("오늘은 판단 로그가 없다 — 휴장일이었거나 유니버스 수집에 실패했을 수 있다."))
 

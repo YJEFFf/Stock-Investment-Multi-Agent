@@ -75,8 +75,10 @@ def format_ic_alert(day: str, segments: dict) -> str:
     """
     lines = [f"📐 [SIMA] 신호 IC ({day})"]
     for name, seg in segments.items():
-        label = "전체" if seg["since"] is None else f"{seg['since']} 이후"
+        label = seg.get("label") or ("전체" if seg["since"] is None else f"{seg['since']} 이후")
         lines.append(f"— {label} (판단 {seg['decisions']}건)")
+        if "normal_days" in seg:
+            lines.append(f"  정상 분석일 {seg['normal_days']}/60일 (장애·부분 실행 제외)")
         for k, s in sorted(seg["horizons"].items(), key=lambda kv: int(kv[0])):
             if s["mean_ic"] is None:
                 lines.append(f"  k={k}: 측정 가능한 날 없음")
@@ -86,7 +88,7 @@ def format_ic_alert(day: str, segments: dict) -> str:
         rho = next((s["rho_score_momentum_20d"] for s in seg["horizons"].values()), None)
         if rho is not None:
             lines.append(f"  ρ(점수, 직전20일수익률) {rho:+.2f}")
-    lines.append("판단에 되먹이지 않음 · 60거래일 후 실거래 판단(IC≥0.03, t≥2)")
+    lines.append("판단에 되먹이지 않음 · 정상 표본 60거래일 뒤 재평가 · t는 중첩 수익률 자기상관 미조정")
     return "\n".join(lines)
 
 

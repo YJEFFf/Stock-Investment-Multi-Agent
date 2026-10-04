@@ -20,6 +20,43 @@ import scripts.decide_buys as db
 from src.schemas import AnalystOpinion, Decision, GateResult, PortfolioState
 
 
+def test_duplicate_completed_analysis_keeps_existing_pending(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+    calls = []
+    async def fake_run(*a, **k):
+        db.run_history.claim_analysis()
+        calls.append(1)
+        return a[1], []
+    monkeypatch.setattr(db.pipeline, "run_daily", fake_run)
+    asyncio.run(db.main())
+    before = db.PENDING_BUYS_PATH.read_bytes()
+    asyncio.run(db.main())
+    assert calls == [1]
+    assert db.PENDING_BUYS_PATH.read_bytes() == before
+    assert db.run_history.load_runs()[-1].status == "completed"
+
+
+def test_collection_failure_is_failed_and_can_retry_data_only(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+    calls, alerts = [], []
+    async def fake_run(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise db.DataCollectionUnavailable("universe_fetch_failed")
+        db.run_history.claim_analysis()
+        return a[1], []
+    monkeypatch.setattr(db.pipeline, "run_daily", fake_run)
+    monkeypatch.setattr(db.notify, "send_telegram_alert", lambda m: alerts.append(m))
+    asyncio.run(db.main())
+    assert json.loads(db.PENDING_BUYS_PATH.read_text())["skipped"] == "universe_fetch_failed"
+    assert db.run_history.load_runs()[-1].status == "failed"
+    assert all("매수 판단 완료" not in m for m in alerts)
+    asyncio.run(db.main())
+    assert len(calls) == 2 and db.run_history.load_runs()[-1].status == "completed"
+
+
 @pytest.fixture(autouse=True)
 def _no_real_notify_or_name_lookup(monkeypatch):
     # main()이 이제 판단 결과 요약(0건 포함)을 텔레그램으로 보낸다 — 목킹 안 하면

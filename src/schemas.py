@@ -4,6 +4,60 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class DataCollectionUnavailable(RuntimeError):
+    """분석을 시작할 수 없는 수집 실패. 정상 관망과 구분해 상위 실행기에 전파한다."""
+
+
+class DataSourceObservation(BaseModel):
+    ticker: str
+    source: str
+    status: Literal["ok", "empty", "failed"]
+    count: int | None = None
+    latest: str | None = None
+    required: bool = True
+
+
+class DailyRunRecord(BaseModel):
+    run_id: str
+    day: str
+    started_at: datetime
+    ended_at: datetime | None = None
+    elapsed_seconds: float | None = None
+    deadline_margin_seconds: float | None = None
+    git_commit: str
+    provider: str
+    model: str
+    cohort: str = "kis_master_naver_json_20261005"
+    status: Literal["started", "collecting", "analysis_started", "completed", "degraded", "failed", "skipped"] = "started"
+    reason: str | None = None
+    analysis_started: bool = False
+    universe: int = 0
+    candidates: int = 0
+    collection_failed: int = 0
+    index_unavailable: bool = False
+    decisions: int = 0
+    hold: int = 0
+    buy: int = 0
+    degraded_decisions: int = 0
+    unavailable_decisions: int = 0
+    gate_rejected: dict[str, int] = Field(default_factory=dict)
+    pending: int = 0
+    provider_attempted: int = 0
+    provider_failed: int = 0
+    analyst_failed: int = 0
+    sources: list[DataSourceObservation] = Field(default_factory=list)
+
+
+class UnconfirmedOrder(BaseModel):
+    ticker: str
+    side: Literal["buy", "sell"]
+    quantity: int = Field(gt=0)
+    created_at: datetime
+    fills_before: tuple[int, float, float | None] | tuple[int, float] | None = None
+    ready_to_commit: bool = False
+    expected_position: dict | None = None
+
+
 class OHLCVBar(BaseModel):
     date: date
     open: float

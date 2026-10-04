@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from src.pipeline import load_decision_entries, summarize_llm_calls, summarize_recent_trading_days
 
@@ -29,7 +29,7 @@ def test_summarize_recent_trading_days_only_counts_the_window(tmp_path):
         ],
     )
 
-    summary = summarize_recent_trading_days(log_path, n_days=2)
+    summary = summarize_recent_trading_days(log_path, n_days=2, as_of=date(2026, 8, 6))
 
     assert summary["total_days"] == 2
     assert summary["signal_days"] == 0
@@ -43,15 +43,17 @@ def test_summarize_recent_trading_days_handles_fewer_days_than_window(tmp_path):
         [{"day": "2026-08-06", "ticker": "AAA", "action": "BUY", "approved": True, "rejected_by": None}],
     )
 
-    summary = summarize_recent_trading_days(log_path, n_days=20)
+    summary = summarize_recent_trading_days(log_path, n_days=20, as_of=date(2026, 8, 12))
 
-    assert summary["total_days"] == 1
-    assert summary["signal_day_ratio"] == 1.0
+    assert summary["total_days"] == 20
+    assert summary["decision_days"] == 1
+    assert summary["signal_day_ratio"] == 0.05
 
 
 def test_summarize_recent_trading_days_missing_file_returns_empty(tmp_path):
     summary = summarize_recent_trading_days(tmp_path / "does_not_exist.jsonl", n_days=20)
-    assert summary["total_days"] == 0
+    assert summary["total_days"] == 20
+    assert summary["days_without_decision_log"] == 20
     assert summary["signal_day_ratio"] == 0.0
 
 
@@ -182,7 +184,7 @@ def test_rejected_by_counts_are_not_double_counted_on_duplicate_runs(tmp_path):
     }
     _write_jsonl(log_path, [entry, dict(entry)])
 
-    summary = summarize_recent_trading_days(log_path, n_days=20)
+    summary = summarize_recent_trading_days(log_path, n_days=20, as_of=date(2026, 8, 12))
 
     assert summary["rejected_by_counts"] == {"position_limit": 1}
 

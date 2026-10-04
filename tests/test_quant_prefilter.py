@@ -1,4 +1,5 @@
 import asyncio
+import pytest
 import json
 from datetime import date, datetime, timezone
 
@@ -216,7 +217,7 @@ def test_run_daily_composes_universe_filter_and_run_day(monkeypatch, tmp_path):
     assert results[0][0].ticker == "005930"
 
 
-def test_run_daily_returns_empty_when_universe_unavailable(monkeypatch, tmp_path):
+def test_run_daily_raises_when_universe_unavailable(monkeypatch, tmp_path):
     async def fake_build_universe():
         return None
 
@@ -227,7 +228,8 @@ def test_run_daily_returns_empty_when_universe_unavailable(monkeypatch, tmp_path
 
     day = datetime(2026, 1, 5, tzinfo=timezone.utc)
     portfolio_in = PortfolioState()
-    portfolio_out, results = asyncio.run(
+    with pytest.raises(pipeline.DataCollectionUnavailable, match="universe_fetch_failed"):
+        asyncio.run(
         pipeline.run_daily(
             day,
             portfolio_in,
@@ -238,12 +240,6 @@ def test_run_daily_returns_empty_when_universe_unavailable(monkeypatch, tmp_path
             log_path=tmp_path / "log.jsonl",
         )
     )
-
-    assert results == []
-    assert portfolio_out == portfolio_in
-
-
-# --- 통과 사유 기록 (2026-09-14 모멘텀 편향 가설의 판정 자료) ---
 
 
 def test_filter_reasons_name_which_condition_let_a_ticker_through():

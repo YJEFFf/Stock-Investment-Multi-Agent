@@ -1,7 +1,7 @@
 import io
 import json
 import zipfile
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import pytest
 import requests
@@ -161,58 +161,53 @@ def test_parse_kospi200_constituent_page_extracts_code_and_name():
     assert items == [("005930", "삼성전자"), ("000660", "SK하이닉스")]
 
 
-def test_fetch_kospi200_universe_paginates_and_dedupes(monkeypatch):
-    monkeypatch.setattr(collectors, "KOSPI200_CONSTITUENT_PAGES", 2)
+def _master_row(code, name, sector):
+    prefix = code.encode().ljust(9) + b"KR7000000000" + name.encode("cp949").ljust(40)
+    suffix = bytearray(b" " * 227)
+    suffix[:2] = b"ST"
+    suffix[18] = ord(sector)
+    return prefix + suffix
 
-    class FakeResponse:
-        def __init__(self, text):
-            self.text = text
 
+def _master_zip(rows, age=0):
+    generated = datetime.now(collectors.ZoneInfo("Asia/Seoul")) - timedelta(days=age)
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as z:
+        info = zipfile.ZipInfo("kospi_code.mst", generated.timetuple()[:6])
+        z.writestr(info, b"\n".join(rows) + b"\n")
+    return out.getvalue()
+
+
+def test_fetch_kospi200_universe_reads_all_members_including_letter_sectors(monkeypatch):
+    class Response:
+        content = _master_zip([_master_row("005930", "삼성전자", "5"),
+                               _master_row("000020", "비편입", "0"),
+                               _master_row("0126Z0", "삼성에피스홀딩스", "A")])
         def raise_for_status(self):
             pass
-
-    # 페이지 1엔 종목 2개, 페이지 2엔 그중 하나가 다시 나온다(중복 제거 확인용).
-    responses = [
-        FakeResponse(FAKE_KOSPI200_PAGE_HTML),
-        FakeResponse(
-            '<table><tr><td class="ctg"><a href="/item/main.naver?code=005930" '
-            'target="_parent">삼성전자</a></td></tr></table>'
-        ),
-    ]
-
-    def fake_get(*args, **kwargs):
-        return responses.pop(0)
-
-    monkeypatch.setattr(collectors.requests, "get", fake_get)
-
-    universe = collectors.fetch_kospi200_universe()
-
-    assert universe == [("005930", "삼성전자"), ("000660", "SK하이닉스")]
+    calls = []
+    monkeypatch.setattr(collectors.requests, "get", lambda url, **kw: (calls.append(url), Response())[1])
+    assert collectors.fetch_kospi200_universe() == [("005930", "삼성전자"), ("0126Z0", "삼성에피스홀딩스")]
+    assert calls == [collectors.KIS_KOSPI_MASTER_URL]
 
 
-def test_fetch_kospi200_universe_returns_none_if_any_page_fails(monkeypatch):
-    monkeypatch.setattr(collectors, "KOSPI200_CONSTITUENT_PAGES", 2)
+@pytest.mark.parametrize("rows,age", [
+    ([], 0), ([_master_row("000020", "비편입", "0")], 0),
+    ([_master_row("005930", "삼성전자", "5")[:-1]], 0),
+    ([_master_row("005930", "삼성전자", "X")], 0),
+    ([_master_row("005930", "삼성전자", "5")] * 2, 0),
+    ([_master_row("005930", "삼성전자", "5")], 8),
+    ([_master_row("005930", "삼성전자", "5")], -1),
+])
+def test_master_rejects_empty_corrupt_duplicate_or_stale_input(rows, age):
+    with pytest.raises(ValueError):
+        collectors._parse_kospi_master(_master_zip(rows, age))
+
+
+def test_fetch_kospi200_universe_returns_none_on_download_failure(monkeypatch):
     monkeypatch.setattr(collectors.time, "sleep", lambda *_: None)
-
-    class FakeResponse:
-        text = FAKE_KOSPI200_PAGE_HTML
-
-        def raise_for_status(self):
-            pass
-
-    calls = {"n": 0}
-
-    def fake_get(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] <= collectors.MAX_RETRIES:  # 페이지 1은 계속 실패
-            raise requests.ConnectionError("down")
-        return FakeResponse()
-
-    monkeypatch.setattr(collectors.requests, "get", fake_get)
-
-    universe = collectors.fetch_kospi200_universe()
-
-    assert universe is None  # 페이지 하나라도 실패하면 전체 실패
+    monkeypatch.setattr(collectors.requests, "get", lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError("down")))
+    assert collectors.fetch_kospi200_universe() is None
 
 
 FAKE_SECTOR_GROUP_LIST_HTML = """
@@ -358,19 +353,8 @@ def _isolate_ticker_name_cache(tmp_path, monkeypatch):
 
 
 def test_fetch_kospi200_ticker_names_builds_map_from_universe(monkeypatch):
-    monkeypatch.setattr(collectors, "KOSPI200_CONSTITUENT_PAGES", 1)
-
-    class FakeResponse:
-        text = FAKE_KOSPI200_PAGE_HTML
-
-        def raise_for_status(self):
-            pass
-
-    monkeypatch.setattr(collectors.requests, "get", lambda *a, **k: FakeResponse())
-
-    ticker_names = collectors.fetch_kospi200_ticker_names()
-
-    assert ticker_names == {"005930": "삼성전자", "000660": "SK하이닉스"}
+    monkeypatch.setattr(collectors, "fetch_kospi200_universe", lambda: [("005930", "삼성전자"), ("000660", "SK하이닉스")])
+    assert collectors.fetch_kospi200_ticker_names() == {"005930": "삼성전자", "000660": "SK하이닉스"}
 
 
 def test_fetch_kospi200_ticker_names_uses_fresh_cache_without_network_call(monkeypatch):
@@ -471,31 +455,24 @@ def test_parse_sector_news_filters_by_keyword():
     assert all("반도체" in item.title for item in items)
 
 
-def test_fetch_company_news_sends_referer_header(monkeypatch):
-    captured = {}
-
-    class FakeResponse:
-        text = FAKE_COMPANY_NEWS_HTML
-
+def test_fetch_company_news_uses_json_source_and_kst(monkeypatch):
+    calls = []
+    class Response:
+        text = json.dumps([{"items": [{"title": "테스트 뉴스 제목", "officeName": "테스트언론사",
+            "datetime": "202601051030", "mobileNewsUrl": "https://n.news.naver.com/mnews/article/001/123"}]}])
         def raise_for_status(self):
             pass
-
-    def fake_get(url, params=None, headers=None, timeout=None):
-        captured["headers"] = headers
-        return FakeResponse()
-
-    monkeypatch.setattr(collectors.requests, "get", fake_get)
-
+    monkeypatch.setattr(collectors.requests, "get", lambda url, **kw: (calls.append(url), Response())[1])
     items = collectors.fetch_company_news("005930")
-
-    assert items is not None
-    assert len(items) == 2
-    assert captured["headers"]["Referer"] == "https://finance.naver.com/item/news.naver?code=005930"
+    assert len(items) == 1
+    assert items[0].title == "테스트 뉴스 제목"
+    assert items[0].published_at.utcoffset() == timedelta(hours=9)
+    assert calls == [collectors.NAVER_STOCK_NEWS_API_URL.format(ticker="005930")]
 
 
 def test_fetch_company_news_no_articles_returns_empty_list_not_none(monkeypatch):
     class FakeResponse:
-        text = FAKE_COMPANY_NEWS_EMPTY_HTML
+        text = "[]"
 
         def raise_for_status(self):
             pass

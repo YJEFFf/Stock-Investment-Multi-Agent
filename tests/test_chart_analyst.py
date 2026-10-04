@@ -36,7 +36,8 @@ def test_chart_analyst_builds_opinion_with_prompt_version(monkeypatch):
     assert opinion.ticker == "005930"
     assert opinion.score == 0.5
     assert opinion.confidence == 0.8
-    assert opinion.evidence == [f"prompt:chart@{expected_version}"]
+    assert opinion.evidence[0] == f"prompt:chart@{expected_version}"
+    assert opinion.evidence[1].startswith("kis:daily_ohlcv:" + context.ticker + ":")
     assert opinion.as_of == context.as_of
 
 
