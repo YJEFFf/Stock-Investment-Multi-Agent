@@ -29,7 +29,8 @@ class Store:
                 CREATE TABLE IF NOT EXISTS subscriptions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT UNIQUE NOT NULL,
                     endpoint TEXT UNIQUE NOT NULL, info TEXT NOT NULL, created REAL NOT NULL,
-                    active INTEGER NOT NULL DEFAULT 1, last_status TEXT);
+                    active INTEGER NOT NULL DEFAULT 1, last_status TEXT,
+                    generation INTEGER NOT NULL DEFAULT 1);
                 CREATE TABLE IF NOT EXISTS alerts (id TEXT PRIMARY KEY, created REAL NOT NULL, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS deliveries (
                     alert TEXT NOT NULL, subscription INTEGER NOT NULL,
@@ -39,6 +40,9 @@ class Store:
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS rate_limits (key TEXT PRIMARY KEY, window REAL NOT NULL, count INTEGER NOT NULL);
             """)
+            db.execute("BEGIN IMMEDIATE")
+            if "generation" not in {r["name"] for r in db.execute("PRAGMA table_info(subscriptions)")}:
+                db.execute("ALTER TABLE subscriptions ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
         path.chmod(0o600)
 
     @contextmanager
@@ -96,7 +100,7 @@ class Store:
     def logout(self, session: str):
         with self.connect() as db:
             db.execute("DELETE FROM sessions WHERE hash=?", (session,))
-            db.execute("UPDATE subscriptions SET active=0 WHERE session=?", (session,))
+            db.execute("UPDATE subscriptions SET active=0,generation=generation+1 WHERE session=?", (session,))
             db.execute("UPDATE deliveries SET state='cancelled' WHERE state='pending' AND subscription IN (SELECT id FROM subscriptions WHERE session=?)", (session,))
 
     def subscribe(self, session: str, info: dict):
@@ -110,21 +114,22 @@ class Store:
                 # iOS는 로그인 세션이 만료돼도 기존 push endpoint를 유지한다.
                 db.execute("UPDATE deliveries SET state='cancelled' WHERE state='pending' AND subscription IN (SELECT id FROM subscriptions WHERE session=? OR id=?)", (session, owner["id"]))
                 db.execute("DELETE FROM subscriptions WHERE session=?", (session,))
-                db.execute("UPDATE subscriptions SET session=?,info=?,created=?,active=1,last_status=NULL WHERE id=?",
+                db.execute("UPDATE subscriptions SET session=?,info=?,created=?,active=1,last_status=NULL,generation=generation+1 WHERE id=?",
                            (session, json.dumps(info), time.time(), owner["id"]))
                 return
-            existing = db.execute("SELECT endpoint FROM subscriptions WHERE session=?", (session,)).fetchone()
-            if existing and existing["endpoint"] != info["endpoint"]:
+            existing = db.execute("SELECT endpoint,info FROM subscriptions WHERE session=?", (session,)).fetchone()
+            if existing and existing["info"] != json.dumps(info):
                 db.execute("UPDATE deliveries SET state='cancelled' WHERE state='pending' AND subscription IN (SELECT id FROM subscriptions WHERE session=?)", (session,))
             db.execute("""INSERT INTO subscriptions (session,endpoint,info,created) VALUES (?,?,?,?)
                         ON CONFLICT(session) DO UPDATE SET
+                        generation=CASE WHEN subscriptions.active=0 OR subscriptions.info<>excluded.info THEN subscriptions.generation+1 ELSE subscriptions.generation END,
                         created=CASE WHEN subscriptions.active=0 OR subscriptions.endpoint<>excluded.endpoint THEN excluded.created ELSE subscriptions.created END,
                         endpoint=excluded.endpoint,info=excluded.info,
                         active=1,last_status=NULL""", (session, info["endpoint"], json.dumps(info), time.time()))
 
     def unsubscribe(self, session: str):
         with self.connect() as db:
-            db.execute("UPDATE subscriptions SET active=0 WHERE session=?", (session,))
+            db.execute("UPDATE subscriptions SET active=0,generation=generation+1 WHERE session=?", (session,))
             db.execute("UPDATE deliveries SET state='cancelled' WHERE state='pending' AND subscription IN (SELECT id FROM subscriptions WHERE session=?)", (session,))
 
     def subscription_status(self, session: str) -> dict:
@@ -154,11 +159,22 @@ class Store:
 
     def pending(self) -> list[dict]:
         with self.connect() as db:
-            return [dict(r) for r in db.execute("""SELECT d.*,p.info,a.payload,a.created FROM deliveries d
+            return [dict(r) for r in db.execute("""SELECT d.*,p.info,p.generation,p.session AS owner_session,a.payload,a.created FROM deliveries d
                 JOIN subscriptions p ON p.id=d.subscription JOIN alerts a ON a.id=d.alert
                 JOIN sessions s ON s.hash=p.session
                 WHERE d.state='pending' AND d.due<=? AND p.active=1 AND s.expires>?
                 ORDER BY d.due LIMIT 30""", (time.time(), time.time()))]
+
+    def _current_delivery(self, db, item: dict) -> bool:
+        return bool(db.execute("""SELECT 1 FROM deliveries d
+            JOIN subscriptions p ON p.id=d.subscription JOIN sessions s ON s.hash=p.session
+            WHERE d.alert=? AND d.subscription=? AND d.state='pending' AND p.active=1
+            AND p.generation=? AND p.session=? AND s.expires>?""",
+            (item["alert"], item["subscription"], item["generation"], item["owner_session"], time.time())).fetchone())
+
+    def delivery_is_current(self, item: dict) -> bool:
+        with self.connect() as db:
+            return self._current_delivery(db, item)
 
     def delivery_result(self, delivery: dict, *, code: int | None):
         attempts = delivery["attempts"] + 1
@@ -168,11 +184,14 @@ class Store:
         state = "sent" if sent else "failed" if terminal else "pending"
         status = "accepted" if sent else "expired" if expired else f"http_{code}" if code else "network_error"
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not self._current_delivery(db, delivery):
+                return  # 이전 구독의 응답으로 새 구독이나 취소한 발송을 변경하지 않는다.
             db.execute("UPDATE deliveries SET state=?,attempts=?,due=?,status=? WHERE alert=? AND subscription=?",
                        (state, attempts, time.time() + min(3600, 15 * 2 ** attempts), status, delivery["alert"], delivery["subscription"]))
             db.execute("UPDATE subscriptions SET last_status=? WHERE id=?", (status, delivery["subscription"]))
             if expired:
-                db.execute("UPDATE subscriptions SET active=0 WHERE id=?", (delivery["subscription"],))
+                db.execute("UPDATE subscriptions SET active=0,generation=generation+1 WHERE id=?", (delivery["subscription"],))
                 db.execute("UPDATE deliveries SET state='cancelled' WHERE state='pending' AND subscription=?", (delivery["subscription"],))
 
     def set_meta(self, key: str, value: str):

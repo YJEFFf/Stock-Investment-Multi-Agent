@@ -57,6 +57,8 @@ def import_outbox(store: Store, path: Path) -> int:
 def send_pending(store: Store, private_key: Path, origin: str) -> int:
     delivered = 0
     for item in store.pending():
+        if not store.delivery_is_current(item):
+            continue
         code = None
         if time.time() - item["created"] > 86400:
             store.delivery_result(item, code=None)

@@ -266,6 +266,34 @@ def test_private_fields_never_appear_in_snapshot(tmp_path):
     assert "secret" not in result and "private" not in result
 
 
+def test_logout_during_push_stops_the_remaining_batch(tmp_path, monkeypatch):
+    store, session = configured_store(tmp_path)
+    store.add_alert(app_notifications.make_alert("[SIMA] 알림 1"))
+    store.add_alert(app_notifications.make_alert("[SIMA] 알림 2"))
+    sent = []
+    def send(**kwargs):
+        sent.append(kwargs)
+        store.logout(session)
+        return SimpleNamespace(status_code=201)
+    monkeypatch.setattr(mobile_push, "webpush", send)
+    mobile_push.send_pending(store, tmp_path / "key.pem", ORIGIN)
+    assert len(sent) == 1
+    assert not store.subscription_status(session)["enabled"]
+
+
+def test_old_push_expiration_cannot_disable_a_new_subscription(tmp_path, monkeypatch):
+    store, session = configured_store(tmp_path)
+    store.add_alert(app_notifications.make_alert("[SIMA] 알림"))
+    def send(**kwargs):
+        store.subscribe(session, valid_subscription(subscription("https://web.push.apple.com/Qnew")))
+        return SimpleNamespace(status_code=410)
+    monkeypatch.setattr(mobile_push, "webpush", send)
+    mobile_push.send_pending(store, tmp_path / "key.pem", ORIGIN)
+    assert store.subscription_status(session)["enabled"]
+    store.add_alert(app_notifications.make_alert("[SIMA] 새 구독 알림"))
+    assert json.loads(store.pending()[0]["info"])["endpoint"].endswith("Qnew")
+
+
 def test_holiday_status_does_not_require_a_fake_analysis_record(tmp_path):
     result = snapshot(tmp_path, now=datetime(2026,10,5,16,0,tzinfo=KST))
     assert result.operation["status"] == "holiday"
