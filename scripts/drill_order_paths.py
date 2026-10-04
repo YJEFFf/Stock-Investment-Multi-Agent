@@ -102,7 +102,7 @@ class FakeBroker:
         qty = int(body["ORD_QTY"])
         if self.order_behavior == "reject":
             return _Resp(BUSINESS_REJECT)
-        if self.order_behavior in ("accept", "lost_filled"):
+        if self.order_behavior in ("accept", "lost_filled", "missing_order_number", "missing_result"):
             f = self.fills[side]
             f[0] += qty
             f[1] += qty * PRICE
@@ -110,6 +110,10 @@ class FakeBroker:
             self.held_qty += qty if side == "buy" else -qty
         if self.order_behavior.startswith("lost"):
             raise requests.ConnectionError("Read timed out (drill)")
+        if self.order_behavior == "missing_order_number":
+            return _Resp({"rt_cd": "0", "output": {}})
+        if self.order_behavior == "missing_result":
+            return _Resp({"output": {"ODNO": "0000123"}})
         return _Resp({"rt_cd": "0", "output": {"ODNO": "0000123"}})
 
 
@@ -265,6 +269,19 @@ def s_sell_response_lost_no_fill() -> Outcome:
     return Outcome("매도 응답 유실 + 체결 없음", "안 팔렸는데 판 걸로 두면 실제 보유가 손절 대상에서 사라진다", ok, f"주문 POST {_order_posts(b)}회, 남은 포지션 {len(portfolio.positions)}")
 
 
+def s_order_number_missing_after_acceptance() -> Outcome:
+    b = FakeBroker(order_behavior="missing_order_number")
+    with _wired(b) as (tmp, _):
+        state = PortfolioState()
+        args = (_decision(), GateResult(approved=True, rejected_by=None), state, "반도체", .08)
+        first = asyncio.run(pipeline.execute_buy_order(*args, log_path=tmp / "journal.jsonl"))
+        # 장부 저장 전 이전 상태로 새 회차가 들어와도 주문을 반복하지 않는다.
+        asyncio.run(pipeline.execute_buy_order(*args, log_path=tmp / "journal.jsonl"))
+        ok = _order_posts(b) == 1 and first.positions[0].quantity == b.held_qty and order_guard.is_blocked(TICKER)
+        return Outcome("접수 성공 응답에 주문번호 없음 + 다음 회차", "주문번호 부재는 명시적 거부가 아니다", ok,
+                       f"주문 POST {_order_posts(b)}회, 브로커 {b.held_qty}주, 확인 장부 {first.positions[0].quantity}주")
+
+
 def s_secondary_quote_active_stop_loss() -> Outcome:
     """KIS 시세 실패를 네이버가 복구한 뒤 운영 finalize/주문 경로까지 실제로 태운다."""
     b = FakeBroker(held_qty=30)
@@ -349,6 +366,7 @@ SCENARIOS = [
     s_pre_open_quote,
     s_sell_response_lost_but_filled,
     s_sell_response_lost_no_fill,
+    s_order_number_missing_after_acceptance,
     s_secondary_quote_active_stop_loss,
     s_gate_total_exposure,
     s_gate_position_limit,

@@ -296,6 +296,14 @@ def _kis_request(
                 time.sleep(policy.backoff_for(attempt))
             continue
 
+        if not isinstance(data, dict) or data.get("rt_cd") not in ("0", "1"):
+            if not idempotent:
+                raise OrderResponseLost("order response has no recognized result code")
+            last_error = "unexpected_response_schema"
+            if attempt < max_attempts:
+                time.sleep(policy.backoff_for(attempt))
+            continue
+
         if data.get("rt_cd") == "0":
             return data
 
@@ -561,6 +569,15 @@ def fetch_account_balance() -> float | None:
     return snapshot.total if snapshot is not None else None
 
 
+def _order_number(data: dict) -> str:
+    output = data.get("output")
+    order_no = output.get("ODNO") if isinstance(output, dict) else None
+    if not isinstance(order_no, str) or not order_no.isdigit() or int(order_no) <= 0:
+        # rt_cd=0은 접수 성공이다. 주문번호 누락을 거부로 취급하면 재주문하게 된다.
+        raise OrderResponseLost("accepted order has no valid order number")
+    return order_no
+
+
 def place_market_buy_order(ticker: str, quantity: int) -> str | None:
     """모의투자 계좌로 시장가 매수 주문을 접수한다. 성공하면 주문번호(ODNO)를
     반환한다 — 주문 접수와 체결은 별개 이벤트라 체결가는 fetch_fill_price로
@@ -584,7 +601,7 @@ def place_market_buy_order(ticker: str, quantity: int) -> str | None:
     if data is None:
         return None
 
-    return (data.get("output") or {}).get("ODNO")
+    return _order_number(data)
 
 
 def place_market_sell_order(ticker: str, quantity: int) -> str | None:
@@ -611,7 +628,7 @@ def place_market_sell_order(ticker: str, quantity: int) -> str | None:
     if data is None:
         return None
 
-    return (data.get("output") or {}).get("ODNO")
+    return _order_number(data)
 
 
 SIDE_CODES = {"buy": "02", "sell": "01"}

@@ -64,3 +64,14 @@ def test_order_marker_corruption_fails_closed():
     order_guard.STATE_PATH.write_text('{"broken":')
     with pytest.raises(json.JSONDecodeError):
         order_guard.is_blocked(TICKER)
+
+
+@pytest.mark.parametrize("behavior", ["missing_order_number", "missing_result"])
+def test_malformed_acceptance_response_is_not_treated_as_rejection(behavior):
+    b = FakeBroker(order_behavior=behavior)
+    with _wired(b) as (tmp, _):
+        first = _buy(PortfolioState(), tmp / "journal.jsonl")
+        assert first.positions[0].quantity == b.held_qty
+        second = _buy(PortfolioState(), tmp / "journal.jsonl")
+        assert second.positions == [] and _order_posts(b) == 1
+        assert order_guard.is_blocked(TICKER)
