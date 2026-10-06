@@ -43,7 +43,9 @@ def serve():
     kis.TOKEN_CACHE_PATH = Path("/var/lib/sima-balance/token.json")
     destination = Path("/var/lib/sima-balance/account.json")
     socket_path = Path("/run/sima-balance/reader.sock")
-    policy = kis.RetryPolicy(timeout_seconds=4, max_attempts=2, backoff_seconds=(1,))
+    # 장중 잔고 응답은 4초를 넘기도 한다(2026-10-06 실측 4.57초).
+    # 개별 요청에 여유를 주되 재시도까지 합친 전체 20초 기한은 유지한다.
+    policy = kis.RetryPolicy(timeout_seconds=15, max_attempts=2, backoff_seconds=(1,))
     last_request = -float("inf")
 
     def deadline(*_):
