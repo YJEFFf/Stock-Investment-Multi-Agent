@@ -34,7 +34,13 @@
   EC2 `logs/ticker_names_20261007/name-cache-before.json`·`alerts-before.json`에 원본 백업.
 - 독립 리뷰 승인: `e9239146eccd76ad151633b4f079f609bc898c50`(별도 에이전트), 차단 지적 없음.
   같은 커밋의 주문 경로 드릴 **12/12 통과**. 후속 기록 커밋은 문서 변경뿐이다.
-- 운영 배포·앱 반영 결과는 완료 후 추가한다.
+- **04:06 KST 운영 반영 완료:** 문서 포함 `87c59bdad5dad25079c37720590534673d5d9124`도
+  독립 리뷰 승인받아 `SIMA_REVIEWED=87c59bd deploy/pull.sh`로 배포했다.
+  EC2 **713 passed, 5 skipped**. `deploy/install_pwa.sh`로 같은 커밋의 앱 릴리스 설치.
+  앱·push·잔고·Caddy 모두 active, 기존 기기 연결·푸시 키 유지.
+- 운영 `pipeline.display_name`·노션 `_display_name`·설치된 앱 매매내역 모두
+  `삼성에피스홀딩스`로 확인. 앱 알림 DB의 `0126Z0` 표기 0건. 포트폴리오·원본
+  매매일지·판단 로그 SHA-256 동일. 후속 커밋은 이 완료 기록만 포함한다.
 
 ## 2026-10-07 (매수 근거 한글 번역 복구·기존 노션 소급 번역)
 
