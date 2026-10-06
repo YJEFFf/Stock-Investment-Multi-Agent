@@ -15,7 +15,8 @@ class _Completed:
         self.stderr = stderr
 
 
-def test_structured_call_uses_chatgpt_login_and_strips_api_keys(monkeypatch, tmp_path):
+@pytest.mark.parametrize("timeout_s", [None, 30.0])
+def test_structured_call_uses_chatgpt_login_and_strips_api_keys(monkeypatch, tmp_path, timeout_s):
     calls = []
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
     monkeypatch.setenv("CODEX_API_KEY", "must-not-leak")
@@ -42,13 +43,20 @@ def test_structured_call_uses_chatgpt_login_and_strips_api_keys(monkeypatch, tmp
     log_path = tmp_path / "calls.jsonl"
 
     result = asyncio.run(
-        codex_plan.check_health(log_path=log_path)
+        codex_plan.check_health(log_path=log_path) if timeout_s is None else
+        codex_plan.call_structured(
+            system="Translate only", user="input", response_model=codex_plan.HealthResponse,
+            json_schema=codex_plan._HEALTH_SCHEMA, log_path=log_path, timeout_s=timeout_s,
+        )
     )
 
     assert result == codex_plan.HealthResponse(status="ok")
     assert calls[1][0][:6] == [
         "/usr/bin/sudo", "-n", "-H", "-u", "sima-codex", "/home/sima-codex/.local/bin/codex"
     ]
+    assert 0 < calls[2][1]["timeout"] <= (timeout_s or codex_plan.DEFAULT_TIMEOUT_S)
+    if timeout_s is not None:
+        assert calls[0][1]["timeout"] > calls[1][1]["timeout"] > calls[2][1]["timeout"]
     assert calls[2][0][-1] == "-"
     assert "Do not inspect files" in calls[2][1]["input"]
     entry = json.loads(log_path.read_text())
@@ -287,3 +295,36 @@ def test_tampered_capacity_state_cannot_authorize(tmp_path):
 
     with pytest.raises(codex_plan.CodexPlanUnavailable, match="state unavailable"):
         codex_plan.load_capacity_status("2026-09-15", path)
+
+
+def test_translation_timeout_includes_waiting_for_a_slot(monkeypatch):
+    semaphore = asyncio.Semaphore(0)
+    monkeypatch.setattr(codex_plan, "_CALL_SEMAPHORE", semaphore)
+    called = []
+    async def forbidden(**kwargs):
+        called.append(kwargs)
+    monkeypatch.setattr(codex_plan, "_call_structured", forbidden)
+    with pytest.raises(TimeoutError):
+        asyncio.run(codex_plan.call_structured(
+            system="translate", user="input", response_model=codex_plan.HealthResponse,
+            json_schema=codex_plan._HEALTH_SCHEMA, timeout_s=0.01,
+        ))
+    assert not called
+    assert semaphore.locked()
+
+
+def test_deadline_expired_during_login_does_not_start_inference(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(codex_plan.time, "monotonic", lambda: now[0])
+    calls = []
+    def fake(command, **kwargs):
+        calls.append(command)
+        now[0] += 16.0
+        if command[-2:] == ["login", "status"]:
+            return _Completed(stdout="Logged in using ChatGPT")
+        return _Completed()
+    monkeypatch.setattr(codex_plan.subprocess, "run", fake)
+    with pytest.raises(codex_plan.CodexPlanUnavailable, match="deadline exceeded"):
+        codex_plan._call_sync("translate", "input", codex_plan.HealthResponse,
+                              codex_plan._HEALTH_SCHEMA, codex_plan.DEFAULT_MODEL, 30.0)
+    assert len(calls) == 2

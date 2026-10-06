@@ -1,59 +1,65 @@
 import asyncio
 
 import pytest
+from pydantic import ValidationError
 
-from src import translate
-
-
-@pytest.fixture(autouse=True)
-def _claude_api_switched_on(monkeypatch):
-    """번역 경로 자체를 검증한다. 꺼진 상태는 맨 아래 테스트가 본다."""
-    monkeypatch.setattr(translate.llm, "CLAUDE_API_ENABLED", True)
+from src import llm, translate
 
 
-def test_to_korean_returns_none_and_empty_string_unchanged():
-    assert asyncio.run(translate.to_korean(None)) is None
-    assert asyncio.run(translate.to_korean("")) == ""
+def test_empty_and_korean_do_not_call_codex(monkeypatch):
+    async def forbidden(**kwargs):
+        raise AssertionError("unexpected call")
+    monkeypatch.setattr(translate.codex_plan, "call_structured", forbidden)
+    for text in (None, "", "수익성이 개선되어 매수합니다."):
+        assert asyncio.run(translate.to_korean(text)) == text
 
 
-def test_to_korean_returns_translated_text(monkeypatch):
-    captured = {}
+def test_translates_with_claude_disabled_and_reuses_cached_result(monkeypatch):
+    captured = []
+    monkeypatch.setattr(llm, "CLAUDE_API_ENABLED", False)
 
-    async def fake_call_structured(**kwargs):
-        captured.update(kwargs)
-        return translate._Translation(translated="번역된 문장")
-
-    monkeypatch.setattr(translate.llm, "call_structured", fake_call_structured)
-
-    result = asyncio.run(translate.to_korean("bullish momentum", label="translate_buy_reason"))
-
-    assert result == "번역된 문장"
-    assert captured["user"] == "bullish momentum"
-    assert captured["label"] == "translate_buy_reason"
-
-
-def test_to_korean_falls_back_to_original_text_on_failure(monkeypatch):
-    async def fake_call_structured(**kwargs):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(translate.llm, "call_structured", fake_call_structured)
-
-    result = asyncio.run(translate.to_korean("bullish momentum"))
-
-    assert result == "bullish momentum"
+    async def fake(**kwargs):
+        captured.append(kwargs)
+        return translate._Translation(translated="상승 모멘텀")
+    monkeypatch.setattr(translate.codex_plan, "call_structured", fake)
+    assert asyncio.run(translate.to_korean("bullish momentum", label="translate_buy_reason")) == "상승 모멘텀"
+    assert asyncio.run(translate.to_korean("bullish momentum", label="translate_daily_report_reason")) == "상승 모멘텀"
+    assert len(captured) == 1
+    assert captured[0]["user"] == "bullish momentum"
+    assert captured[0]["label"] == "translate_buy_reason"
+    assert captured[0]["timeout_s"] == 30
 
 
-def test_switched_off_returns_the_original_without_calling_claude(monkeypatch, caplog):
-    """스위치로 끈 것은 실패가 아니라 스택트레이스를 남기지 않는다(노션 일일 리포트가 사유
-    수십 개를 번역하려 들면 cron.log가 트레이스로 덮인다)."""
-    monkeypatch.setattr(translate.llm, "CLAUDE_API_ENABLED", False)
-
-    async def must_not_be_called(**kwargs):
-        raise AssertionError("스위치가 꺼졌는데 번역을 호출했다")
-
-    monkeypatch.setattr(translate.llm, "call_structured", must_not_be_called)
-
-    with caplog.at_level("INFO"):
+def test_failure_keeps_original_and_does_not_cache(monkeypatch):
+    calls = []
+    async def fake(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("unavailable")
+    monkeypatch.setattr(translate.codex_plan, "call_structured", fake)
+    for _ in range(2):
         assert asyncio.run(translate.to_korean("bullish momentum")) == "bullish momentum"
+    assert len(calls) == 2
+    assert not translate.DEFAULT_CACHE_DIR.exists()
 
-    assert not any(r.exc_info for r in caplog.records)
+
+def test_invalid_translation_is_rejected():
+    for text in ("", "   ", "still English"):
+        with pytest.raises(ValidationError):
+            translate._Translation(translated=text)
+
+
+def test_prompt_change_and_corrupt_cache_trigger_new_translation(monkeypatch, tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("first prompt")
+    monkeypatch.setattr(translate, "PROMPT_PATH", prompt)
+    calls = []
+    async def fake(**kwargs):
+        calls.append(kwargs)
+        return translate._Translation(translated="번역 결과")
+    monkeypatch.setattr(translate.codex_plan, "call_structured", fake)
+    asyncio.run(translate.to_korean("English reason"))
+    next(translate.DEFAULT_CACHE_DIR.glob("*.json")).write_text("partial")
+    asyncio.run(translate.to_korean("English reason"))
+    prompt.write_text("second prompt")
+    asyncio.run(translate.to_korean("English reason"))
+    assert len(calls) == 3

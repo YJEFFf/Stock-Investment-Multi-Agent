@@ -113,22 +113,22 @@ def _codex_command(*args: str) -> list[str]:
     return ["/usr/bin/sudo", "-n", "-H", "-u", CODEX_OS_USER, CODEX_EXECUTABLE, *args]
 
 
-def _run(command: list[str], *, env: dict[str, str], input_text: str | None = None, cwd: str | None = None):
+def _run(command: list[str], *, env: dict[str, str], input_text: str | None = None, cwd: str | None = None, timeout_s: float = DEFAULT_TIMEOUT_S):
     return subprocess.run(
         command,
         input=input_text,
         text=True,
         capture_output=True,
-        timeout=DEFAULT_TIMEOUT_S,
+        timeout=timeout_s,
         check=False,
         env=env,
         cwd=cwd,
     )
 
 
-def _ensure_chatgpt_login(env: dict[str, str]) -> None:
+def _ensure_chatgpt_login(env: dict[str, str], timeout_s: float = DEFAULT_TIMEOUT_S) -> None:
     try:
-        result = _run(_codex_command("login", "status"), env=env)
+        result = _run(_codex_command("login", "status"), env=env, timeout_s=timeout_s)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         raise CodexPlanUnavailable(f"Codex CLI unavailable: {exc}") from exc
     status = f"{result.stdout}\n{result.stderr}"
@@ -136,14 +136,14 @@ def _ensure_chatgpt_login(env: dict[str, str]) -> None:
         raise CodexPlanUnavailable("Codex CLI is not logged in using ChatGPT")
 
 
-def _ensure_filesystem_isolation(env: dict[str, str]) -> None:
+def _ensure_filesystem_isolation(env: dict[str, str], timeout_s: float = DEFAULT_TIMEOUT_S) -> None:
     """전용 계정이 운영 저장소를 탐색할 수 있으면 호출을 거부한다."""
     command = [
         "/usr/bin/sudo", "-n", "-u", CODEX_OS_USER,
         "/usr/bin/test", "!", "-x", str(PROJECT_ROOT),
     ]
     try:
-        result = _run(command, env=env)
+        result = _run(command, env=env, timeout_s=timeout_s)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         raise CodexPlanUnavailable(f"Codex isolation check unavailable: {exc}") from exc
     if result.returncode != 0:
@@ -322,10 +322,21 @@ def _call_sync(
     response_model: type[T],
     json_schema: dict[str, Any],
     model: str,
+    timeout_s: float | None = None,
 ) -> tuple[T, dict[str, int]]:
     env = _subscription_environment()
-    _ensure_filesystem_isolation(env)
-    _ensure_chatgpt_login(env)
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+
+    def remaining() -> float:
+        if deadline is None:
+            return DEFAULT_TIMEOUT_S
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise CodexPlanUnavailable("Codex call deadline exceeded")
+        return seconds
+
+    _ensure_filesystem_isolation(env, timeout_s=remaining())
+    _ensure_chatgpt_login(env, timeout_s=remaining())
     prompt = (
         "Do not inspect files, run commands, or use tools. The input below is complete. "
         "Return only the JSON object required by the supplied output schema.\n\n"
@@ -359,7 +370,7 @@ def _call_sync(
             "-",
         )
         try:
-            result = _run(command, env=env, input_text=prompt, cwd=tmp)
+            result = _run(command, env=env, input_text=prompt, cwd=tmp, timeout_s=remaining())
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
             raise CodexPlanUnavailable(f"Codex execution unavailable: {exc}") from exc
         if result.returncode != 0:
@@ -376,6 +387,7 @@ def _call_sync(
 async def _call_structured(
     *, system: str, user: str, response_model: type[T], json_schema: dict[str, Any],
     label: str, model: str, log_path: Path | None,
+    timeout_s: float | None = None,
 ) -> T:
     path = log_path or DEFAULT_CALL_LOG_PATH
     started = time.monotonic()
@@ -387,7 +399,7 @@ async def _call_structured(
         "model": model,
     }
     try:
-        result, usage = await asyncio.to_thread(_call_sync, system, user, response_model, json_schema, model)
+        result, usage = await asyncio.to_thread(_call_sync, system, user, response_model, json_schema, model, timeout_s)
     except asyncio.CancelledError:
         # asyncio.to_thread의 바깥 대기는 취소돼도 이미 시작한 subprocess 스레드는 끝까지
         # 돌 수 있다. 실제 usage는 회수할 수 없지만 호출/실패 자체를 감시에서 잃지 않는다.
@@ -430,6 +442,7 @@ async def call_structured(
     effort: str | None = None,
     label: str = "unknown",
     log_path: Path | None = None,
+    timeout_s: float | None = None,
 ) -> T:
     """기존 ``llm.call_structured``와 같은 형태로 매수 판단에서 쓰는 진입점.
 
@@ -440,7 +453,15 @@ async def call_structured(
     del max_tokens, effort
     if model != DEFAULT_MODEL:
         raise CodexPlanUnavailable(f"Unsupported Codex plan model: {model}")
-    async with _CALL_SEMAPHORE:
+    started = time.monotonic()
+    if timeout_s is None:
+        await _CALL_SEMAPHORE.acquire()
+    else:
+        await asyncio.wait_for(_CALL_SEMAPHORE.acquire(), timeout=timeout_s)
+    try:
+        remaining = None if timeout_s is None else timeout_s - (time.monotonic() - started)
+        if remaining is not None and remaining <= 0:
+            raise CodexPlanUnavailable("Codex call deadline exceeded while queued")
         return await _call_structured(
             system=system,
             user=user,
@@ -449,7 +470,10 @@ async def call_structured(
             label=label,
             model=model,
             log_path=log_path or DEFAULT_JUDGMENT_CALL_LOG_PATH,
+            timeout_s=remaining,
         )
+    finally:
+        _CALL_SEMAPHORE.release()
 
 
 async def check_health(*, log_path: Path | None = None) -> HealthResponse:
