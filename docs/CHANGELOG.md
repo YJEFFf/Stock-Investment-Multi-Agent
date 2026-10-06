@@ -52,7 +52,13 @@
   남겨 둔다(토큰만 서버·로컬에서 삭제). 주문 경로 드릴 `c651230` 기준 **12/12 통과**
   (`docs/drills/2026-10-06-order-paths.md`). 이 드릴은 알림 함수를 목으로 바꾸므로 바뀐 알림
   경로 자체의 증거는 아니다 — 그쪽은 위 단위 테스트가 맡는다.
-- 배포 뒤 할 일: EC2 `.env`의 `SIMA_TELEGRAM_ENABLED` 줄 삭제(코드가 더 이상 읽지 않음).
+- **17:53 KST `SIMA_REVIEWED=cd96382 deploy/pull.sh`로 운영 배포.** EC2 **698 passed, 5 skipped**,
+  crontab은 주석 2줄 차이로 재적용돼 원본과 일치한다. 실행 중인 매매 잡은 없었다.
+  **17:53:49** EC2 `.env`에서 더 이상 읽지 않는 `SIMA_TELEGRAM_ENABLED` 줄을 삭제했다(git 밖, 권한 600).
+  확인: 배포본 `notify`에 `requests` 없음, `SIMA_APP_ALERTS_ENABLED=1`, TELEGRAM 환경변수 없음,
+  PWA·push·balance·Caddy 4개 active. PWA 릴리스는 바뀌지 않은 `make_alert`만 써서 재설치하지 않았다.
+  사용자 휴대폰으로 가는 테스트 알림은 보내지 않았다 — 첫 실관측은 10/7 08:05 Codex 한도 알림
+  (cron.log `app_alert_queued`, 앱 DB deliveries)이다.
 
 ## 2026-10-06 (새로고침 수정 운영 배포 완료)
 
