@@ -284,7 +284,15 @@ def _parse_kospi_master(payload: bytes) -> list[tuple[str, str]]:
 
 def fetch_kospi200_universe() -> list[tuple[str, str]] | None:
     """KIS 공식 종목 파일에서 편입종목 전체를 가져온다. 부분·빈·낡은 파일은 실패다."""
-    return _fetch_with_retries(KIS_KOSPI_MASTER_URL, _parse_kospi_master, binary=True)
+    universe = _fetch_with_retries(KIS_KOSPI_MASTER_URL, _parse_kospi_master, binary=True)
+    if universe is not None:
+        # 매일 확인한 공식 마스터를 표시용 캐시에도 반영한다. 30일 TTL만 기다리면
+        # 새 편입 종목은 판단·주문되면서도 알림/노션에는 코드로 남는다.
+        cached = _read_ticker_name_cache()
+        names = dict(cached[0]) if cached else {}
+        names.update(universe)
+        _write_ticker_name_cache(names)
+    return universe
 
 
 _SECTOR_GROUP_PATTERN = re.compile(
@@ -379,8 +387,19 @@ def fetch_kospi200_sector_map() -> dict[str, str] | None:
 def _read_ticker_name_cache() -> tuple[dict[str, str], datetime] | None:
     try:
         payload = json.loads(TICKER_NAME_CACHE_PATH.read_text())
-        return payload["ticker_names"], datetime.fromisoformat(payload["fetched_at"])
-    except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError, ValueError):
+        if not isinstance(payload, dict):
+            return None
+        names = payload.get("ticker_names")
+        if not isinstance(names, dict) or not all(
+            isinstance(code, str) and isinstance(name, str) and code and name.strip()
+            for code, name in names.items()
+        ):
+            return None
+        fetched_at = datetime.fromisoformat(payload["fetched_at"])
+        if fetched_at.tzinfo is None:
+            return None
+        return names, fetched_at
+    except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError, ValueError, TypeError):
         return None
 
 
@@ -411,7 +430,8 @@ def fetch_kospi200_ticker_names() -> dict[str, str] | None:
 
     universe = fetch_kospi200_universe()
     if universe is not None:
-        ticker_names = dict(universe)
+        ticker_names = dict(cached[0]) if cached else {}
+        ticker_names.update(universe)
         _write_ticker_name_cache(ticker_names)
         return ticker_names
 

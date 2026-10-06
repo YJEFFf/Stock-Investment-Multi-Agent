@@ -415,3 +415,18 @@ def test_unavailable_balance_service_returns_failure(web):
     login(web)
     web[0].config["BALANCE_SOCKET"] = "/nonexistent/sima.sock"
     assert request(web[1], "POST", "/api/account/refresh", json={}, headers=HEADERS).status_code == 503
+
+
+def test_trade_name_survives_full_sale_and_missing_name_in_latest_holdings(tmp_path):
+    write_rows(tmp_path, "account_nav.jsonl", [
+        {"day":"2026-10-05", "status":"ok", "total":10000, "holdings":[
+            {"pdno":"0126Z0", "prdt_name":"삼성에피스홀딩스"},
+            {"pdno":"NEW001", "prdt_name":"새종목"}]},
+        {"day":"2026-10-06", "status":"ok", "total":10000, "holdings":[
+            {"pdno":"NEW001", "prdt_name":"", "hldg_qty":1}]},
+    ])
+    write_rows(tmp_path, "trade_journal.jsonl", [
+        {"day":"2026-10-06", "event":"sell", "ticker":"0126Z0"}])
+    result = snapshot(tmp_path, now=datetime(2026,10,7,3,0,tzinfo=KST))
+    assert result.trades[0]["name"] == "삼성에피스홀딩스"
+    assert result.holdings[0]["name"] == "새종목"

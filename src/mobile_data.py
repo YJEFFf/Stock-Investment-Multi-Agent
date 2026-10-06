@@ -107,6 +107,11 @@ def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float 
             names = json.loads(names_file.read_text()).get("ticker_names", {})
         except (OSError, ValueError, AttributeError):
             pass
+    # 매도 후 최신 잔고에서 사라져도 과거 브로커 관측의 종목명을 유지한다.
+    for observation in valid_nav:
+        for holding in observation.get("holdings", []):
+            if isinstance(holding, dict) and holding.get("pdno") and holding.get("prdt_name"):
+                names[str(holding["pdno"])] = str(holding["prdt_name"])
     if latest:
         account = {k: latest.get(k) for k in ("day", "observed_at", "total", "cash", "securities", "daily_return",
                                              "return_since_first_observation", "max_drawdown_since_first_observation")}
@@ -119,7 +124,7 @@ def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float 
             if not isinstance(h, dict):
                 continue
             ticker = str(h.get("pdno", ""))
-            name = str(h.get("prdt_name") or ticker)
+            name = str(h.get("prdt_name") or names.get(ticker) or ticker)
             names[ticker] = name
             holdings.append({"ticker": ticker, "name": name,
                              "quantity": number(h.get("hldg_qty")), "entry_price": number(h.get("pchs_avg_pric")),

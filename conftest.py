@@ -156,8 +156,9 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     `trade_journal.jsonl`에 적힌 뒤 다음 날 노션 매매일지까지 동기화됐다.
     그래서 이제 **`src` 전체의 `logs/` 기본값을 빠짐없이 등록한다.**
     """
-    from src import app_notifications, codex_plan, evaluation, judgment, llm, notion_sync, order_guard, pipeline, portfolio_store, run_history, translate
+    from src import app_notifications, codex_plan, collectors, evaluation, judgment, llm, notion_sync, order_guard, pipeline, portfolio_store, run_history, translate
 
+    monkeypatch.setattr(collectors, "TICKER_NAME_CACHE_PATH", tmp_path / "ticker_names.json")
     monkeypatch.setattr(translate, "DEFAULT_CACHE_DIR", tmp_path / "translations")
     monkeypatch.delenv("SIMA_APP_ALERTS_ENABLED", raising=False)
     monkeypatch.setattr(app_notifications, "DEFAULT_APP_ALERTS_PATH", tmp_path / "app_alerts.jsonl")

@@ -635,3 +635,30 @@ def test_fetch_disclosures_returns_none_after_exhausting_retries(monkeypatch):
     items = collectors.fetch_disclosures("005930")
 
     assert items is None
+
+
+def test_daily_universe_refreshes_fresh_but_incomplete_name_cache(monkeypatch):
+    collectors._write_ticker_name_cache({"005930": "삼성전자", "OLD001": "과거보유종목"})
+    expected = [("005930", "삼성전자"), ("0126Z0", "삼성에피스홀딩스")]
+    monkeypatch.setattr(collectors, "_fetch_with_retries", lambda *a, **k: expected)
+    assert collectors.fetch_kospi200_universe() == expected
+    assert collectors.fetch_kospi200_ticker_names() == {
+        "005930": "삼성전자", "OLD001": "과거보유종목", "0126Z0": "삼성에피스홀딩스"}
+
+
+def test_failed_universe_does_not_change_name_cache(monkeypatch):
+    collectors._write_ticker_name_cache({"0126Z0": "삼성에피스홀딩스"})
+    before = collectors.TICKER_NAME_CACHE_PATH.read_bytes()
+    monkeypatch.setattr(collectors, "_fetch_with_retries", lambda *a, **k: None)
+    assert collectors.fetch_kospi200_universe() is None
+    assert collectors.TICKER_NAME_CACHE_PATH.read_bytes() == before
+
+
+@pytest.mark.parametrize("names", [None, "broken", [], {"005930": None}, {"005930": " "}])
+def test_corrupt_display_cache_cannot_block_universe(monkeypatch, names):
+    collectors.TICKER_NAME_CACHE_PATH.write_text(json.dumps({
+        "fetched_at":"2026-10-07T03:00:00+00:00", "ticker_names":names}))
+    expected = [("0126Z0", "삼성에피스홀딩스")]
+    monkeypatch.setattr(collectors, "_fetch_with_retries", lambda *a, **k: expected)
+    assert collectors.fetch_kospi200_universe() == expected
+    assert collectors.fetch_kospi200_ticker_names() == dict(expected)
