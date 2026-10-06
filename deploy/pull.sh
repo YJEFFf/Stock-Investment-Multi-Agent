@@ -40,6 +40,7 @@ PY
 TRADING_PATHS=(
   src/sell.py src/pipeline.py src/kis.py src/collectors.py src/schemas.py src/portfolio_store.py
   src/notify.py src/judgment.py src/translate.py src/llm.py src/analysts.py
+  src/app_notifications.py
   src/codex_plan.py
   src/order_guard.py
   src/run_history.py

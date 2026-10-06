@@ -57,24 +57,6 @@ def _operational_logs_must_not_change():
 
 
 @pytest.fixture(autouse=True)
-def _never_send_telegram(monkeypatch):
-    """텔레그램은 requests.post 지점에서 막는다. 실제 전송은 실패로 흘러 False가 된다.
-
-    send_telegram_alert를 통째로 목킹하지 않는 이유: 그 함수 자체를 검증하는
-    tests/test_notify.py가 requests.post를 직접 목킹하며, monkeypatch 순서상 테스트의
-    목이 이 픽스처를 덮는다. 같은 지점을 막아야 그 테스트가 그대로 유효하다.
-    """
-    import requests
-
-    from src import notify
-
-    def _blocked(*args, **kwargs):
-        raise requests.RequestException("blocked in tests: telegram")
-
-    monkeypatch.setattr(notify.requests, "post", _blocked)
-
-
-@pytest.fixture(autouse=True)
 def _never_send_web_push(monkeypatch):
     from src import mobile_push
 
@@ -177,7 +159,6 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     from src import app_notifications, codex_plan, evaluation, judgment, llm, notion_sync, order_guard, pipeline, portfolio_store, run_history
 
     monkeypatch.delenv("SIMA_APP_ALERTS_ENABLED", raising=False)
-    monkeypatch.delenv("SIMA_TELEGRAM_ENABLED", raising=False)
     monkeypatch.setattr(app_notifications, "DEFAULT_APP_ALERTS_PATH", tmp_path / "app_alerts.jsonl")
 
     monkeypatch.setattr(order_guard, "STATE_PATH", tmp_path / "unconfirmed_orders.json")

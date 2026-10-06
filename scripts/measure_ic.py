@@ -9,7 +9,7 @@
 멈추는 것이 결론이다(docs/evaluations/2026-09-13-first-month.md §7).
 
 읽기 전용이다: pipeline.jsonl을 읽고, 가격을 받아 logs/price_history/에 누적하고,
-logs/ic_summary.json과 cron.log·텔레그램에 결과를 남긴다. 매매 상태는 건드리지 않는다.
+logs/ic_summary.json과 cron.log·앱 알림에 결과를 남긴다. 매매 상태는 건드리지 않는다.
 
 실행: uv run python scripts/measure_ic.py (레포 루트에서)
 """

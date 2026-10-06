@@ -2,7 +2,7 @@
 
     uv run python scripts/reconcile_portfolio.py            # 대조만 (드라이런)
     uv run python scripts/reconcile_portfolio.py --apply    # 브로커 기준으로 교정
-    uv run python scripts/reconcile_portfolio.py --alert    # 드라이런 + 어긋나면 텔레그램
+    uv run python scripts/reconcile_portfolio.py --alert    # 드라이런 + 어긋나면 앱 알림
 
 `--alert`가 크론(장 마감 후)이 쓰는 모드다. 교정은 안 하고 보고만 한다 —
 2026-08-28까지 이 스크립트는 수동 실행뿐이라 아무도 안 돌리면 어긋난 진입가로
@@ -28,7 +28,7 @@ from src.pipeline import _kst_today  # noqa: E402
 from src.portfolio_store import load_portfolio, portfolio_lock, save_portfolio  # noqa: E402
 
 # 크론(--alert)에서 도는 스크립트라 다른 크론 스크립트와 같은 형식으로 남긴다.
-# 이게 없으면 notify의 telegram_alert_sent(INFO)가 통째로 사라져서, 알림을 보냈는지
+# 이게 없으면 notify의 app_alert_queued(INFO)가 통째로 사라져서, 알림을 보냈는지
 # 로그로 확인할 수 없다 — 2026-08-26 장애 때 도착 여부를 사용자에게 물어서야 알 수
 # 있었던 것과 같은 문제다(CHANGELOG 2026-08-27).
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

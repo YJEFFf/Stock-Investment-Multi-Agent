@@ -58,7 +58,7 @@ src/
   pipeline.py            # 판단 → 게이트 → 집행 오케스트레이션, 매도 판단→집행 공유 로직
   sell.py                # 결정론적 손절/트레일링 익절
   portfolio_store.py     # logs/portfolio_state.json 로드/원자적 저장/락
-  notify.py              # 텔레그램 알림 (매수/매도/스킵/에러 통일 양식)
+  notify.py              # 앱 알림 (매수/매도/스킵/에러 통일 양식, 앱 발송함에 기록)
   notion_sync.py         # 매매일지·일일 리포트 노션 동기화
   evaluation.py          # IC(information coefficient) 측정
 scripts/
@@ -91,7 +91,7 @@ docs/PLAN.md            # 설계 배경과 근거
 휴장일(주말·KRX 공휴일)은 `market_calendar.is_krx_trading_day`가 각 스크립트
 맨 앞에서 걸러 LLM/KIS 호출 없이 조용히 종료한다. 전체 파이프라인이 예외로
 죽거나 개별 단계(보유 종목 평가, 노션 동기화)가 실패하면 `notify.py`가
-텔레그램으로 즉시 알린다.
+앱 알림(아래 개인용 PWA)으로 즉시 알린다.
 
 ## 설정
 
@@ -104,8 +104,9 @@ uv sync
 - `DART_API_KEY` — 공시 수집
 - `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ACCOUNT_NO` — 한국투자증권 **모의투자** API
   (실전투자 키 아님. 이 코드베이스는 모의투자 도메인만 호출한다)
-- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — 매수/매도/스킵/에러 알림 (선택,
-  없으면 알림만 조용히 꺼짐)
+- `SIMA_APP_ALERTS_ENABLED=1` — 매수/매도/스킵/에러 알림을 앱 발송함에 기록. 유일한 알림
+  경로다(텔레그램은 2026-10-06 제거). 없으면 알림은 `logs/cron.log`의
+  `app_alert_not_queued` 경고로만 남는다
 - `NOTION_API_KEY`, `NOTION_PARENT_PAGE_ID`, `NOTION_TRADE_JOURNAL_DB_ID`,
   `NOTION_DAILY_REPORT_DB_ID`, `NOTION_INTRO_PAGE_ID` — 매매일지·일일 리포트
   동기화 (선택, `scripts/setup_notion_workspace.py`로 최초 생성)
@@ -153,9 +154,9 @@ sudo -u sima-web /opt/sima-pwa/current/.venv/bin/python /opt/sima-pwa/current/sc
   Unix socket은 sima-web 그룹만 사용하며 요청은 15초 간격·앱 전체 분당 3회로 제한한다.
 - HTTPS는 Caddy가 제공한다. AWS 보안그룹에서 TCP 80/443이 필요하다. 주소는 기존 고정
   IP를 가리키는 무료 DNS이며, 해당 DNS 제공자에 의존한다. 별도 EC2는 만들지 않는다.
-- 운영 `.env`의 `SIMA_APP_ALERTS_ENABLED=1`이면 기존 알림을 앱 발송함에도 남긴다.
-  `SIMA_TELEGRAM_ENABLED` 기본값은 `1`이다. 실제 아이폰 알림을 확인하기 전에는 유지한다.
-  앱 단독 전환은 확인 후 `SIMA_TELEGRAM_ENABLED=0`으로 한다.
+- 운영 `.env`의 `SIMA_APP_ALERTS_ENABLED=1`이면 모든 알림을 앱 발송함에 남긴다.
+  2026-10-06 실제 아이폰 수신 확인 후 앱 단독 알림으로 전환했고 텔레그램 전송 코드와
+  봇 토큰은 제거했다.
 - 푸시 서비스의 접수 성공과 실제 아이폰 수신은 다르다. 알림함에 이력을 보존하고,
   만료 구독은 해제하며 일시 전송 실패는 최대 24시간 범위에서 재시도한다.
 - 서비스 워커는 공개 화면 파일만 캐시한다. 금융 데이터·로그인·알림 API는 캐시하지 않는다.
@@ -177,7 +178,7 @@ sudo -u sima-web /opt/sima-pwa/current/.venv/bin/python /opt/sima-pwa/current/sc
   09:00–15:30 매분 손절 체크 / 15:35 장 마감·노션 동기화)로 나뉘어 자동 실행된다
   — 자세한 스케줄은 위 "실행 스케줄" 참고
 - 휴장일 자동 판정(`market_calendar.is_krx_trading_day`), cron 실패·개별 단계
-  실패 시 텔레그램 알림(`notify.py`), 매매일지·일일 리포트 노션 동기화
+  실패 시 앱 알림(`notify.py`), 매매일지·일일 리포트 노션 동기화
   (`notion_sync.py`) 전부 연결 완료
 - AGENTS.md "감시 지표"(최근 20영업일 신호 발생률, 게이트 거부 사유별 집계,
   분석가 호출수/실패율/토큰량)를 매일 cron 로그에 자동 기록

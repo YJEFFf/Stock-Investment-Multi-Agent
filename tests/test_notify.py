@@ -5,46 +5,32 @@ import pytest
 from src import notify
 
 
-class _FakeResponse:
-    def raise_for_status(self):
-        pass
+def test_send_telegram_alert_only_writes_the_app_outbox(monkeypatch):
+    """텔레그램 전송은 2026-10-06에 제거했다. 옛 토큰이 환경에 남아 있어도 네트워크로
+    나가면 안 된다 — 앱 발송함 한 줄이 전부다."""
+    import requests
 
+    from src import app_notifications
 
-def test_send_telegram_alert_success(monkeypatch):
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("SIMA_APP_ALERTS_ENABLED", "1")
+    monkeypatch.delenv("SIMA_TELEGRAM_ENABLED", raising=False)  # 옛 스위치가 0이면 되살아난 전송을 가린다
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "old-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: pytest.fail("network called"))
 
-    captured = {}
-
-    def fake_post(url, json, timeout):
-        captured["url"] = url
-        captured["json"] = json
-        return _FakeResponse()
-
-    monkeypatch.setattr(notify.requests, "post", fake_post)
-
-    assert notify.send_telegram_alert("test message") is True
-    assert captured["url"] == "https://api.telegram.org/bottest-token/sendMessage"
-    assert captured["json"] == {"chat_id": "12345", "text": "test message"}
+    assert notify.send_telegram_alert("🟢 [SIMA] 매수\n삼성전자") is True
+    assert len(app_notifications.DEFAULT_APP_ALERTS_PATH.read_text().splitlines()) == 1
 
 
-def test_send_telegram_alert_skips_when_unconfigured(monkeypatch):
-    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+def test_send_telegram_alert_is_false_and_logged_when_app_alerts_are_off(monkeypatch, caplog):
+    """앱 발송함이 유일한 경로다. 꺼져 있으면 False여야 alert_once가 마커를 안 남기고,
+    무슨 알림을 잃었는지는 로그에라도 남아야 한다."""
+    monkeypatch.delenv("SIMA_APP_ALERTS_ENABLED", raising=False)
 
-    assert notify.send_telegram_alert("test message") is False
+    with caplog.at_level("WARNING", logger="src.notify"):
+        assert notify.send_telegram_alert("⚠️ [SIMA] 오류\n상세") is False
 
-
-def test_send_telegram_alert_swallows_network_failure(monkeypatch):
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
-
-    def fake_post(url, json, timeout):
-        raise ConnectionError("network down")
-
-    monkeypatch.setattr(notify.requests, "post", fake_post)
-
-    assert notify.send_telegram_alert("test message") is False
+    assert "app_alert_not_queued title=⚠️ [SIMA] 오류" in caplog.text
 
 
 def test_format_buy_alert():
@@ -247,14 +233,12 @@ def test_recovery_alert_counts_the_positions_it_could_not_check():
 def test_send_telegram_alert_logs_the_title_on_success(monkeypatch, caplog):
     """성공 로그가 없으면 "안 보냈다"와 "보냈는데 기록이 없다"가 로그에서 같은
     모양이다 — 2026-08-26 알림 도착 여부를 사용자에게 물어서야 확인할 수 있었다."""
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
-    monkeypatch.setattr(notify.requests, "post", lambda url, json, timeout: _FakeResponse())
+    monkeypatch.setenv("SIMA_APP_ALERTS_ENABLED", "1")
 
     with caplog.at_level("INFO", logger="src.notify"):
         assert notify.send_telegram_alert("🟡 [SIMA] 시세 공백 종료\n총 78분간 판정 없음") is True
 
-    assert "telegram_alert_sent" in caplog.text
+    assert "app_alert_queued" in caplog.text
     assert "🟡 [SIMA] 시세 공백 종료" in caplog.text
     assert "총 78분간 판정 없음" not in caplog.text  # 첫 줄만 남긴다
 

@@ -1,6 +1,7 @@
 import base64
 import fcntl
 import json
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -122,43 +123,48 @@ def test_push_registration_test_notification_and_logout_cancel(web):
     assert store.pending() == []
 
 
-def test_app_outbox_is_independent_of_telegram_failure(monkeypatch):
+def test_alert_lands_in_app_outbox(monkeypatch):
     monkeypatch.setenv("SIMA_APP_ALERTS_ENABLED", "1")
-    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     assert notify.send_telegram_alert("⚠️ [SIMA] 오류 — 데이터 수집 실패\n오늘 신규 판단 중지") is True
     row = json.loads(app_notifications.DEFAULT_APP_ALERTS_PATH.read_text())
     assert row["kind"] == "error"
     assert "수집 실패" in row["title"]
 
 
-def test_app_outbox_failure_does_not_stop_telegram(monkeypatch):
+def test_app_outbox_write_failure_is_reported(monkeypatch):
+    # 텔레그램 폴백이 없어졌으니 실패는 False로 드러나야 한다(alert_once가 마커를 안 남긴다).
     monkeypatch.setenv("SIMA_APP_ALERTS_ENABLED", "1")
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "test")
     monkeypatch.setattr(app_notifications, "DEFAULT_APP_ALERTS_PATH", Path("/dev/null/not-a-dir"))
-    sent = []
-    monkeypatch.setattr(notify.requests, "post", lambda *a, **kw: sent.append(kw) or SimpleNamespace(raise_for_status=lambda: None))
-    assert notify.send_telegram_alert("test") is True
-    assert len(sent) == 1
+    assert notify.send_telegram_alert("test") is False
 
 
-def test_telegram_disabled_only_queues_app(monkeypatch):
+def test_stuck_app_outbox_writer_delays_the_caller_only_briefly(monkeypatch):
+    # 매매 호출자(주문·손절 경로)가 알림 한 건에 묶이는 상한이다. 늘리려면 그 경로 지연부터 볼 것.
+    assert app_notifications.LOCK_WAIT_SECONDS <= 2
     monkeypatch.setenv("SIMA_APP_ALERTS_ENABLED", "1")
-    monkeypatch.setenv("SIMA_TELEGRAM_ENABLED", "0")
-    monkeypatch.setattr(notify.requests, "post", lambda *a, **kw: pytest.fail("telegram called"))
-    assert notify.send_telegram_alert("[SIMA] 매수\n삼성전자")
-
-
-def test_locked_app_outbox_does_not_delay_existing_telegram(monkeypatch):
-    monkeypatch.setenv("SIMA_APP_ALERTS_ENABLED", "1")
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "test")
-    sent = []
-    monkeypatch.setattr(notify.requests, "post", lambda *a, **kw: sent.append(kw) or SimpleNamespace(raise_for_status=lambda: None))
+    monkeypatch.setattr(app_notifications, "LOCK_WAIT_SECONDS", 0.2)
     with app_notifications.DEFAULT_APP_ALERTS_PATH.open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        assert notify.send_telegram_alert("test")
-    assert len(sent) == 1
+        started = time.monotonic()
+        assert notify.send_telegram_alert("test") is False
+        assert time.monotonic() - started < 1
+
+
+def test_concurrent_app_outbox_writer_does_not_drop_the_alert(monkeypatch):
+    # 두 크론이 같은 순간에 쓰는 경우. 예전엔 즉시 포기해도 텔레그램이 메웠다.
+    monkeypatch.setenv("SIMA_APP_ALERTS_ENABLED", "1")
+    lock = app_notifications.DEFAULT_APP_ALERTS_PATH.open("w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    releaser = threading.Timer(0.2, lock.close)
+    started = time.monotonic()
+    releaser.start()
+    try:
+        assert notify.send_telegram_alert("🟢 [SIMA] 매수\n삼성전자") is True
+        assert time.monotonic() - started >= 0.15  # 실제로 기다린 뒤 썼다
+    finally:
+        releaser.join()
+    row = json.loads(app_notifications.DEFAULT_APP_ALERTS_PATH.read_text())
+    assert row["title"] == "매수"
 
 
 def configured_store(tmp_path):

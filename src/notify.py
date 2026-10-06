@@ -1,4 +1,8 @@
-"""매수·매도·오류를 SSH 없이 바로 알기 위한 텔레그램 알림.
+"""매수·매도·오류를 SSH 없이 바로 알기 위한 앱 알림.
+
+2026-10-06 사용자 결정으로 텔레그램 전송을 걷어내고 앱 단독 알림으로 전환했다
+(docs/CHANGELOG.md). 여기서는 앱 발송함(logs/app_alerts.jsonl)에 쓰기만 하고,
+휴대폰 전송은 매매 프로세스와 분리된 sima-push 서비스가 맡는다.
 
 AGENTS.md의 재시도 규칙(규칙 4)과는 무관한 영역이다 — 이건 실패를 감추거나
 우회하는 코드가 아니라 이미 일어난 일을 사람에게 알리는 코드라 재시도를 하지
@@ -14,26 +18,22 @@ AGENTS.md의 재시도 규칙(규칙 4)과는 무관한 영역이다 — 이건 
 
 import json
 import logging
-import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv()  # 앱 발송함 스위치(SIMA_APP_ALERTS_ENABLED)를 .env에서 읽는다
 
 logger = logging.getLogger(__name__)
-
-TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 KST = ZoneInfo("Asia/Seoul")  # "하루"의 경계는 장이 도는 시간대 기준이어야 한다 (pipeline._kst_today와 같은 이유)
 
 # notion_sync.REASON_LABELS와 값은 같지만 독립적으로 든다 — 이 파일과 notion_sync.py는
-# "노션에 뭘 쓰나"/"텔레그램에 뭘 보내나"로 고치는 이유가 다르다.
+# "노션에 뭘 쓰나"/"알림에 뭘 보내나"로 고치는 이유가 다르다.
 # 매도 기록의 exit_trigger(sell.exit_trigger)용. REASON_LABELS의 take_profit_trail("익절")은
 # 1차 익절과 트레일링을 가르지 못해 2026-09-14 이전 기록을 읽을 때만 쓴다.
 TRIGGER_LABELS = {
@@ -280,40 +280,30 @@ def format_reconcile_drift_alert(day: str, drifts: list) -> str:
 
 
 def send_telegram_alert(message: str) -> bool:
-    """기존 호출명 유지. 앱 발송함 저장 또는 텔레그램 전송 성공 시 True.
+    """앱 발송함에 저장한다. 저장했으면 True.
 
-    앱 전송은 별도 프로세스가 담당한다. 전환 전에는 두 경로를 함께 사용한다.
+    이름만 옛것이다 — 텔레그램 전송은 2026-10-06에 제거했다. 호출처가 매매 경로 전반에
+    퍼져 있어 그 파일들을 건드리지 않으려고 이름을 유지했다. 이제 앱 발송함이 유일한
+    경로라, False면 이 알림은 사람에게 닿지 않는다(alert_once는 그래서 마커를 안 남긴다).
     """
     from src.app_notifications import enqueue
 
-    queued = enqueue(message)
-    if os.environ.get("SIMA_TELEGRAM_ENABLED", "1") == "0":
-        return queued
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        logger.warning("telegram_alert_skipped reason=missing_token_or_chat_id")
-        return queued
-
-    try:
-        response = requests.post(
-            TELEGRAM_API_URL.format(token=token),
-            json={"chat_id": chat_id, "text": message},
-            timeout=10,
-        )
-        response.raise_for_status()
-        # 성공도 남긴다. 실패만 로그가 있으면 "안 보냈다"와 "보냈는데 기록이 없다"가
-        # 로그에서 같은 모양이라, 2026-08-26 장애 때 알림 도착 여부를 사용자에게
-        # 물어서야 확인할 수 있었다(CHANGELOG 2026-08-27). 본문 첫 줄만 남긴다 —
-        # 어떤 알림인지 식별하는 데 그거면 충분하고, 전문은 길다.
-        logger.info("telegram_alert_sent title=%s", message.splitlines()[0] if message else "")
-        return True
-    except Exception:
-        logger.exception("telegram_alert_failed")
-        return queued
+    title = message.splitlines()[0] if message else ""
+    if not enqueue(message):
+        # 스위치가 꺼졌거나 쓰기에 실패했다(쓰기 실패 사유는 enqueue가 남긴다). 휴대폰엔 안 가므로
+        # 무슨 알림을 잃었는지라도 cron.log에 남긴다.
+        logger.warning("app_alert_not_queued title=%s", title)
+        return False
+    # 성공도 남긴다. 실패만 로그가 있으면 "안 보냈다"와 "보냈는데 기록이 없다"가
+    # 로그에서 같은 모양이라, 2026-08-26 장애 때 알림 도착 여부를 사용자에게
+    # 물어서야 확인할 수 있었다(CHANGELOG 2026-08-27). 본문 첫 줄만 남긴다 —
+    # 어떤 알림인지 식별하는 데 그거면 충분하고, 전문은 길다.
+    # 2026-10-06까지는 같은 자리에 telegram_alert_sent가 찍혔다.
+    logger.info("app_alert_queued title=%s", title)
+    return True
 
 
-# 매분 도는 잡(check_stop_loss)이 지속 장애를 만나면 텔레그램이 하루 수백 번
+# 매분 도는 잡(check_stop_loss)이 지속 장애를 만나면 알림이 하루 수백 번
 # 울린다 — 하루 첫 발생에만 보내고 나머지는 logs/cron.log로만 남긴다.
 # 원래 scripts/check_stop_loss.py 안에 있던 로직을 여기로 올렸다. 이유는 두
 # 가지다: (1) "알림을 얼마나 자주 보낼 것인가"는 알림 쪽 관심사고, (2) 원래
