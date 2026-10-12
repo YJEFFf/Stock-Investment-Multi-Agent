@@ -37,7 +37,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import kis, notify, notion_sync, pipeline, sell  # noqa: E402
+from src import kis, notify, notion_sync, order_recovery, pipeline, sell  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.portfolio_store import load_portfolio, portfolio_lock, save_portfolio  # noqa: E402
 from src.schemas import Decision, GateResult, SellAction  # noqa: E402
@@ -224,6 +224,7 @@ async def main() -> None:
         len(portfolio.positions),
     )
 
+    await asyncio.to_thread(order_recovery.recover_pending_buy, day)
     await _sync_trade_journal()
 
 

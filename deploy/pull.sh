@@ -42,7 +42,7 @@ TRADING_PATHS=(
   src/notify.py src/judgment.py src/translate.py src/llm.py src/analysts.py
   src/app_notifications.py
   src/codex_plan.py
-  src/order_guard.py
+  src/order_guard.py src/order_recovery.py
   src/run_history.py
   scripts/execute_open.py scripts/check_stop_loss.py scripts/decide_buys.py scripts/decide_llm_sell.py
   scripts/check_codex_plan.py

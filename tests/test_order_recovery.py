@@ -1,0 +1,194 @@
+import json
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from src import kis, order_guard, order_recovery as recovery, portfolio_store as store
+from src.schemas import ExitPlan, PortfolioState, Position, UnconfirmedOrder
+
+NOW = datetime(2026, 10, 12, 9, 4, tzinfo=ZoneInfo('Asia/Seoul'))
+
+
+@pytest.fixture
+def waiting(monkeypatch):
+    plan = ExitPlan(stop_loss_pct=-.067715, take_profit_pct=.13543, take_profit_fraction=1/3, trail_pct=-.054172)
+    position = Position(ticker='009240', sector='', quantity=183, entry_day=NOW.date(), entry_price=40600,
+                        peak_price=41200, weight=.08, exit_plan=plan)
+    store.save_portfolio(PortfolioState(positions=[position], cash_weight=.92))
+    order_guard._save({'009240': UnconfirmedOrder(ticker='009240', side='buy', quantity=183,
+                                                created_at=NOW-timedelta(minutes=2), fills_before=(0,0.,0.))})
+    row = dict(event='buy', ticker='009240', day=NOW.date().isoformat(), quantity=183, entry_price=40600,
+               fee_amount=40, entry_price_source='fill_partial', order_no='3324', exit_plan_source='volatility',
+               exit_plan=plan.model_dump(mode='json'))
+    recovery.JOURNAL_PATH.parent.mkdir(parents=True,exist_ok=True)
+    recovery.JOURNAL_PATH.write_text(json.dumps(row)+'\n')
+    calls=[]
+    def fills(ticker,day,side,**kw):
+        assert kw['policy'].max_attempts==1
+        calls.append(side)
+        return (183,7464450.,1050.) if side=='buy' else (0,0.,0.)
+    monkeypatch.setattr(kis,'fetch_daily_fill_totals',fills)
+    monkeypatch.setattr(kis,'fetch_holdings',lambda **kw:{'009240':(183,40789.344)})
+    def forbidden(*a,**k): raise AssertionError('recovery must never submit an order')
+    monkeypatch.setattr(kis,'place_market_buy_order',forbidden)
+    monkeypatch.setattr(kis,'place_market_sell_order',forbidden)
+    return calls
+
+
+def test_complete_late_fill_persists_before_unblock_and_is_idempotent(waiting, monkeypatch):
+    old=store.load_portfolio();clear=order_guard.clear
+    def checked_clear(ticker):
+        assert store.load_portfolio().positions[0].entry_price==7464450/183
+        assert json.loads(recovery.JOURNAL_PATH.read_text())['fee_amount']==1050
+        clear(ticker)
+    monkeypatch.setattr(order_guard,'clear',checked_clear)
+    assert recovery.recover_pending_buy(NOW)
+    new=store.load_portfolio();old.positions[0].entry_price=7464450/183
+    assert new==old
+    row=json.loads(recovery.JOURNAL_PATH.read_text())
+    assert row['fill_recovery']['fee_before']==40
+    assert row['entry_price_source']=='fill'
+    assert not order_guard.load_orders()
+    assert not recovery.recover_pending_buy(NOW)
+    assert waiting==['buy','sell']
+
+
+@pytest.mark.parametrize('problem',['partial','overfill','timeout','sold','quantity','average','nan','old_day','addon','lost_response','missing_journal','changed_marker','changed_journal','changed_position'])
+def test_ambiguous_evidence_never_unblocks(waiting,monkeypatch,problem):
+    before=store.load_portfolio()
+    if problem in ['partial','overfill','timeout','sold','nan']:
+        def fills(t,d,side,**kw):
+            if problem=='timeout':return None
+            if side=='sell':return (1,40000.,10.) if problem=='sold' else (0,0.,0.)
+            return {'partial':(7,284200.,40.),'overfill':(184,7500000.,1050.),'nan':(183,float('nan'),1050.)}.get(problem,(183,7464450.,1050.))
+        monkeypatch.setattr(kis,'fetch_daily_fill_totals',fills)
+    elif problem in ['quantity','average']:
+        monkeypatch.setattr(kis,'fetch_holdings',lambda **kw:{'009240':(182 if problem=='quantity' else 183,40600.)})
+    elif problem=='old_day':
+        orders=order_guard.load_orders();orders['009240'].created_at-=timedelta(days=1);order_guard._save(orders)
+    elif problem in ['addon','lost_response']:
+        row=json.loads(recovery.JOURNAL_PATH.read_text())
+        if problem=='addon':row['exit_plan_source']='existing_position'
+        else:row['order_no']=None
+        recovery.JOURNAL_PATH.write_text(json.dumps(row)+'\n')
+    elif problem=='missing_journal':recovery.JOURNAL_PATH.unlink()
+    else:
+        def race(**kw):
+            if problem=='changed_marker':
+                orders=order_guard.load_orders();orders['009240'].quantity=184;order_guard._save(orders)
+            elif problem=='changed_journal':recovery.JOURNAL_PATH.write_text(recovery.JOURNAL_PATH.read_text()+'{}\n')
+            else:
+                state=store.load_portfolio();state.positions[0].weight=.09;store.save_portfolio(state)
+            return {'009240':(183,40789.344)}
+        monkeypatch.setattr(kis,'fetch_holdings',race)
+    assert not recovery.recover_pending_buy(NOW)
+    assert order_guard.is_blocked('009240')
+    if problem!='changed_position':assert store.load_portfolio()==before
+
+
+@pytest.mark.parametrize('failure_at',['journal','portfolio','audit_commit','clear'])
+def test_crash_retry_keeps_block_until_both_files_are_committed(waiting,monkeypatch,failure_at):
+    atomic=recovery._atomic_write;save=store.save_portfolio;clear=order_guard.clear
+    def fail(*a,**k):raise OSError('injected crash')
+    if failure_at in ['journal','audit_commit']:
+        def write(path,data):
+            if path==recovery.JOURNAL_PATH and failure_at=='journal' or path.name=='committed.json' and failure_at=='audit_commit':fail()
+            atomic(path,data)
+        monkeypatch.setattr(recovery,'_atomic_write',write)
+    elif failure_at=='portfolio':monkeypatch.setattr(store,'save_portfolio',fail)
+    else:monkeypatch.setattr(order_guard,'clear',fail)
+    with pytest.raises(OSError):recovery.recover_pending_buy(NOW)
+    assert order_guard.is_blocked('009240')
+    monkeypatch.setattr(recovery,'_atomic_write',atomic);monkeypatch.setattr(store,'save_portfolio',save);monkeypatch.setattr(order_guard,'clear',clear)
+    assert recovery.recover_pending_buy(NOW)
+    assert not order_guard.load_orders()
+    assert json.loads(recovery.JOURNAL_PATH.read_text())['fill_recovery']['entry_price_before']==40600
+
+
+def test_quote_updates_during_query_preserved_and_network_outside_lock(waiting,monkeypatch):
+    def holding(**kw):
+        with store.portfolio_lock(blocking=False):
+            state=store.load_portfolio();state.positions[0].peak_price=42000;store.save_portfolio(state)
+        return {'009240':(183,40789.344)}
+    monkeypatch.setattr(kis,'fetch_holdings',holding)
+    assert recovery.recover_pending_buy(NOW)
+    assert store.load_portfolio().positions[0].peak_price==42000
+
+
+def test_sell_marker_not_recovered(waiting):
+    orders=order_guard.load_orders();orders['009240'].side='sell';order_guard._save(orders)
+    assert not recovery.recover_pending_buy(NOW)
+    assert waiting==[]
+
+
+def test_minute_job_recovers_after_saving_and_next_evaluation_uses_correct_price(waiting, monkeypatch):
+    from scripts import check_stop_loss as csl
+    class Clock(datetime):
+        @classmethod
+        def now(cls,tz=None):return NOW
+    monkeypatch.setattr(csl,'datetime',Clock)
+    monkeypatch.setattr(csl,'is_krx_trading_day',lambda d:True)
+    seen=[]
+    async def evaluate(portfolio,*args):
+        seen.append((portfolio.positions[0].entry_price,order_guard.is_blocked('009240')))
+        return portfolio
+    monkeypatch.setattr(csl.pipeline,'evaluate_holdings',evaluate)
+    import asyncio
+    asyncio.run(csl.main());asyncio.run(csl.main())
+    assert seen==[(40600,True),(7464450/183,False)]
+
+
+def test_busy_commit_leaves_order_blocked(waiting,monkeypatch):
+    from contextlib import contextmanager
+    original=store.portfolio_lock
+    @contextmanager
+    def lock(*a,**kw):
+        raise store.PortfolioLockBusy('injected writer')
+        yield
+    def holding(**kw):
+        monkeypatch.setattr(store,'portfolio_lock',lock)
+        return {'009240':(183,40789.344)}
+    monkeypatch.setattr(kis,'fetch_holdings',holding)
+    assert not recovery.recover_pending_buy(NOW)
+    assert order_guard.is_blocked('009240')
+    monkeypatch.setattr(store,'portfolio_lock',original)
+
+
+@pytest.mark.parametrize('missing_fee',[False,True])
+def test_broker_parser_requires_fee_and_propagates_bounded_policy(waiting, monkeypatch, missing_fee):
+    # 원본 파서까지 통과시켜 단위 테스트의 fetch_* 모킹 경계 아래도 검증한다.
+    import importlib.util
+    spec=importlib.util.spec_from_file_location('recovery_kis_parser',kis.__file__)
+    module=importlib.util.module_from_spec(spec)
+    import sys
+    monkeypatch.setitem(sys.modules,spec.name,module);spec.loader.exec_module(module)
+    calls=[]
+    def get(path,tr,params,*,policy):
+        assert policy is recovery.QUERY_POLICY
+        calls.append(path)
+        if path==kis.BALANCE_PATH:
+            return {'output1':[{'pdno':'009240','hldg_qty':'183','pchs_avg_pric':'40789.344'}]}
+        buy=params['SLL_BUY_DVSN_CD']=='02'
+        output={'tot_ccld_qty':'183' if buy else '0','tot_ccld_amt':'7464450' if buy else '0','prsm_tlex_smtl':'1050' if buy else '0'}
+        if missing_fee:output.pop('prsm_tlex_smtl')
+        return {'output2':output}
+    monkeypatch.setattr(module,'_kis_get',get)
+    monkeypatch.setattr(kis,'fetch_daily_fill_totals',module.fetch_daily_fill_totals)
+    monkeypatch.setattr(kis,'fetch_holdings',module.fetch_holdings)
+    assert recovery.recover_pending_buy(NOW) is not missing_fee
+    assert order_guard.is_blocked('009240') is missing_fee
+    assert len(calls)==(1 if missing_fee else 3)
+
+
+@pytest.mark.parametrize('problem',['prior_holding','duplicate_row','ready'])
+def test_unattributable_or_committed_orders_are_left_alone(waiting,problem):
+    if problem=='ready':
+        orders=order_guard.load_orders();orders['009240'].ready_to_commit=True;order_guard._save(orders)
+    elif problem=='duplicate_row':recovery.JOURNAL_PATH.write_text(recovery.JOURNAL_PATH.read_text()*2)
+    else:
+        prior={'event':'buy','ticker':'009240','day':'2026-10-08','quantity':1}
+        recovery.JOURNAL_PATH.write_text(json.dumps(prior)+'\n'+recovery.JOURNAL_PATH.read_text())
+    assert not recovery.recover_pending_buy(NOW)
+    assert waiting==[]
+    assert order_guard.is_blocked('009240')

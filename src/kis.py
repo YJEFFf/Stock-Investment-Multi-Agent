@@ -652,7 +652,9 @@ SELL_TAX_RATE = 0.0020
 BROKERAGE_FEE_RATE = 0.000142
 
 
-def fetch_daily_fill_totals(ticker: str, order_date: date, side: str) -> tuple[int, float, float] | None:
+def fetch_daily_fill_totals(
+    ticker: str, order_date: date, side: str, *, policy: RetryPolicy = DEFAULT_POLICY, require_fee: bool = False,
+) -> tuple[int, float, float] | None:
     """그날 그 종목의 **누적** 체결 수량·금액·위탁수수료 (side: "buy" | "sell").
 
     주문 직전·직후로 두 번 불러 차를 내면 그 주문 하나의 정확한 체결 수량·금액이
@@ -683,11 +685,14 @@ def fetch_daily_fill_totals(ticker: str, order_date: date, side: str) -> tuple[i
         "CTX_AREA_FK100": "",
         "CTX_AREA_NK100": "",
     }
-    data = _kis_get(DAILY_CCLD_PATH, DAILY_CCLD_TR_ID, params)
+    data = _kis_get(DAILY_CCLD_PATH, DAILY_CCLD_TR_ID, params, policy=policy)
     if data is None:
         return None
 
     output2 = data.get("output2") or {}
+    # 자동 차단 해제에는 수수료 누락을 0원으로 추정하지 않는다.
+    if require_fee and output2.get("prsm_tlex_smtl") in (None, ""):
+        return None
     qty_str, amount_str = output2.get("tot_ccld_qty"), output2.get("tot_ccld_amt")
     if qty_str is None or amount_str is None:
         return None
@@ -796,7 +801,7 @@ def fill_after_order(
     return best.model_copy(update={"complete": False})
 
 
-def fetch_holdings() -> dict[str, tuple[int, float]] | None:
+def fetch_holdings(*, policy: RetryPolicy = DEFAULT_POLICY) -> dict[str, tuple[int, float]] | None:
     """브로커가 보고하는 보유 종목 전체: {종목코드: (보유수량, 매입평균가)}.
 
     **브로커가 사실의 출처다.** 자체 상태 파일(logs/portfolio_state.json)의 값과
@@ -820,7 +825,7 @@ def fetch_holdings() -> dict[str, tuple[int, float]] | None:
         "CTX_AREA_FK100": "",
         "CTX_AREA_NK100": "",
     }
-    data = _kis_get(BALANCE_PATH, BALANCE_TR_ID, params)
+    data = _kis_get(BALANCE_PATH, BALANCE_TR_ID, params, policy=policy)
     if data is None:
         return None
 

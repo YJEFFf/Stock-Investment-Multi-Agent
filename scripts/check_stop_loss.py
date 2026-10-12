@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import notify, pipeline, sell  # noqa: E402
+from src import notify, order_recovery, pipeline, sell  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.portfolio_store import (  # noqa: E402
     PortfolioLockBusy,
@@ -71,6 +71,9 @@ async def main() -> None:
             save_portfolio(portfolio)
     except PortfolioLockBusy:
         logger.info("check_stop_loss_skipped reason=previous_run_still_holding_lock")
+        return
+
+    await asyncio.to_thread(order_recovery.recover_pending_buy, day)
 
 
 if __name__ == "__main__":
