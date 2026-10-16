@@ -96,6 +96,13 @@ def test_news_canary_checks_are_separate_from_empty_stock_news():
         health.news_data('[]', AT)
 
 
+def test_index_expected_session_distinguishes_premarket_and_1600_ic():
+    from datetime import date
+    assert health.expected_session(AT.replace(hour=8, minute=30)) == date(2026, 10, 16)
+    assert health.expected_session(AT.replace(hour=16, minute=0)) == date(2026, 10, 19)
+    assert health.expected_session(AT.replace(day=17, hour=16)) == date(2026, 10, 16)
+
+
 def test_member_pagination_must_be_complete(monkeypatch):
     pages = iter([
         {"items": [{"itemCode": "005930"}], "hasNext": True, "cursor": "next"},

@@ -40,7 +40,9 @@ class ProbeError(ValueError):
 
 def expected_session(now):
     day = now.astimezone(KST).date()
-    if now.astimezone(KST).time() < time(16, 10) or not is_krx_trading_day(day):
+    # KRX close (15:30) is independent from the deployment freeze (16:10).
+    # 16:00 IC collection must accept today's completed index bar.
+    if now.astimezone(KST).time() < time(15, 30) or not is_krx_trading_day(day):
         day -= timedelta(days=1)
     while not is_krx_trading_day(day):
         day -= timedelta(days=1)
