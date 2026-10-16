@@ -103,6 +103,18 @@ def test_index_expected_session_distinguishes_premarket_and_1600_ic():
     assert health.expected_session(AT.replace(day=17, hour=16)) == date(2026, 10, 16)
 
 
+@pytest.mark.parametrize('url', ['https://STOCK.NAVER.COM/api', 'https://stock.naver.com:443/api'])
+def test_runtime_naver_redirect_policy_matches_manifest_variants(monkeypatch, url):
+    from src import collectors
+    calls = []
+    def get(*args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(status_code=302)
+    monkeypatch.setattr(collectors.requests, 'get', get)
+    assert collectors._fetch_with_retries(url, lambda t: t) is None
+    assert len(calls) == 1 and calls[0]['allow_redirects'] is False
+
+
 def test_member_pagination_must_be_complete(monkeypatch):
     pages = iter([
         {"items": [{"itemCode": "005930"}], "hasNext": True, "cursor": "next"},

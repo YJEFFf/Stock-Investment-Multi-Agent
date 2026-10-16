@@ -12,6 +12,7 @@ from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypeVar
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
@@ -73,7 +74,7 @@ def _fetch_with_retries(
     merged_headers = {"User-Agent": USER_AGENT, **(headers or {})}
     last_error: Exception | None = None
 
-    naver = any(url.startswith(f"https://{host}/") for host in collector_routes.HOSTS)
+    naver = urlsplit(url).scheme == "https" and urlsplit(url).hostname in collector_routes.HOSTS
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             with _REQUEST_SEMAPHORE:
