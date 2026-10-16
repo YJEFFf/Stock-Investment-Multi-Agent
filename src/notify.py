@@ -167,7 +167,7 @@ def format_buy_decision_alert(day: str, names: list[str]) -> str:
     2026-08-11 — 침묵이 "신호 없음"인지 "cron이 안 돎"인지 구분이 안 되는 문제)."""
     if not names:
         return f"🔎 [SIMA] 매수 판단 완료 ({day})\n승인 0건 — 오늘은 매수 후보 없음"
-    return f"🔎 [SIMA] 매수 판단 완료 ({day})\n승인 {len(names)}건: {', '.join(names)}\n집행은 09:00 장 시작 직후"
+    return f"🔎 [SIMA] 매수 판단 완료 ({day})\n승인 {len(names)}건: {', '.join(names)}\n집행은 09:01"
 
 
 def format_gate_headroom_broken_alert(headroom: dict) -> str:
@@ -249,7 +249,7 @@ def format_sell_decision_alert(day: str, names: list[str]) -> str:
         return f"🔎 [SIMA] 재량 매도 판단 완료 ({day})\n매도 결정 0건 — 보유 종목 유지"
     return (
         f"🔎 [SIMA] 재량 매도 판단 완료 ({day})\n매도 결정 {len(names)}건: {', '.join(names)}"
-        "\n집행은 다음 거래일 09:00 장 시작 직후"
+        "\n집행은 다음 거래일 09:01"
     )
 
 
@@ -344,8 +344,8 @@ def alert_once_per_day(context_key: str, message: str, today: date | None = None
     except OSError:
         pass  # 마커를 못 읽으면 "아직 안 보냈다"로 본다 — 알림은 놓치는 쪽이 더 위험하다
 
-    send_telegram_alert(message)
-
+    if not send_telegram_alert(message):
+        return False
     try:
         ALERT_MARKER_DIR.mkdir(parents=True, exist_ok=True)
         marker.write_text(today.isoformat())

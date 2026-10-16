@@ -31,7 +31,7 @@ install -d -m 700 -o sima-web -g sima-web /var/lib/sima-pwa
 install -d -m 755 -o sima-web -g sima-web /var/lib/sima-pwa/data
 if [ ! -d "$PWA_RELEASE" ]; then
   install -d -m 755 "$PWA_RELEASE"
-  sudo -u ubuntu git archive "$PWA_COMMIT" src web scripts/mobile.py pyproject.toml uv.lock | tar -x -C "$PWA_RELEASE"
+  sudo -u ubuntu git archive "$PWA_COMMIT" src config web scripts/mobile.py pyproject.toml uv.lock | tar -x -C "$PWA_RELEASE"
 fi
 "$PWA_UV" sync --project "$PWA_RELEASE" --python /usr/bin/python3 --frozen --no-dev --cache-dir /var/cache/sima-pwa-uv
 chmod -R a+rX "$PWA_RELEASE"

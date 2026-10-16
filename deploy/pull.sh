@@ -11,6 +11,8 @@
 set -euo pipefail
 cd "$HOME/sima"
 export PATH="$HOME/.local/bin:$PATH"
+exec 9>"$HOME/sima/.deploy.lock"
+flock -n 9 || { echo "거부: 다른 배포가 진행 중이다." >&2; exit 7; }
 
 if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "거부: 운영 체크아웃에 추적 파일 변경이 있다. 먼저 원인을 확인할 것." >&2
@@ -44,6 +46,9 @@ TRADING_PATHS=(
   src/codex_plan.py
   src/order_guard.py src/order_recovery.py
   src/run_history.py
+  src/collector_routes.py src/collector_health.py src/collector_repair.py
+  config/collector_routes.json prompts/collector_repair.md prompts/collector_repair_review.md
+  scripts/collector_preflight.py scripts/collector_preflight.sh
   scripts/execute_open.py scripts/check_stop_loss.py scripts/decide_buys.py scripts/decide_llm_sell.py
   scripts/check_codex_plan.py
   scripts/repair_20261005.py
@@ -66,6 +71,7 @@ fi
 # 검사한 바로 그 커밋으로만 옮긴다. `git pull`은 한 번 더 fetch해서, 검사 뒤에 push된 커밋이
 # 리뷰 없이 따라 들어올 수 있다(독립 리뷰 지적).
 OLD_HEAD=$(git rev-parse HEAD)
+DEPLOY_CHECKOUT=$(mktemp -d "$HOME/sima-deploy-check-XXXXXX")
 CRONTAB_BACKUP=$(mktemp)
 CRONTAB_ERROR=$(mktemp)
 HAD_CRONTAB=0
@@ -76,6 +82,8 @@ elif grep -q '^no crontab for ' "$CRONTAB_ERROR"; then
 else
   cat "$CRONTAB_ERROR" >&2
   rm -f "$CRONTAB_BACKUP" "$CRONTAB_ERROR"
+  git worktree remove --force "$DEPLOY_CHECKOUT/repo" >/dev/null 2>&1 || true
+  rm -rf "$DEPLOY_CHECKOUT"
   echo "거부: 기존 크론을 읽지 못해 안전한 롤백 상태를 만들 수 없다." >&2
   exit 6
 fi
@@ -92,12 +100,26 @@ rollback_on_failure() {
     echo "배포 실패: 코드와 크론을 $OLD_HEAD 상태로 복구했다." >&2
   fi
   rm -f "$CRONTAB_BACKUP" "$CRONTAB_ERROR"
+  git worktree remove --force "$DEPLOY_CHECKOUT/repo" >/dev/null 2>&1 || true
+  rm -rf "$DEPLOY_CHECKOUT"
   exit "$status"
 }
 trap rollback_on_failure EXIT
 
+# 운영 logs/는 24시간 watchdog이 갱신하므로 테스트는 격리 checkout에서 한다.
+# 동일 TARGET을 검사하고, 종료 후에도 장중 차단 시간을 다시 확인한다.
+git worktree add --quiet --detach "$DEPLOY_CHECKOUT/repo" "$TARGET"
+(cd "$DEPLOY_CHECKOUT/repo" && "$HOME/sima/.venv/bin/python" -m pytest -q) 2>&1 | tail -2
+uv run python - <<'PY'
+import sys
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+from src.market_calendar import is_krx_trading_day
+now = datetime.now(ZoneInfo("Asia/Seoul"))
+if is_krx_trading_day(now.date()) and time(8, 25) <= now.time() < time(16, 10):
+    sys.exit("거부: 검증 중 배포 금지 시간에 진입했다.")
+PY
 git merge --ff-only --quiet "$TARGET"
-uv run pytest -q 2>&1 | tail -2
 if ! cmp -s <(crontab -l 2>/dev/null || true) deploy/crontab; then
   crontab deploy/crontab
   echo "crontab updated from deploy/crontab"

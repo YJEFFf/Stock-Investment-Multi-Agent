@@ -2,6 +2,7 @@ import asyncio
 from contextvars import ContextVar
 import json
 import logging
+import os
 import re
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, time, timedelta, timezone
@@ -802,6 +803,8 @@ async def quant_prefilter(
     """
     log_path = log_path or DEFAULT_PREFILTER_LOG_PATH
     index_bars = await asyncio.to_thread(collectors.fetch_kospi200_index_bars, lookback_days)
+    if not index_bars and os.environ.get("SIMA_COLLECTOR_AUTOREPAIR") == "1":
+        raise DataCollectionUnavailable("index_input_unavailable")
     index_indicators = collectors.compute_indicators(index_bars) if index_bars else {}
     index_return_5d_pct = index_indicators.get("return_5d_pct")
     record = run_history.CURRENT.get()

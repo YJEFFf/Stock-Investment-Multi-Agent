@@ -160,6 +160,13 @@ async def _main() -> None:
             notify.send_telegram_alert(notify.format_codex_capacity_skip_alert(capacity.model_dump(mode="json")))
             return
 
+    from src import collector_repair
+    if problem := collector_repair.preanalysis_problem(day):
+        _write_pending_state(today_kst.isoformat(), [], skipped=problem)
+        notify.send_telegram_alert(notify.format_error_alert(
+            "장전 수집 점검 미완료 — 오늘 신규 매수 판단 중지", problem))
+        return
+
     seconds_until_deadline = _seconds_until_deadline(day)
     if seconds_until_deadline <= 0:
         _write_pending_state(today_kst.isoformat(), [], skipped="decision_started_after_deadline")

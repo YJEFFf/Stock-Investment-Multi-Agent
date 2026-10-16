@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
 
-from src import kis
+from src import kis, collector_routes
 from src.schemas import DisclosureItem, MarketContext, NewsItem, OHLCVBar
 
 load_dotenv()
@@ -73,18 +73,26 @@ def _fetch_with_retries(
     merged_headers = {"User-Agent": USER_AGENT, **(headers or {})}
     last_error: Exception | None = None
 
+    naver = any(url.startswith(f"https://{host}/") for host in collector_routes.HOSTS)
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             with _REQUEST_SEMAPHORE:
                 response = requests.get(
-                    url, params=params, headers=merged_headers, timeout=REQUEST_TIMEOUT_SECONDS
+                    url, params=params, headers=merged_headers, timeout=REQUEST_TIMEOUT_SECONDS,
+                    **({"allow_redirects": False} if naver else {}),
                 )
+            if naver and getattr(response, "status_code", None) in (301, 302, 303, 307, 308):
+                raise ValueError("Naver endpoint redirected; collector repair required")
             response.raise_for_status()
             payload = response.content if binary else response.text
             return parse(payload)
-        except (requests.RequestException, ET.ParseError, ValueError, zipfile.BadZipFile) as exc:
+        except (requests.RequestException, ET.ParseError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as exc:
             last_error = exc
             logger.warning("fetch_failed url=%s attempt=%d error=%s", url, attempt, exc)
+            if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code in (404, 410):
+                break  # 폐기된 주소를 세 번 기다려도 복구되지 않는다.
+            if naver and isinstance(exc, ValueError) and "endpoint redirected" in str(exc):
+                break
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
@@ -222,12 +230,16 @@ def fetch_kospi200_index_bars(lookback_days: int = 60) -> list[OHLCVBar] | None:
     params = {"symbol": KOSPI200_INDEX_SYMBOL, "timeframe": "day", "count": lookback_days, "requestType": 0}
 
     def _parse(xml_text: str) -> list[OHLCVBar]:
+        if os.environ.get("SIMA_COLLECTOR_AUTOREPAIR") == "1":
+            # 실제 분석 입력도 검사한다. 장전 canary 통과로 나중 응답을 신뢰하지 않는다.
+            from src.collector_health import index_data
+            index_data(xml_text, datetime.now(ZoneInfo("Asia/Seoul")))
         bars = _parse_bars(xml_text)
         if not bars:
             raise ValueError("no bars parsed for KOSPI200 index")
         return bars
 
-    return _fetch_with_retries(NAVER_CHART_URL, _parse, params=params)
+    return _fetch_with_retries(collector_routes.url("index", NAVER_CHART_URL), _parse, params=params)
 
 
 _KOSPI200_CONSTITUENT_ROW_PATTERN = re.compile(
@@ -340,11 +352,11 @@ def _parse_sector_json(text: str) -> dict | list:
 
 def _fetch_sector_map_json() -> dict[str, str] | None:
     """네이버 개편 후 같은 업종 분류의 JSON 경로. 모든 페이지를 검증한다."""
-    base = "https://stock.naver.com/api/domestic/market/upjong"
     groups = []
     seen_groups = set()
     while True:
-        page = _fetch_with_retries(base + "/list", _parse_sector_json,
+        page = _fetch_with_retries(collector_routes.url("sector_groups"),
+                                  lambda t: _parse_sector_json(collector_routes.normalize("sector_groups", t)),
                                   params={"startIdx": len(groups), "pageSize": 100, "sortType": "changeRate"})
         if not isinstance(page, list):
             return None
@@ -368,7 +380,8 @@ def _fetch_sector_map_json() -> dict[str, str] | None:
             params = {"size": 100, "sortType": "marketCap", "sortDirection": "desc"}
             if cursor:
                 params["cursor"] = cursor
-            page = _fetch_with_retries(f"{base}/{group['no']}/stocklist", _parse_sector_json, params=params)
+            page = _fetch_with_retries(collector_routes.url("sector_members", group=group['no']),
+                                      lambda t: _parse_sector_json(collector_routes.normalize("sector_members", t)), params=params)
             if (not isinstance(page, dict) or not isinstance(page.get("items"), list)
                     or type(page.get("hasNext")) is not bool):
                 return None
@@ -567,7 +580,8 @@ def fetch_company_news(ticker: str, limit: int = 10) -> list[NewsItem] | None:
     if not re.fullmatch(r"[0-9A-Z]{6}", ticker):
         raise ValueError("invalid stock code")
     items = _fetch_with_retries(
-        NAVER_STOCK_NEWS_API_URL.format(ticker=ticker), _parse_company_news_api,
+        collector_routes.url("stock_news", NAVER_STOCK_NEWS_API_URL, ticker=ticker),
+        lambda t: _parse_company_news_api(collector_routes.normalize("stock_news", t)),
         params={"page": 1, "pageSize": limit},
     )
     if items is None:
@@ -603,10 +617,39 @@ def fetch_sector_news(sector: str, limit: int = 10) -> list[NewsItem] | None:
     단위라 회사명 매칭보다 오탐 허용 범위가 넓다). 개별 기사 타임스탬프는 이 페이지에
     없어 published_at은 항상 None이다.
     """
-    items = _fetch_with_retries(NAVER_NEWS_HUB_URL, lambda text: _parse_sector_news(text, sector))
+    def parse_hub(text):
+        if not _SECTOR_HEADLINE_PATTERN.search(text):
+            raise ValueError("news hub layout changed")
+        return _parse_sector_news(text, sector)
+
+    items = _fetch_with_retries(
+        collector_routes.url("sector_news"),
+        lambda t: [n for n in _parse_news_hub_api(collector_routes.normalize("sector_news", t)) if sector in n.title],
+        params={"category": "FLASHNEWS", "page": 1, "pageSize": 50},
+    )
+    if items is None:
+        items = _fetch_with_retries(NAVER_NEWS_HUB_URL, parse_hub)
     if items is None:
         return None
     return items[:limit]
+
+
+def _parse_news_hub_api(text: str) -> list[NewsItem]:
+    """개편된 동일 시황 허브. 전체 응답 형식을 확인한 뒤 업종명으로 거른다."""
+    payload = json.loads(text)
+    if not isinstance(payload, dict) or not isinstance(payload.get("articles"), list):
+        raise ValueError("news hub missing articles")
+    items = []
+    for row in payload["articles"]:
+        if not isinstance(row, dict) or not isinstance(row.get("title"), str) or not row["title"].strip():
+            raise ValueError("news hub missing title")
+        office, article = row.get("officeId"), row.get("articleId")
+        if not isinstance(office, str) or not re.fullmatch(r"\d{3}", office) or not isinstance(article, str) or not re.fullmatch(r"\d{10}", article):
+            raise ValueError("news hub invalid article identity")
+        published = datetime.strptime(row["datetime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        items.append(NewsItem(title=html.unescape(row["title"]), press=row.get("officeHname") or None,
+                              published_at=published, url=f"https://n.news.naver.com/mnews/article/{office}/{article}"))
+    return items
 
 
 _corp_code_cache: dict[str, str] | None = None
@@ -725,9 +768,9 @@ def fetch_naver_quotes(tickers: list[str], *, today: date | None = None) -> dict
     if not tickers:
         return {}
     today = today or datetime.now(ZoneInfo("Asia/Seoul")).date()
-    url = NAVER_REALTIME_QUOTE_URL.format(codes=",".join(tickers))
+    url = collector_routes.url("quotes", NAVER_REALTIME_QUOTE_URL, codes=",".join(tickers))
     try:
-        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=NAVER_REALTIME_TIMEOUT_S)
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=NAVER_REALTIME_TIMEOUT_S, allow_redirects=False)
         payload = response.json()
     except (requests.RequestException, ValueError) as exc:
         logger.warning("naver_quote_fetch_failed tickers=%s error=%s", tickers, exc)

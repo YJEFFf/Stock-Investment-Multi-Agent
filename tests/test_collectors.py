@@ -256,7 +256,7 @@ def test_fetch_kospi200_sector_map_builds_map_from_all_groups(monkeypatch):
         ("sise_group_detail.naver", "272"): FakeResponse(FAKE_SECTOR_MEMBERS_272_HTML),
     }
 
-    def fake_get(url, params=None, headers=None, timeout=None):
+    def fake_get(url, params=None, headers=None, timeout=None, **kwargs):
         key = (url.rsplit("/", 1)[-1], (params or {}).get("no"))
         return responses[key]
 
@@ -305,7 +305,7 @@ def test_fetch_kospi200_sector_map_refetches_when_cache_stale(monkeypatch):
         ("sise_group_detail.naver", "272"): FakeResponse(FAKE_SECTOR_MEMBERS_272_HTML),
     }
 
-    def fake_get(url, params=None, headers=None, timeout=None):
+    def fake_get(url, params=None, headers=None, timeout=None, **kwargs):
         key = (url.rsplit("/", 1)[-1], (params or {}).get("no"))
         return responses[key]
 

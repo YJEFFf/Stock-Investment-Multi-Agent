@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "routes": {
+    "index": {
+      "url": "https://fchart.stock.naver.com/sise.nhn",
+      "root": [],
+      "keys": {}
+    },
+    "stock_news": {
+      "url": "https://m.stock.naver.com/api/news/stock/{ticker}",
+      "root": [],
+      "keys": {}
+    },
+    "sector_news": {
+      "url": "https://stock.naver.com/api/domestic/news/list",
+      "root": [],
+      "keys": {}
+    },
+    "sector_groups": {
+      "url": "https://stock.naver.com/api/domestic/market/upjong/list",
+      "root": [],
+      "keys": {}
+    },
+    "sector_members": {
+      "url": "https://stock.naver.com/api/domestic/market/upjong/{group}/stocklist",
+      "root": [],
+      "keys": {}
+    },
+    "quotes": {
+      "url": "https://polling.finance.naver.com/api/realtime/domestic/stock/{codes}",
+      "root": [],
+      "keys": {}
+    }
+  }
+}

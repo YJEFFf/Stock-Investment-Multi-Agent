@@ -10,3 +10,4 @@ logs/
 .kospi200_ticker_name_cache.json
 
 .kis_request_clock
+.deploy.lock
