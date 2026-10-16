@@ -13,14 +13,10 @@
 # 한도 상태를 확인할 수 없으면 08:30 신규 매수 판단은 실패 폐쇄한다.
 5 8 * * 1-5      /home/ubuntu/sima/scripts/check_codex_plan.sh
 
-# 24시간 5분마다 네이버 6경로 점검. 거래일 08:15~16:10에는 오류를 대기열에 저장.
-# 16:10부터 재확인·자동 수리. 장외는 발견 회차에서 즉시 수리(첫 정상 섀도 후).
-# 장전/장후 각 2회, 휴장일 2회 한도. 실패 후 30분 간격. 분석 재실행 없음.
-# 최초 정상 거래일 장후 전체 섀도 점검이 저장된 뒤에만 다음 날부터 자동 배포 가능.
-# 07:30/16:10/16:20은 모든 업종 구성종목까지 전체 검사, 나머지는 canary 검사.
-*/5 * * * *    /home/ubuntu/sima/scripts/collector_preflight.sh --monitor
-# 감시기는 수리 작업과 별도 락으로 24시간 동작. 같은 서버 전체 정지는 감지 불가.
-2-59/5 * * * * /home/ubuntu/sima/scripts/collector_preflight.sh --watchdog
+# 상시/주기 수집 감시 없음. 매수 판단·보유 감시·장후 측정의 실제 실패만 수리 요청으로 저장.
+# 아래는 오류가 있을 때만 조회·수리하는 대기열 처리. 오류 없으면 HTTP/모델/정상 알림 없음.
+# 16:10 장후 수리, 실패 시 16:40 재시도(최대2회). 성공한 분석은 재실행하지 않는다.
+10,40 16 * * 1-5 /home/ubuntu/sima/scripts/collector_preflight.sh --pending
 
 # 08:30 — Codex Sol 매수 판단만. 승인분을 pending에 기록하고 집행은 안 함. 개장 30분 전.
 30 8 * * 1-5    /home/ubuntu/sima/scripts/decide_buys.sh

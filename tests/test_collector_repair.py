@@ -9,6 +9,8 @@ import requests
 
 from src import collector_routes as routes, collector_health as health, collector_repair as repair, notify
 
+REAL_NAVER_QUOTES = health.collectors.fetch_naver_quotes
+
 AT = datetime(2026, 10, 19, 8, 0, tzinfo=health.KST)
 
 
@@ -167,23 +169,17 @@ def test_failed_daily_alert_enqueue_does_not_consume_marker(monkeypatch):
     assert notify.alert_once_per_day("failed_write", "message") is True
 
 
-def test_preanalysis_missing_stale_failed_or_different_version_blocks(monkeypatch):
+def test_preanalysis_does_not_require_periodic_probe_but_incomplete_deployment_blocks(monkeypatch):
     monkeypatch.setenv("SIMA_COLLECTOR_AUTOREPAIR", "1")
-    assert repair.preanalysis_problem(AT) == "collector_preflight_missing"
-    value = good_report()
-    repair.atomic_json(repair.STATE_DIR / "latest.json", value)
     assert repair.preanalysis_problem(AT) is None
-    value["checked_at"] = (AT - timedelta(minutes=36)).isoformat()
-    repair.atomic_json(repair.STATE_DIR / "latest.json", value)
-    assert repair.preanalysis_problem(AT) == "collector_preflight_stale"
     value = good_report()
-    value["manifest"] = "different"
-    repair.atomic_json(repair.STATE_DIR / "latest.json", value)
-    assert repair.preanalysis_problem(AT) == "collector_preflight_version_mismatch"
-    value = good_report()
+    value["checked_at"] = (AT - timedelta(days=3)).isoformat()
+    value["manifest"] = "old-version"
     value["sources"]["index"]["status"] = "stale"
     repair.atomic_json(repair.STATE_DIR / "latest.json", value)
-    assert repair.preanalysis_problem(AT) == "collector_index_unavailable"
+    assert repair.preanalysis_problem(AT) is None
+    repair.atomic_json(repair.STATE_DIR / "transaction.json", {"status": "publishing"})
+    assert repair.preanalysis_problem(AT) == "collector_deployment_incomplete"
 
 
 def test_optional_news_failure_is_visible_without_mandatory_block(monkeypatch):
@@ -220,7 +216,7 @@ def test_shadow_day_required_and_transient_errors_never_invoke_model(monkeypatch
     assert repair.read_state()["attempts"] == {}
 
 
-def test_watchdog_independent_from_worker_and_stale_completion(monkeypatch):
+def test_watchdog_does_not_alert_about_intentionally_idle_worker(monkeypatch):
     monkeypatch.setattr(repair, "now", lambda: AT.replace(hour=8, minute=23))
     sent = []
     monkeypatch.setattr(notify, "send_telegram_alert", lambda m: sent.append(m) or True)
@@ -229,7 +225,7 @@ def test_watchdog_independent_from_worker_and_stale_completion(monkeypatch):
     repair.atomic_json(repair.STATE_DIR / "state.json", state)
     before = (repair.STATE_DIR / "state.json").read_bytes()
     repair.watchdog()
-    assert sent and "완료 기록 없음" in sent[0]
+    assert sent == []
     assert before == (repair.STATE_DIR / "state.json").read_bytes()
 
 
@@ -530,7 +526,7 @@ def test_intraday_monitor_rejects_frozen_krx_quotes():
         health.quotes_data(json.dumps({'datas': rows}), at, monitoring=True)
 
 
-@pytest.mark.parametrize('running,age,problem', [(False, 11, True), (False, 5, False), (True, 19, False), (True, 21, True)])
+@pytest.mark.parametrize('running,age,problem', [(False, 11, False), (False, 5, False), (True, 19, False), (True, 21, True)])
 def test_watchdog_works_at_night_with_bounded_worker_grace(monkeypatch, running, age, problem):
     at = AT.replace(day=17, hour=23)
     monkeypatch.setattr(repair, 'now', lambda: at)
@@ -566,3 +562,189 @@ def test_controller_error_recovery_and_recurrence_notifications(monkeypatch):
     for error in ('exception', 'exception', None, 'exception'):
         repair.controller_status('worker_process', error)
     assert len(sent) == 3
+
+
+def test_empty_pending_queue_never_probes_models_or_sends_health_alerts(monkeypatch):
+    monkeypatch.setattr(health, 'probe', lambda *a, **k: pytest.fail('unsolicited probe'))
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda *a: pytest.fail('normal health alert'))
+    # Old periodic monitoring state must not create artificial jobs or stale alerts.
+    state = repair.read_state()
+    state['completed_at'] = (AT - timedelta(days=3)).isoformat()
+    state['pending_repairs'] = {'index': {'status': 'waiting_close'}}
+    repair.atomic_json(repair.STATE_DIR / 'state.json', state)
+    assert repair.process_pending() is None
+
+
+def test_actual_failed_fetch_queues_exact_request_and_matching_success_closes_it(monkeypatch):
+    from src import collectors
+    monkeypatch.setenv('SIMA_COLLECTOR_AUTOREPAIR', '1')
+    monkeypatch.setattr(collectors.time, 'sleep', lambda *a: None)
+    sent = []
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: sent.append(m) or True)
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: (_ for _ in ()).throw(requests.Timeout()))
+    assert collectors.fetch_company_news('005930') is None
+    entry = repair.read_workflow()['requests']['stock_news']
+    assert list(entry['samples'].values())[0]['slots'] == {'ticker': '005930'}
+    assert len(sent) == 1
+    # A different ticker's success must not close this incident; empty news is valid.
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: SimpleNamespace(text='[]', raise_for_status=lambda: None))
+    assert collectors.fetch_company_news('000660') == []
+    assert 'stock_news' in repair.read_workflow()['requests']
+    assert collectors.fetch_company_news('005930') == []
+    assert repair.read_workflow()['requests'] == {}
+    assert len(sent) == 2
+
+
+def test_failed_quote_and_stale_sector_cache_refresh_are_recorded(monkeypatch):
+    from src import collectors
+    monkeypatch.setenv('SIMA_COLLECTOR_AUTOREPAIR', '1')
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: True)
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: SimpleNamespace(json=lambda: {'unexpected': []}))
+    assert REAL_NAVER_QUOTES(['005930']) == {}
+    monkeypatch.setattr(collectors, '_read_sector_cache', lambda: ({'005930': '반도체'}, AT - timedelta(days=90)))
+    monkeypatch.setattr(collectors, '_fetch_sector_map_live', lambda: None)
+    assert collectors.fetch_kospi200_sector_map() == {'005930': '반도체'}
+    assert set(repair.read_workflow()['requests']) == {'quotes', 'sector_groups'}
+
+
+def test_queue_write_failure_does_not_break_collection_failure_contract(monkeypatch):
+    from src import collectors
+    monkeypatch.setenv('SIMA_COLLECTOR_AUTOREPAIR', '1')
+    monkeypatch.setattr(repair, 'request_repair', lambda *a, **k: (_ for _ in ()).throw(OSError('disk full')))
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: (_ for _ in ()).throw(requests.Timeout()))
+    monkeypatch.setattr(collectors.time, 'sleep', lambda *a: None)
+    assert collectors.fetch_company_news('005930') is None
+
+
+def test_real_success_refreshes_baseline_without_another_request(monkeypatch):
+    from src import collectors
+    monkeypatch.setenv('SIMA_COLLECTOR_AUTOREPAIR', '1')
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda *a: pytest.fail('normal alert'))
+    monkeypatch.setattr(health, 'probe', lambda *a, **k: pytest.fail('extra HTTP probe'))
+    calls = []
+    def get(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(text=index_xml(), raise_for_status=lambda: None)
+    monkeypatch.setattr(requests, 'get', get)
+    # Actual input validates with wall clock, fixed to this fixture here.
+    monkeypatch.setattr(collectors, 'datetime', type('FixedTime', (datetime,), {'now': classmethod(lambda cls, tz=None: AT)}))
+    assert len(collectors.fetch_kospi200_index_bars()) == 60
+    baseline = repair.read_workflow()['baseline']['index']
+    assert baseline['status'] == 'ok' and len(baseline['data']) == 60
+    assert len(calls) == 1
+
+
+def test_canary_success_does_not_claim_original_request_recovered_or_repeat_probe(monkeypatch):
+    monkeypatch.setenv('SIMA_COLLECTOR_AUTOREPAIR', '1')
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=16, minute=10))
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: True)
+    state = repair.read_state()
+    state['shadow_days'] = ['2026-10-16']
+    repair.atomic_json(repair.STATE_DIR / 'state.json', state)
+    repair.request_repair('stock_news', 'specific ticker failed', slots={'ticker': '123456'})
+    calls = []
+    monkeypatch.setattr(repair, 'check', lambda **k: calls.append(k) or good_report())
+    repair.process_pending()
+    assert repair.read_workflow()['requests']['stock_news']['diagnosed_generation']
+    assert repair.read_workflow()['incidents']['stock_news']['open']
+    repair.process_pending()
+    assert len(calls) == 1
+    repair.request_repair('stock_news', 'same ticker failed again', slots={'ticker': '123456'})
+    repair.process_pending()
+    assert len(calls) == 2
+
+
+def test_diagnosis_preserves_new_failure_and_member_failure(monkeypatch):
+    monkeypatch.setenv('SIMA_COLLECTOR_AUTOREPAIR', '1')
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=16, minute=10))
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: True)
+    state = repair.read_state()
+    state['shadow_days'] = ['2026-10-16']
+    repair.atomic_json(repair.STATE_DIR / 'state.json', state)
+    repair.request_repair('sector_groups', 'map refresh failed')
+    value = good_report()
+    value['sources']['sector_members'] = {'status': 'structure', 'error': 'wrong members'}
+    monkeypatch.setattr(repair, 'check', lambda **k: value)
+    repair.process_pending()
+    assert 'diagnosed_generation' not in repair.read_workflow()['requests']['sector_groups']
+    def racing_check(**kwargs):
+        repair.request_repair('sector_groups', 'new incident during diagnosis')
+        return good_report()
+    monkeypatch.setattr(repair, 'check', racing_check)
+    repair.process_pending()
+    assert 'diagnosed_generation' not in repair.read_workflow()['requests']['sector_groups']
+
+
+@pytest.mark.parametrize('healthy_pre,healthy_close,failed_midday,ready', [(True, True, False, True), (False, True, False, False), (True, False, False, False), (True, True, True, False)])
+def test_passive_shadow_requires_normal_workflow_and_close_without_extra_probes(monkeypatch, healthy_pre, healthy_close, failed_midday, ready):
+    monkeypatch.setenv('SIMA_COLLECTOR_AUTOREPAIR', '1')
+    monkeypatch.setattr(health, 'probe', lambda *a, **k: pytest.fail('extra shadow probe'))
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: True)
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=8, minute=50))
+    repair.workflow_finished('premarket', healthy=healthy_pre)
+    if failed_midday:
+        repair.request_repair('quotes', 'workflow failure')
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=16, minute=2))
+    repair.workflow_finished('afterclose', healthy=healthy_close)
+    assert repair.shadow_ready(repair.read_state(), AT.replace(day=20)) is ready
+    assert not repair.shadow_ready(repair.read_state(), AT.replace(hour=20))
+
+
+def test_passive_shadow_rejects_changed_manifest(monkeypatch):
+    monkeypatch.setenv('SIMA_COLLECTOR_AUTOREPAIR', '1')
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=8, minute=50))
+    repair.workflow_finished('premarket', healthy=True)
+    candidate = routes.default_manifest()
+    candidate['routes']['stock_news']['url'] = 'https://m.stock.naver.com/api/v2/news/stock/{ticker}'
+    monkeypatch.setattr(routes, 'load', lambda: candidate)
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=16))
+    repair.workflow_finished('afterclose', healthy=True)
+    assert not repair.shadow_ready(repair.read_state(), AT.replace(day=20))
+
+
+def test_same_problem_has_no_periodic_status_alerts(monkeypatch):
+    state, sent = repair.read_state(), []
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: sent.append(m) or True)
+    for minute in (0, 5, 15, 45):
+        repair.report(state, 'index', True, 'waiting', phase='waiting_close', at=AT + timedelta(minutes=minute))
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize('allowed', [True, False])
+def test_codex_preparation_only_notifies_when_blocked(monkeypatch, allowed):
+    import asyncio
+    from scripts import check_codex_plan as script
+    monkeypatch.setattr(script, 'datetime', type('FixedTime', (datetime,), {'now': classmethod(lambda cls, tz=None: AT)}))
+    capacity = SimpleNamespace(buy_judgment_allowed=allowed, remaining_percent=50 if allowed else 1,
+                               resets_at=AT, model_dump=lambda **k: {})
+    async def health_ok():
+        return SimpleNamespace(status='ok')
+    async def capacity_ok():
+        return capacity
+    monkeypatch.setattr(script.codex_plan, 'check_health', health_ok)
+    monkeypatch.setattr(script.codex_plan, 'read_capacity', capacity_ok)
+    monkeypatch.setattr(script.codex_plan, 'save_capacity_status', lambda c: None)
+    monkeypatch.setattr(notify, 'format_codex_capacity_alert', lambda c: 'blocked')
+    sent = []
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: sent.append(m) or True)
+    asyncio.run(script.main())
+    assert sent == ([] if allowed else ['blocked'])
+
+
+def test_sector_member_validation_failure_is_queued_with_group(monkeypatch):
+    from src import collectors
+    monkeypatch.setenv('SIMA_COLLECTOR_AUTOREPAIR', '1')
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: True)
+    replies = iter([[{'no': '42', 'name': '반도체', 'type': 'upjong', 'totalCnt': 1}], {'items': [], 'hasNext': True}])
+    monkeypatch.setattr(collectors, '_fetch_with_retries', lambda *a, **k: next(replies))
+    assert collectors._fetch_sector_map_json() is None
+    entry = repair.read_workflow()['requests']['sector_members']
+    assert list(entry['samples'].values())[0]['slots'] == {'group': '42'}
+
+
+def test_parallel_failure_writes_preserve_all_request_samples(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: True)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda n: repair.request_repair('stock_news', 'timeout', slots={'ticker': f'{n:06d}'}), range(12)))
+    assert len(repair.read_workflow()['requests']['stock_news']['samples']) == 12

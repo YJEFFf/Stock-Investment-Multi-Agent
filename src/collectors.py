@@ -57,6 +57,28 @@ _REQUEST_SEMAPHORE = threading.Semaphore(5)
 T = TypeVar("T")
 
 
+def _queue_collection_failure(source: str, error: str, **context) -> None:
+    """Record actual workflow failures, without another HTTP request or model call."""
+    if os.environ.get("SIMA_COLLECTOR_AUTOREPAIR") != "1":
+        return
+    try:
+        from src.collector_repair import request_repair
+        request_repair(source, error, **context)
+    except Exception:
+        # Reporting must not break stop-loss evaluation or replace its failure result.
+        logger.exception("collector_repair_request_failed source=%s", source)
+
+
+def _record_collection_success(source: str, payload=None, **context) -> None:
+    if os.environ.get("SIMA_COLLECTOR_AUTOREPAIR") != "1":
+        return
+    try:
+        from src.collector_repair import source_succeeded
+        source_succeeded(source, payload, **context)
+    except Exception:
+        logger.exception("collector_repair_evidence_failed source=%s", source)
+
+
 def _fetch_with_retries(
     url: str,
     parse: Callable[[str | bytes], T],
@@ -64,6 +86,8 @@ def _fetch_with_retries(
     params: dict | None = None,
     headers: dict | None = None,
     binary: bool = False,
+    source: str | None = None,
+    source_slots: dict | None = None,
 ) -> T | None:
     """공통 HTTP GET + 파싱 재시도 로직.
 
@@ -86,7 +110,10 @@ def _fetch_with_retries(
                 raise ValueError("Naver endpoint redirected; collector repair required")
             response.raise_for_status()
             payload = response.content if binary else response.text
-            return parse(payload)
+            parsed = parse(payload)
+            if source and source not in {"sector_groups", "sector_members"}:
+                _record_collection_success(source, payload, slots=source_slots, params=params)
+            return parsed
         except (requests.RequestException, ET.ParseError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as exc:
             last_error = exc
             logger.warning("fetch_failed url=%s attempt=%d error=%s", url, attempt, exc)
@@ -98,6 +125,8 @@ def _fetch_with_retries(
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
     logger.error("fetch_exhausted url=%s error=%s", url, last_error)
+    if source:
+        _queue_collection_failure(source, str(last_error)[:400], slots=source_slots, params=params)
     return None
 
 
@@ -240,7 +269,7 @@ def fetch_kospi200_index_bars(lookback_days: int = 60) -> list[OHLCVBar] | None:
             raise ValueError("no bars parsed for KOSPI200 index")
         return bars
 
-    return _fetch_with_retries(collector_routes.url("index", NAVER_CHART_URL), _parse, params=params)
+    return _fetch_with_retries(collector_routes.url("index", NAVER_CHART_URL), _parse, params=params, source="index")
 
 
 _KOSPI200_CONSTITUENT_ROW_PATTERN = re.compile(
@@ -353,26 +382,31 @@ def _parse_sector_json(text: str) -> dict | list:
 
 def _fetch_sector_map_json() -> dict[str, str] | None:
     """네이버 개편 후 같은 업종 분류의 JSON 경로. 모든 페이지를 검증한다."""
+    def invalid(source, **context):
+        _queue_collection_failure(source, "업종 응답의 식별자·페이지·개수 검증 실패", **context)
+        return None
+
     groups = []
     seen_groups = set()
     while True:
         page = _fetch_with_retries(collector_routes.url("sector_groups"),
                                   lambda t: _parse_sector_json(collector_routes.normalize("sector_groups", t)),
-                                  params={"startIdx": len(groups), "pageSize": 100, "sortType": "changeRate"})
+                                  params={"startIdx": len(groups), "pageSize": 100, "sortType": "changeRate"}, source="sector_groups")
         if not isinstance(page, list):
-            return None
+            return invalid("sector_groups")
         for group in page:
             if (not isinstance(group, dict) or not str(group.get("no", "")).isdigit()
                     or not isinstance(group.get("name"), str) or not group["name"].strip()
                     or group["no"] in seen_groups or group.get("type") != "upjong"):
-                return None
+                return invalid("sector_groups")
             seen_groups.add(group["no"])
             groups.append(group)
         if len(page) < 100:
             break
     if not groups:
-        return None
+        return invalid("sector_groups")
     sector_map = {}
+    members_by_group = {}
     for group in groups:
         cursor = None
         cursors = set()
@@ -382,28 +416,31 @@ def _fetch_sector_map_json() -> dict[str, str] | None:
             if cursor:
                 params["cursor"] = cursor
             page = _fetch_with_retries(collector_routes.url("sector_members", group=group['no']),
-                                      lambda t: _parse_sector_json(collector_routes.normalize("sector_members", t)), params=params)
+                                      lambda t: _parse_sector_json(collector_routes.normalize("sector_members", t)), params=params, source="sector_members", source_slots={"group": group['no']})
             if (not isinstance(page, dict) or not isinstance(page.get("items"), list)
                     or type(page.get("hasNext")) is not bool):
-                return None
+                return invalid("sector_members", slots={"group": group["no"]})
             for item in page["items"]:
                 code = item.get("itemCode") if isinstance(item, dict) else None
                 if not isinstance(code, str) or not re.fullmatch(r"[0-9A-Z]{6}", code) or code in members:
-                    return None
+                    return invalid("sector_members", slots={"group": group["no"]})
                 members.add(code)
             if not page["hasNext"]:
                 break
             cursor = page.get("cursor")
             if not isinstance(cursor, str) or not cursor or cursor in cursors or not page["items"]:
-                return None
+                return invalid("sector_members", slots={"group": group["no"]})
             cursors.add(cursor)
         try:
             if len(members) != int(group["totalCnt"]):
-                return None
+                return invalid("sector_members", slots={"group": group["no"]})
         except (KeyError, ValueError, TypeError):
-            return None
+            return invalid("sector_members", slots={"group": group["no"]})
         for code in members:
             sector_map.setdefault(code, group["name"])
+        members_by_group[group["no"]] = sorted(members)
+    _record_collection_success("sector_groups", data={g['no']: {"name": g['name'], "count": int(g['totalCnt'])} for g in groups}, complete=True)
+    _record_collection_success("sector_members", data=members_by_group, complete=True)
     logger.info("sector_map_source source=naver_json groups=%d members=%d", len(groups), len(sector_map))
     return sector_map or None
 
@@ -455,6 +492,8 @@ def fetch_kospi200_sector_map() -> dict[str, str] | None:
     if fresh is not None:
         _write_sector_cache(fresh)
         return fresh
+
+    _queue_collection_failure("sector_groups", "업종 갱신 실패 또는 구성종목 응답 검증 실패; 기존 캐시 사용 여부와 별도로 수리 확인 필요")
 
     if cached is not None:
         logger.warning("sector_map_refresh_failed_using_stale_cache")
@@ -583,7 +622,7 @@ def fetch_company_news(ticker: str, limit: int = 10) -> list[NewsItem] | None:
     items = _fetch_with_retries(
         collector_routes.url("stock_news", NAVER_STOCK_NEWS_API_URL, ticker=ticker),
         lambda t: _parse_company_news_api(collector_routes.normalize("stock_news", t)),
-        params={"page": 1, "pageSize": limit},
+        params={"page": 1, "pageSize": limit}, source="stock_news", source_slots={"ticker": ticker},
     )
     if items is None:
         return None
@@ -626,7 +665,7 @@ def fetch_sector_news(sector: str, limit: int = 10) -> list[NewsItem] | None:
     items = _fetch_with_retries(
         collector_routes.url("sector_news"),
         lambda t: [n for n in _parse_news_hub_api(collector_routes.normalize("sector_news", t)) if sector in n.title],
-        params={"category": "FLASHNEWS", "page": 1, "pageSize": 50},
+        params={"category": "FLASHNEWS", "page": 1, "pageSize": 50}, source="sector_news",
     )
     if items is None:
         items = _fetch_with_retries(NAVER_NEWS_HUB_URL, parse_hub)
@@ -770,15 +809,18 @@ def fetch_naver_quotes(tickers: list[str], *, today: date | None = None) -> dict
         return {}
     today = today or datetime.now(ZoneInfo("Asia/Seoul")).date()
     url = collector_routes.url("quotes", NAVER_REALTIME_QUOTE_URL, codes=",".join(tickers))
+    slots = {"codes": ",".join(sorted(tickers))}
     try:
         response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=NAVER_REALTIME_TIMEOUT_S, allow_redirects=False)
         payload = response.json()
     except (requests.RequestException, ValueError) as exc:
         logger.warning("naver_quote_fetch_failed tickers=%s error=%s", tickers, exc)
+        _queue_collection_failure("quotes", f"보조 시세 요청 실패: {type(exc).__name__}", slots=slots)
         return {}
 
     if not isinstance(payload, dict) or not isinstance(payload.get("datas"), list):
         logger.warning("naver_quote_unexpected_payload tickers=%s type=%s", tickers, type(payload).__name__)
+        _queue_collection_failure("quotes", "보조 시세 응답 형식 검증 실패", slots=slots)
         return {}
 
     quotes: dict[str, kis.Quote] = {}
@@ -806,4 +848,8 @@ def fetch_naver_quotes(tickers: list[str], *, today: date | None = None) -> dict
             open_price=_naver_raw_number(row, "openPriceRaw") if traded_today else None,
             prev_close=prev_close if prev_close and prev_close > 0 else None,
         )
+    if set(tickers) - quotes.keys():
+        _queue_collection_failure("quotes", "보조 시세 응답의 요청 종목/가격 누락", slots=slots)
+    else:
+        _record_collection_success("quotes", json.dumps(payload), slots=slots)
     return quotes

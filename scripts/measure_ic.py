@@ -103,6 +103,11 @@ def main() -> int:
         json.dumps({"as_of": today.isoformat(), "segments": segments}, ensure_ascii=False, indent=2)
     )
     notify.send_telegram_alert(notify.format_ic_alert(today.isoformat(), segments))
+    from src import collector_repair
+    try:
+        collector_repair.workflow_finished("afterclose", healthy=bool(index_bars) and len(added) == len(tickers))
+    except Exception:
+        logger.exception("collector_workflow_record_failed")
     logger.info("measure_ic_done day=%s", today.isoformat())
     return 0
 

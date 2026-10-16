@@ -16,15 +16,17 @@ def main():
     parser.add_argument("--repair", action="store_true")
     parser.add_argument("--full", action="store_true")
     parser.add_argument("--watchdog", action="store_true")
-    parser.add_argument("--monitor", action="store_true", help="24시간 점검 및 장외 자동 수리")
+    parser.add_argument("--pending", action="store_true", help="실제 워크플로우에서 접수된 오류만 수리; 평상시 조회 없음")
     args = parser.parse_args()
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        if args.watchdog:
+        if args.pending or not any((args.repair, args.full, args.watchdog)):
+            collector_repair.process_pending()
+        elif args.watchdog:
             collector_repair.watchdog()
         else:
-            result = collector_repair.check(allow_repair=args.repair or args.monitor, full=args.full, monitoring=args.monitor)
+            result = collector_repair.check(allow_repair=args.repair, full=args.full)
             print({name: value["status"] for name, value in result["sources"].items()})
         collector_repair.controller_status("watchdog_process" if args.watchdog else "worker_process")
     except PortfolioLockBusy:

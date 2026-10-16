@@ -1,4 +1,4 @@
-"""Round-the-clock monitor and bounded off-hours repair. Models propose data.
+"""Workflow-triggered bounded off-hours repair. Models propose data.
 
 Trusted Python builds a two-file commit (routes + changelog), tests it, obtains
 an independent review bound to that exact commit, then uses deploy/pull.sh.
@@ -11,6 +11,7 @@ import signal
 import subprocess
 import tempfile
 import time as clock
+from uuid import uuid4
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
@@ -101,9 +102,8 @@ def report(state, key, problem, message, *, at=None, phase=None):
         if not incident or not incident["open"]:
             incident = {"open": True, "since": at.isoformat(), "last_sent": None, "sent_problem": False}
             state["incidents"][key] = incident
-        sent = datetime.fromisoformat(incident["last_sent"]) if incident["last_sent"] else None
-        interval = timedelta(minutes=5 if not incident.get("escalated") else 15)
-        due = not incident["sent_problem"] or sent is None or at - sent >= interval or incident.get("phase") != phase
+        # Only a new incident or a changed repair stage warrants another alert.
+        due = not incident["sent_problem"] or incident.get("phase") != phase
         if due and notify.send_telegram_alert(f"⚠️ [SIMA] 수집 자동화 오류 — {LABELS.get(key, key)}\n{message}\n발견: {incident['since']}"):
             incident["escalated"] = incident["sent_problem"]
             incident["last_sent"] = at.isoformat()
@@ -124,6 +124,116 @@ def flush_notices(state):
     for key, message in list(state.get("notices", {}).items()):
         if notify.send_telegram_alert(message):
             del state["notices"][key]
+
+
+def repair_progress(state, key, message):
+    queue_notice(state, key, f"🔧 [SIMA] 오류 수정 진행\n{message}")
+    flush_notices(state)
+    atomic_json(STATE_DIR / "state.json", state)
+
+
+def read_workflow():
+    path = STATE_DIR / "workflow.json"
+    return json.loads(path.read_text()) if path.exists() else {"requests": {}, "days": {}, "incidents": {}}
+
+
+def request_identity(slots=None, params=None):
+    return json.dumps({"slots": slots or {}, "params": params or {}}, sort_keys=True)
+
+
+def request_repair(source, error, *, slots=None, params=None):
+    """Called only after a real collector failed. Never fetch, analyze or deploy."""
+    if source not in routes.DEFAULT_URLS:
+        raise ValueError("unknown collector source")
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with portfolio_lock(STATE_DIR / "workflow.lock"):
+        at = now()
+        state = read_workflow()
+        entry = state["requests"].setdefault(source, {"since": at.isoformat()})
+        entry.update(generation=uuid4().hex, last_at=at.isoformat(), error=error[:500])
+        entry.setdefault("samples", {})[request_identity(slots, params)] = {"slots": slots or {}, "params": params or {}}
+        state["days"].setdefault(at.date().isoformat(), {})["failed"] = True
+        phase = "waiting_close" if not repair_window(at) else "queued"
+        message = ("장중 변경을 보류하고 16:10부터 원인 확인·수리를 진행합니다." if phase == "waiting_close"
+                   else "발견된 오류를 다음 수리 처리에서 확인합니다.")
+        # Save the request before attempting notification delivery.
+        atomic_json(STATE_DIR / "workflow.json", state)
+        report(state, source, True, f"{error[:400]}\n{message}", phase=phase)
+        atomic_json(STATE_DIR / "workflow.json", state)
+
+
+def source_succeeded(source, payload=None, *, slots=None, params=None, data=None, complete=False):
+    """Reuse actual successful responses; never make a canary request here."""
+    at = now()
+    if data is None and payload is not None:
+        try:
+            normalized = routes.normalize(source, payload)
+            if source == "index":
+                data = health.index_data(normalized, at)
+            elif source == "stock_news" and (slots or {}).get("ticker") in health.CANARIES:
+                data = {(slots or {})["ticker"]: health.news_data(normalized, at)}
+            elif source == "sector_news":
+                data = health.news_data(normalized, at, hub=True)
+            elif source == "quotes":
+                rows = [r for r in json.loads(normalized)["datas"] if r.get("itemCode") in health.CANARIES]
+                data = health.quotes_data(json.dumps({"datas": rows}), at)
+        except (ValueError, KeyError, TypeError):
+            # Normal empty news is valid. It simply provides no comparison evidence.
+            data = None
+    if data is None and source not in read_workflow()["requests"]:
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with portfolio_lock(STATE_DIR / "workflow.lock"):
+        state = read_workflow()
+        if data is not None:
+            baseline = state.setdefault("baseline", {})
+            if source == "stock_news":
+                data = {**baseline.get(source, {}).get("data", {}), **data}
+            if source != "stock_news" or set(data) == set(health.CANARIES):
+                baseline[source] = {"status": "ok", "data": data, "checked_at": at.isoformat()}
+            else:
+                baseline[source] = {"status": "partial", "data": data, "checked_at": at.isoformat()}
+        entry = state["requests"].get(source)
+        if entry:
+            if complete:
+                entry["samples"] = {}
+            else:
+                entry.get("samples", {}).pop(request_identity(slots, params), None)
+            if not entry.get("samples"):
+                report(state, source, False, "실제 워크플로우에서 실패했던 요청의 정상 응답을 확인했습니다.")
+                if not state["incidents"].get(source, {}).get("open"):
+                    del state["requests"][source]
+        atomic_json(STATE_DIR / "workflow.json", state)
+
+
+def workflow_finished(stage, *, healthy):
+    """Passive shadow: outcomes of existing jobs, with no extra source probes."""
+    if os.environ.get("SIMA_COLLECTOR_AUTOREPAIR") != "1":
+        return
+    if stage not in {"premarket", "afterclose"}:
+        raise ValueError("unknown workflow stage")
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with portfolio_lock(STATE_DIR / "workflow.lock"):
+        at = now()
+        state = read_workflow()
+        day = state["days"].setdefault(at.date().isoformat(), {})
+        in_stage = ((stage == "premarket" and time(8) <= at.time() < time(9))
+                    or (stage == "afterclose" and at.time() >= time(16)))
+        if not healthy:
+            day["failed"] = True
+        elif in_stage and is_krx_trading_day(at.date()):
+            day[stage] = routes.digest(routes.load())
+        atomic_json(STATE_DIR / "workflow.json", state)
+
+
+def shadow_ready(state, at):
+    if any(day < at.date().isoformat() for day in state["shadow_days"]):
+        return True
+    for day, obs in read_workflow()["days"].items():
+        if (day < at.date().isoformat() and not obs.get("failed") and obs.get("premarket")
+                and obs.get("premarket") == obs.get("afterclose")):
+            return True
+    return False
 
 
 def repair_window(at=None):
@@ -365,6 +475,7 @@ def repair(state, current, report_data):
     changed = {k for k in current["routes"] if current["routes"][k] != candidate["routes"][k]}
     if not changed or not changed <= set(failed):
         raise RuntimeError("proposal changed healthy or unrelated routes")
+    repair_progress(state, f"validate-{slot}-{state['attempts'][slot]}", "수정안을 만들었습니다. 실제 데이터와 과거 정상 자료를 대조하고 전체 테스트를 실행합니다.")
     checked = health.probe(candidate, full=True, timeout_s=budget(90))
     if any(v["status"] != "ok" for v in checked["sources"].values()):
         raise RuntimeError("candidate live validation failed")
@@ -376,6 +487,7 @@ def repair(state, current, report_data):
         try:
             commit = build_commit(tree, candidate, base)
             tests = run_tests(tree)
+            repair_progress(state, f"review-{commit}", "데이터 대조와 전체 테스트를 통과했습니다. 독립 검토를 진행합니다.")
             diff = git("diff", base, commit, "--", "config/collector_routes.json", cwd=tree)
             review = model_call("collector_repair_review.md", {"commit": commit, "manifest_sha256": routes.digest(candidate),
                                 "diff": diff, "test_result": tests, "changed": sorted(changed),
@@ -392,6 +504,7 @@ def repair(state, current, report_data):
                 if git("rev-parse", "HEAD") != base or git("status", "--porcelain", "--untracked-files=no"):
                     raise RuntimeError("production changed during repair")
                 require_publish_window()
+                repair_progress(state, f"publish-{commit}", "독립 검토를 통과했습니다. 서버에 배포한 뒤 실제 수집 결과를 확인합니다.")
                 # Normal fast-forward push rejects concurrent upstream changes.
                 atomic_json(STATE_DIR / "transaction.json", {"status": "publishing", "base": base, "commit": commit})
                 try:
@@ -431,16 +544,16 @@ def repair_disposition(state, at, *, enabled):
     if current_analysis_blocks(at):
         return "analysis", "오늘 분석이 이미 시작되어 변경을 보류합니다. 16:10 이후 다시 확인합니다."
     if not enabled or os.environ.get("SIMA_COLLECTOR_AUTOREPAIR") != "1":
-        return "disabled", "자동 수리 비활성 상태입니다. 감시와 알림은 계속합니다."
-    if not any(day < at.date().isoformat() for day in state["shadow_days"]):
-        return "shadow", "첫 정상 거래일 장전·장후 섀도 검증 대기 중입니다. 완료 다음 날부터 자동 수리합니다."
+        return "disabled", "자동 수리 비활성 상태입니다. 실제 업무의 오류 알림은 유지합니다."
+    if not shadow_ready(state, at):
+        return "shadow", "첫 정상 거래일의 매수 판단·장후 측정 완료 기록을 기다립니다. 완료 다음 날부터 자동 수리합니다."
     slot = attempt_window(at)
     # Count any attempts made by the previous premarket-only controller too.
     if attempts_used(state, at) >= MAX_ATTEMPTS:
-        return "budget", "이번 시간대 자동 수리 2회 한도 도달. 다음 장전/장후 시간대에 다시 시도합니다. 감시는 계속합니다."
+        return "budget", "이번 시간대 자동 수리 2회 한도 도달. 미해결 요청을 보존하고 다음 거래일 장후 수리에서 다시 확인합니다."
     retry = state.get("retry", {})
     if retry.get("slot") == slot and at < datetime.fromisoformat(retry["after"]):
-        return "cooldown", f"직전 수리 실패: {retry.get('error', '')}. {retry['after']}부터 재시도합니다."
+        return "cooldown", f"직전 수리 실패: {retry.get('error', '')}. {retry['after']} 이후 예약된 수리 회차에서 재시도합니다."
     return "ready", "장외 오류를 확인했습니다. 자동 수리·검증·배포를 시작합니다."
 
 
@@ -470,6 +583,9 @@ def check(*, allow_repair=False, full=False, monitoring=False):
         else:
             report(state, "deployment", False, "미완결 배포 없음")
         current = routes.load()
+        for name, item in read_workflow().get("baseline", {}).items():
+            if item.get("status") == "ok" and item.get("checked_at", "") > state["baseline"].get(name, {}).get("checked_at", ""):
+                state["baseline"][name] = item
         previous = state["baseline"].copy()
         full = full or (monitoring and scheduled_full(now()))
         result = health.probe(current, full=full, monitoring=monitoring)
@@ -488,8 +604,8 @@ def check(*, allow_repair=False, full=False, monitoring=False):
             else:
                 pending.pop(name, None)
                 if status != "ok":
-                    detail = ("일시 오류로 짧은 재시도 후 다음 5분 점검을 기다립니다." if status in {"transient", "dependency"}
-                              else "데이터 의미·최신성 검증 실패로 주소 자동 변경 대상이 아닙니다. 확인 필요; 감시는 계속합니다.")
+                    detail = ("일시 오류로 짧은 재시도 후 다음 예약된 수리 회차를 기다립니다." if status in {"transient", "dependency"}
+                              else "데이터 의미·최신성 검증 실패로 주소 자동 변경 대상이 아닙니다. 원인 확인이 필요합니다.")
             report(state, name, status != "ok", f"{item.get('error', '')}\n{detail}\n영향: {IMPACTS.get(name, '')}", phase=item_phase)
             if item["status"] == "ok" and (name != "sector_members" or full):
                 state["baseline"][name] = {**item, "checked_at": result["checked_at"]}
@@ -541,24 +657,51 @@ def check(*, allow_repair=False, full=False, monitoring=False):
 
 
 def preanalysis_problem(at=None):
-    """Fail closed for missing preflight/mandatory index; optional inputs degrade."""
+    """No periodic preflight dependency. Actual input validation stays mandatory."""
     if os.environ.get("SIMA_COLLECTOR_AUTOREPAIR") != "1":
         return None
-    at = at or now()
     if transaction_blocked():
         return "collector_deployment_incomplete"
-    try:
-        value = json.loads((STATE_DIR / "latest.json").read_text())
-        checked = datetime.fromisoformat(value["checked_at"])
-        if checked > at or at - checked > timedelta(minutes=35) or checked.date() != at.date():
-            return "collector_preflight_stale"
-        if value["manifest"] != routes.digest(routes.load()):
-            return "collector_preflight_version_mismatch"
-        if value["sources"]["index"]["status"] != "ok":
-            return "collector_index_unavailable"
-    except (OSError, ValueError, KeyError, TypeError):
-        return "collector_preflight_missing"
     return None
+
+
+def process_pending():
+    """Drain real incidents only. An empty queue performs no probes or alerts."""
+    requests = {k: v for k, v in read_workflow()["requests"].items()
+                if v.get("diagnosed_generation") != v["generation"]}
+    state = read_state()
+    blocked = transaction_blocked()
+    if not requests and not blocked:
+        # Deliver only already-pending incident progress messages, never health notices.
+        if state.get("notices"):
+            with portfolio_lock(STATE_DIR / "worker.lock", blocking=False):
+                state = read_state()
+                flush_notices(state)
+                atomic_json(STATE_DIR / "state.json", state)
+        return None
+    watchdog()
+    phase, message = repair_disposition(state, now(), enabled=True)
+    if phase != "ready" and not (blocked and repair_window()):
+        with portfolio_lock(STATE_DIR / "workflow.lock"):
+            workflow = read_workflow()
+            for source in workflow["requests"]:
+                report(workflow, source, True, message, phase=phase)
+            atomic_json(STATE_DIR / "workflow.json", workflow)
+        return None
+    result = check(allow_repair=True, full=True)
+    with portfolio_lock(STATE_DIR / "workflow.lock"):
+        workflow = read_workflow()
+        for source, request in requests.items():
+            current = workflow["requests"].get(source)
+            if (current and current["generation"] == request["generation"]
+                    and all(v["status"] == "ok" for v in result["sources"].values()) and not transaction_blocked()):
+                # Canaries do not prove the original ticker/group request recovered.
+                # Do not probe again without a new workflow failure. Actual success
+                # of every recorded request is the only way to close this incident.
+                current["diagnosed_generation"] = request["generation"]
+                report(workflow, source, True, "수리 점검 경로는 정상입니다. 원래 실패한 업무 요청의 복구 여부는 다음 정규 실행에서 확인합니다.", phase="awaiting_workflow")
+        atomic_json(STATE_DIR / "workflow.json", workflow)
+    return result
 
 
 def watchdog():
@@ -571,11 +714,8 @@ def watchdog():
             last = datetime.fromisoformat(state["completed_at"]) if state.get("completed_at") else None
             started = datetime.fromisoformat(state["started_at"]) if state.get("started_at") else None
             running = started is not None and (last is None or started > last)
-            if running:
-                problem = not timedelta(0) <= at - started <= timedelta(minutes=20)
-            else:
-                problem = last is None or not timedelta(0) <= at - last <= timedelta(minutes=10)
-            message = f"24시간 수집 점검 {'20분 초과 실행' if running else '10분 이상 완료 기록 없음'}. 마지막 완료: {last}. 신규 판단은 점검 상태를 확인합니다."
+            problem = running and not timedelta(0) <= at - started <= timedelta(minutes=20)
+            message = f"오류 수리 작업이20분 넘게 완료되지 않았습니다. 마지막 완료: {last}."
         except Exception as exc:
             problem, message = True, f"수집 자동화 상태를 읽지 못함: {type(exc).__name__}"
         # Separate state file: never overwrite a concurrent worker update.

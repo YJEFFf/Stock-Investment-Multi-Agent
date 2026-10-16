@@ -164,7 +164,7 @@ async def _main() -> None:
     if problem := collector_repair.preanalysis_problem(day):
         _write_pending_state(today_kst.isoformat(), [], skipped=problem)
         notify.send_telegram_alert(notify.format_error_alert(
-            "장전 수집 점검 미완료 — 오늘 신규 매수 판단 중지", problem))
+            "수집 설정 배포 미완결 — 오늘 신규 매수 판단 중지", problem))
         return
 
     seconds_until_deadline = _seconds_until_deadline(day)
@@ -307,6 +307,11 @@ async def main() -> None:
                 record.deadline_margin_seconds = _seconds_until_deadline(record.ended_at)
                 try:
                     run_history.write(record)
+                    from src import collector_repair
+                    try:
+                        collector_repair.workflow_finished("premarket", healthy=record.status == "completed" and not run_history.input_failed(record))
+                    except Exception:
+                        logger.exception("collector_workflow_record_failed")
                 except Exception:
                     _write_pending_state(record.day, [], skipped="run_history_write_failed")
                     raise

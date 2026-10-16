@@ -31,7 +31,8 @@ async def main() -> None:
     logger.info("codex_plan_health_check_ok day=%s status=%s", today.isoformat(), result.status)
     capacity = await codex_plan.read_capacity()
     codex_plan.save_capacity_status(capacity)
-    notify.send_telegram_alert(notify.format_codex_capacity_alert(capacity.model_dump(mode="json")))
+    if not capacity.buy_judgment_allowed:
+        notify.send_telegram_alert(notify.format_codex_capacity_alert(capacity.model_dump(mode="json")))
     logger.info(
         "codex_plan_capacity day=%s remaining=%.1f allowed=%s reset=%s",
         today.isoformat(), capacity.remaining_percent, capacity.buy_judgment_allowed, capacity.resets_at.isoformat(),
