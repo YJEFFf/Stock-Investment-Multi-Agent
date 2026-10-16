@@ -84,12 +84,16 @@ def request(manifest, name, params=None, **slots):
         raise ProbeError("structure", f"normalization: {type(exc).__name__}") from exc
 
 
-def index_data(text, now):
+def index_data(text, now, *, monitoring=False):
     root = ET.fromstring(text)
     chart = root.find("chartdata")
     if chart is None or chart.get("symbol") != "KPI200" or chart.get("timeframe") != "day":
         raise ProbeError("semantic", "not KOSPI200 daily bars")
     bars = collectors._parse_bars(text)
+    # During the session Naver includes a changing current-day bar. Only the
+    # monitoring probe may remove it; actual premarket input remains strict.
+    if monitoring and is_krx_trading_day(now.date()) and time(9) <= now.time() < time(15, 30):
+        bars = [b for b in bars if b.date != now.date()]
     if len(bars) < 60 or len({b.date for b in bars}) != len(bars):
         raise ProbeError("semantic", "incomplete or duplicate index dates")
     if bars[-1].date != expected_session(now):
@@ -176,7 +180,7 @@ def fetch_members(manifest, groups):
     return out
 
 
-def quotes_data(text, now):
+def quotes_data(text, now, *, monitoring=False):
     payload = json.loads(text)
     if not isinstance(payload, dict) or not isinstance(payload.get("datas"), list):
         raise ProbeError("structure", "missing realtime quotes")
@@ -190,21 +194,27 @@ def quotes_data(text, now):
         traded = str(row.get("localTradedAt", ""))[:10]
         if price is None or not math.isfinite(price) or traded < expected_session(now).isoformat() or traded > now.date().isoformat():
             raise ProbeError("stale", "invalid quote price/date")
+        if monitoring and is_krx_trading_day(now.date()) and time(9, 5) <= now.time() < time(15, 30):
+            stamp = datetime.fromisoformat(row["localTradedAt"])
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=KST)
+            if not timedelta(0) <= now - stamp <= timedelta(minutes=5):
+                raise ProbeError("stale", "KRX quote timestamp outside five-minute monitoring window")
         out[code] = {"price": price, "date": traded}
     if set(out) != set(CANARIES):
         raise ProbeError("semantic", "incomplete canary quotes")
     return out
 
 
-def probe(manifest, *, now=None, full=False, timeout_s=90):
+def probe(manifest, *, now=None, full=False, timeout_s=90, monitoring=False):
     token = DEADLINE.set(clock.monotonic() + timeout_s)
     try:
-        return _probe(manifest, now=now, full=full)
+        return _probe(manifest, now=now, full=full, monitoring=monitoring)
     finally:
         DEADLINE.reset(token)
 
 
-def _probe(manifest, *, now=None, full=False):
+def _probe(manifest, *, now=None, full=False, monitoring=False):
     now = now or datetime.now(KST)
     routes.validate_manifest(manifest)
     results = {}
@@ -213,7 +223,7 @@ def _probe(manifest, *, now=None, full=False):
         try:
             remaining()
             if name == "index":
-                data = index_data(request(manifest, name, {"symbol": "KPI200", "timeframe": "day", "count": 60, "requestType": 0}), now)
+                data = index_data(request(manifest, name, {"symbol": "KPI200", "timeframe": "day", "count": 61 if monitoring else 60, "requestType": 0}), now, monitoring=monitoring)
             elif name == "stock_news":
                 data = {code: news_data(request(manifest, name, {"page": 1, "pageSize": 50}, ticker=code), now) for code in CANARIES}
             elif name == "sector_news":
@@ -226,7 +236,7 @@ def _probe(manifest, *, now=None, full=False):
                 selected = groups if full else dict(list(sorted(groups.items()))[:2])
                 data = fetch_members(manifest, selected)
             else:
-                data = quotes_data(request(manifest, name, codes=",".join(CANARIES)), now)
+                data = quotes_data(request(manifest, name, codes=",".join(CANARIES)), now, monitoring=monitoring)
             results[name] = {"status": "ok", "data": data}
         except Exception as exc:
             results[name] = {"status": getattr(exc, "kind", "structure"), "error": str(exc)[:500]}

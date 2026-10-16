@@ -1,4 +1,4 @@
-"""Bounded premarket repair controller. Models propose data, never code.
+"""Round-the-clock monitor and bounded off-hours repair. Models propose data.
 
 Trusted Python builds a two-file commit (routes + changelog), tests it, obtains
 an independent review bound to that exact commit, then uses deploy/pull.sh.
@@ -24,6 +24,14 @@ ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = ROOT / "logs/collector_repair"
 MAX_ATTEMPTS = 2
 WORK_DEADLINE = None
+LABELS = {"repair": "자동 수리", "deployment": "배포 복구", "watchdog": "감시 점검",
+          "worker_process": "수집 점검 프로그램", "watchdog_process": "완료 감시 프로그램",
+          "index": "코스피200 지수", "stock_news": "종목 뉴스", "sector_news": "업종 뉴스",
+          "sector_groups": "업종 목록", "sector_members": "업종 구성종목", "quotes": "보조 시세"}
+IMPACTS = {"index": "장전 필수 입력 불가 시 신규 매수 판단 차단",
+           "stock_news": "종목 뉴스 결손 시 해당 분석 의견 제외·기존 degraded 기준 적용",
+           "sector_news": "업종 배경 뉴스 누락 가능", "sector_groups": "업종 분류 갱신 불가 가능",
+           "sector_members": "업종 분류 갱신 불가 가능", "quotes": "한투 시세 실패 시 보조 시세 사용 불가 가능"}
 
 
 def budget(cap):
@@ -85,7 +93,7 @@ def audit(event, **fields):
         os.fsync(f.fileno())
 
 
-def report(state, key, problem, message, *, at=None):
+def report(state, key, problem, message, *, at=None, phase=None):
     """Durable incident transitions; failed enqueue never consumes the alert."""
     at = at or now()
     incident = state["incidents"].get(key)
@@ -95,13 +103,14 @@ def report(state, key, problem, message, *, at=None):
             state["incidents"][key] = incident
         sent = datetime.fromisoformat(incident["last_sent"]) if incident["last_sent"] else None
         interval = timedelta(minutes=5 if not incident.get("escalated") else 15)
-        due = not incident["sent_problem"] or sent is None or at - sent >= interval
-        if due and notify.send_telegram_alert(f"⚠️ [SIMA] 수집 자동화 오류 — {key}\n{message}\n발견: {incident['since']}"):
+        due = not incident["sent_problem"] or sent is None or at - sent >= interval or incident.get("phase") != phase
+        if due and notify.send_telegram_alert(f"⚠️ [SIMA] 수집 자동화 오류 — {LABELS.get(key, key)}\n{message}\n발견: {incident['since']}"):
             incident["escalated"] = incident["sent_problem"]
             incident["last_sent"] = at.isoformat()
             incident["sent_problem"] = True
+            incident["phase"] = phase
     elif incident and incident["open"]:
-        if not incident["sent_problem"] or notify.send_telegram_alert(f"✅ [SIMA] 수집 자동화 복구 — {key}\n{message}"):
+        if not incident["sent_problem"] or notify.send_telegram_alert(f"✅ [SIMA] 수집 자동화 복구 — {LABELS.get(key, key)}\n{message}"):
             incident["open"] = False
             incident["recovered_at"] = at.isoformat()
 
@@ -119,21 +128,44 @@ def flush_notices(state):
 
 def repair_window(at=None):
     at = at or now()
-    return is_krx_trading_day(at.date()) and time(7, 30) <= at.time() < time(8, 20)
+    return not is_krx_trading_day(at.date()) or at.time() < time(8, 15) or at.time() >= time(16, 10)
+
+
+def next_repair_time(at=None):
+    at = at or now()
+    return at if repair_window(at) else at.replace(hour=16, minute=10, second=0, microsecond=0)
+
+
+def attempt_window(at=None):
+    at = at or now()
+    slot = "closed_day" if not is_krx_trading_day(at.date()) else ("after_close" if at.time() >= time(16, 10) else "before_open")
+    return f"{at.date().isoformat()}:{slot}"
+
+
+def current_analysis_blocks(at):
+    # A completed morning run is not a reason to postpone after-close repairs.
+    # Never clear its history or invoke it again; active runs are excluded by lock.
+    return (is_krx_trading_day(at.date()) and at.time() < time(16, 10)
+            and run_history.already_analyzed(at.date().isoformat(), ROOT / "logs/pipeline.jsonl"))
+
+
+def attempts_used(state, at):
+    slot = attempt_window(at)
+    return state["attempts"].get(slot, 0) + (state["attempts"].get(at.date().isoformat(), 0) if slot.endswith(":before_open") else 0)
 
 
 def require_window():
-    if not repair_window() or run_history.already_analyzed(now().date().isoformat(), ROOT / "logs/pipeline.jsonl"):
+    if not repair_window() or current_analysis_blocks(now()):
         raise RuntimeError("repair window closed or analysis already started")
 
 
 def require_publish_window(*, rollback=False):
     at = now()
     # Reserve ten minutes for deployment, read-only checks and a rollback.
-    cutoff = time(8, 25) if rollback else time(8, 15)
-    if not is_krx_trading_day(at.date()) or not time(7, 30) <= at.time() < cutoff:
+    cutoff = time(8, 23) if rollback else time(8, 15)
+    if is_krx_trading_day(at.date()) and cutoff <= at.time() < time(16, 10):
         raise RuntimeError("deployment time reserve exhausted")
-    if run_history.already_analyzed(at.date().isoformat(), ROOT / "logs/pipeline.jsonl"):
+    if current_analysis_blocks(at):
         raise RuntimeError("analysis already started")
 
 
@@ -300,18 +332,22 @@ def compatibility_evidence(previous, checked, changed):
 def repair(state, current, report_data):
     global WORK_DEADLINE
     # Ten minutes for proposal/review, separate bounded activation/rollback.
-    WORK_DEADLINE = clock.monotonic() + min(600, (now().replace(hour=8, minute=15, second=0, microsecond=0) - now()).total_seconds())
+    at = now()
+    seconds = 600
+    if is_krx_trading_day(at.date()) and at.time() < time(8, 15):
+        seconds = min(seconds, (at.replace(hour=8, minute=15, second=0, microsecond=0) - at).total_seconds())
+    WORK_DEADLINE = clock.monotonic() + seconds
     require_window()
-    day = now().date().isoformat()
-    if state["attempts"].get(day, 0) >= MAX_ATTEMPTS:
-        raise RuntimeError("daily repair attempt budget exhausted")
+    slot = attempt_window(at)
+    if attempts_used(state, at) >= MAX_ATTEMPTS:
+        raise RuntimeError("repair session attempt budget exhausted")
     capacity = asyncio.run(codex_plan.read_capacity())
     if not capacity.buy_judgment_allowed:
         raise RuntimeError("Codex capacity unavailable for repair")
-    state["attempts"][day] = state["attempts"].get(day, 0) + 1
+    state["attempts"][slot] = state["attempts"].get(slot, 0) + 1
     atomic_json(STATE_DIR / "state.json", state)  # claim before invoking a model
-    audit("repair_started", day=day, attempt=state["attempts"][day])
-    queue_notice(state, f"start-{day}-{state['attempts'][day]}", "🔧 [SIMA] 수집 자동 수리 시작\n수집 주소·응답 형식만 검사합니다. 매수 판단은 아직 실행하지 않습니다.")
+    audit("repair_started", slot=slot, attempt=state["attempts"][slot])
+    queue_notice(state, f"start-{slot}-{state['attempts'][slot]}", "🔧 [SIMA] 수집 자동 수리 시작\n수집 주소·응답 필드를 수정하고 데이터 대조·전체 테스트·독립 검토 후 배포합니다. 성공한 분석은 다시 실행하지 않습니다.")
     flush_notices(state)
     if not git("status", "--porcelain", "--untracked-files=no") == "":
         raise RuntimeError("production checkout has changes")
@@ -373,6 +409,7 @@ def repair(state, current, report_data):
                     remote = git("rev-parse", "origin/main")
                     if remote == commit:
                         rollback_candidate(tree, current, commit)
+                        queue_notice(state, f"rollback-{commit}", "↩️ [SIMA] 자동 배포 실패·이전 수집 설정 복원 완료\n이전 설정도 오류가 있을 수 있어 다음 점검까지 정상으로 처리하지 않습니다.")
                     elif remote == base and git("rev-parse", "HEAD") == base:
                         atomic_json(STATE_DIR / "transaction.json", {"status": "not_pushed", "commit": commit})
                     # Unknown state remains blocked and is visible to watchdog.
@@ -385,21 +422,75 @@ def repair(state, current, report_data):
             git("worktree", "remove", "--force", str(tree))
 
 
-def check(*, allow_repair=False, full=False):
+def repair_disposition(state, at, *, enabled):
+    """Explain why a queued structural failure can or cannot be repaired now."""
+    if not repair_window(at):
+        return "waiting_close", f"장전 분석·장중·장후 정산 보호 시간입니다. {next_repair_time(at):%m/%d %H:%M}부터 재확인 후 자동 수리합니다."
+    if transaction_blocked():
+        return "transaction", "미완결 배포 복구 중입니다. 신규 매수 판단 차단 유지."
+    if current_analysis_blocks(at):
+        return "analysis", "오늘 분석이 이미 시작되어 변경을 보류합니다. 16:10 이후 다시 확인합니다."
+    if not enabled or os.environ.get("SIMA_COLLECTOR_AUTOREPAIR") != "1":
+        return "disabled", "자동 수리 비활성 상태입니다. 감시와 알림은 계속합니다."
+    if not any(day < at.date().isoformat() for day in state["shadow_days"]):
+        return "shadow", "첫 정상 거래일 장전·장후 섀도 검증 대기 중입니다. 완료 다음 날부터 자동 수리합니다."
+    slot = attempt_window(at)
+    # Count any attempts made by the previous premarket-only controller too.
+    if attempts_used(state, at) >= MAX_ATTEMPTS:
+        return "budget", "이번 시간대 자동 수리 2회 한도 도달. 다음 장전/장후 시간대에 다시 시도합니다. 감시는 계속합니다."
+    retry = state.get("retry", {})
+    if retry.get("slot") == slot and at < datetime.fromisoformat(retry["after"]):
+        return "cooldown", f"직전 수리 실패: {retry.get('error', '')}. {retry['after']}부터 재시도합니다."
+    return "ready", "장외 오류를 확인했습니다. 자동 수리·검증·배포를 시작합니다."
+
+
+def scheduled_full(at):
+    return is_krx_trading_day(at.date()) and (at.hour, at.minute) in {(7, 30), (16, 10), (16, 20)}
+
+
+def check(*, allow_repair=False, full=False, monitoring=False):
+    global WORK_DEADLINE
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with portfolio_lock(STATE_DIR / "worker.lock", blocking=False):
         state = read_state()
         flush_notices(state)
-        if transaction_blocked():
-            recover_transaction()
         state["started_at"] = now().isoformat()
         atomic_json(STATE_DIR / "state.json", state)
+        if transaction_blocked():
+            message = "미완결 배포 복구 대기. 16:10 이후 복구하며 신규 매수 판단은 차단합니다."
+            if repair_window():
+                try:
+                    recover_transaction()
+                    txn = json.loads((STATE_DIR / "transaction.json").read_text())
+                    outcome = "이전 수집 설정 복원 완료" if txn.get("status") == "rolled_back" else "미게시 변경 정리 완료"
+                    queue_notice(state, f"transaction-{state['started_at']}", f"↩️ [SIMA] 중단된 수집 배포 정리 완료\n{outcome}. 현재 수집 상태를 다시 확인합니다. 성공한 분석은 다시 실행하지 않습니다.")
+                except Exception as exc:
+                    message = f"미완결 배포 복구 실패: {str(exc)[:300]}. 신규 매수 판단 차단 유지."
+            report(state, "deployment", transaction_blocked(), message, phase="recovering" if repair_window() else "waiting_close")
+        else:
+            report(state, "deployment", False, "미완결 배포 없음")
         current = routes.load()
         previous = state["baseline"].copy()
-        result = health.probe(current, full=full)
+        full = full or (monitoring and scheduled_full(now()))
+        result = health.probe(current, full=full, monitoring=monitoring)
         atomic_json(STATE_DIR / "latest.json", result)
+        at = now()
+        phase, explanation = repair_disposition(state, at, enabled=allow_repair)
+        pending = state.setdefault("pending_repairs", {})
         for name, item in result["sources"].items():
-            report(state, name, item["status"] != "ok", item.get("error", "수집 경로 정상 확인"))
+            status = item["status"]
+            detail = "수집 경로 정상 확인. 대기 중이던 수리는 취소합니다."
+            item_phase = status
+            if status == "structure":
+                pending.setdefault(name, {"since": at.isoformat()})
+                pending[name].update(status=phase, error=item.get("error"), checked_at=at.isoformat())
+                detail, item_phase = explanation, phase
+            else:
+                pending.pop(name, None)
+                if status != "ok":
+                    detail = ("일시 오류로 짧은 재시도 후 다음 5분 점검을 기다립니다." if status in {"transient", "dependency"}
+                              else "데이터 의미·최신성 검증 실패로 주소 자동 변경 대상이 아닙니다. 확인 필요; 감시는 계속합니다.")
+            report(state, name, status != "ok", f"{item.get('error', '')}\n{detail}\n영향: {IMPACTS.get(name, '')}", phase=item_phase)
             if item["status"] == "ok" and (name != "sector_members" or full):
                 state["baseline"][name] = {**item, "checked_at": result["checked_at"]}
         all_ok = all(v["status"] == "ok" for v in result["sources"].values())
@@ -413,21 +504,17 @@ def check(*, allow_repair=False, full=False):
                 and is_krx_trading_day(at.date()) and at.time() >= time(16, 10)):
             if at.date().isoformat() not in state["shadow_days"]:
                 state["shadow_days"].append(at.date().isoformat())
-        has_shadow = any(day < at.date().isoformat() for day in state["shadow_days"])
-        structural = any(v["status"] == "structure" for v in result["sources"].values())
         state["last_check"] = at.isoformat()
         atomic_json(STATE_DIR / "state.json", state)
-        if allow_repair and structural and repair_window():
+        if pending and phase == "ready":
             try:
-                if not has_shadow:
-                    raise RuntimeError("첫 정상 거래일 장후 섀도 점검 전 — 자동 배포 대기")
-                if os.environ.get("SIMA_COLLECTOR_AUTOREPAIR") != "1":
-                    raise RuntimeError("automatic repair not enabled")
                 # Keep evidence from before the repair; healthy canaries may be newer.
                 for key, value in previous.items():
                     if result["sources"][key]["status"] != "ok":
                         state["baseline"][key] = value
                 result = repair(state, current, result)
+                pending.clear()
+                state.pop("retry", None)
                 atomic_json(STATE_DIR / "latest.json", result)
                 for name, item in result["sources"].items():
                     state["baseline"][name] = {**item, "checked_at": result["checked_at"]}
@@ -435,7 +522,16 @@ def check(*, allow_repair=False, full=False):
                 report(state, "repair", False, "수집 설정 자동 배포 완료")
             except Exception as exc:
                 audit("repair_failed", error=str(exc)[:1000])
-                report(state, "repair", True, str(exc)[:500])
+                state["retry"] = {"slot": attempt_window(), "after": (now() + timedelta(minutes=30)).isoformat(), "error": str(exc)[:500]}
+                next_phase, next_step = repair_disposition(state, now(), enabled=allow_repair)
+                for entry in pending.values():
+                    entry["status"] = next_phase
+                report(state, "repair", True, f"수리 실패: {str(exc)[:500]}\n검증을 통과한 변경만 반영합니다.\n다음 처리: {next_step}", phase="failed")
+            finally:
+                WORK_DEADLINE = None
+        elif all_ok:
+            state.pop("retry", None)
+            report(state, "repair", False, "수집 경로 정상 확인. 추가 수리 없음.")
         state["completed_at"] = now().isoformat()
         state["last_check"] = state["completed_at"]
         flush_notices(state)
@@ -473,15 +569,13 @@ def watchdog():
         try:
             state = read_state()
             last = datetime.fromisoformat(state["completed_at"]) if state.get("completed_at") else None
-            due = None
-            if is_krx_trading_day(at.date()):
-                for hh, mm, grace in ((7, 30, 5), (8, 0, 5), (8, 15, 7), (16, 20, 10)):
-                    scheduled = at.replace(hour=hh, minute=mm, second=0, microsecond=0)
-                    deadline = scheduled + timedelta(minutes=grace)
-                    if at >= deadline:
-                        due = scheduled
-            problem = due is not None and (last is None or last < due)
-            message = f"예정 수집 점검 완료 기록 없음. 마지막 완료: {last}. 신규 판단은 점검 상태를 확인합니다."
+            started = datetime.fromisoformat(state["started_at"]) if state.get("started_at") else None
+            running = started is not None and (last is None or started > last)
+            if running:
+                problem = not timedelta(0) <= at - started <= timedelta(minutes=20)
+            else:
+                problem = last is None or not timedelta(0) <= at - last <= timedelta(minutes=10)
+            message = f"24시간 수집 점검 {'20분 초과 실행' if running else '10분 이상 완료 기록 없음'}. 마지막 완료: {last}. 신규 판단은 점검 상태를 확인합니다."
         except Exception as exc:
             problem, message = True, f"수집 자동화 상태를 읽지 못함: {type(exc).__name__}"
         # Separate state file: never overwrite a concurrent worker update.
@@ -490,4 +584,14 @@ def watchdog():
         report(alerts, "watchdog", problem, message, at=at)
         report(alerts, "deployment", transaction_blocked(), "수집 설정 배포가 완결되지 않았습니다. 신규 매수 판단 차단 유지.", at=at)
         alerts["checked_at"] = at.isoformat()
+        atomic_json(path, alerts)
+
+
+def controller_status(kind, error=None):
+    """Track failures of the worker/watchdog without racing worker state writes."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with portfolio_lock(STATE_DIR / "controller.lock", blocking=False):
+        path = STATE_DIR / "controller.json"
+        alerts = json.loads(path.read_text()) if path.exists() else {"incidents": {}}
+        report(alerts, kind, error is not None, error or "감시 프로그램 정상 실행 재개", phase="failed" if error else None)
         atomic_json(path, alerts)

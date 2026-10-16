@@ -15,6 +15,7 @@ AT = datetime(2026, 10, 19, 8, 0, tzinfo=health.KST)
 @pytest.fixture(autouse=True)
 def no_external_actions(monkeypatch):
     monkeypatch.setattr(repair, "now", lambda: AT)
+    monkeypatch.setattr(repair, "WORK_DEADLINE", None)
     monkeypatch.setattr(repair, "model_call", lambda *a, **k: pytest.fail("real model call"))
     monkeypatch.setattr(health, "get_text", lambda *a, **k: pytest.fail("real source request"))
     monkeypatch.setattr(repair, "git", lambda *a, **k: pytest.fail("real git action"))
@@ -193,7 +194,7 @@ def test_optional_news_failure_is_visible_without_mandatory_block(monkeypatch):
     assert repair.preanalysis_problem(AT) is None
 
 
-@pytest.mark.parametrize("hour,minute,allowed", [(7, 29, False), (7, 30, True), (8, 19, True), (8, 20, False), (9, 0, False)])
+@pytest.mark.parametrize("hour,minute,allowed", [(0, 0, True), (7, 29, True), (8, 14, True), (8, 15, False), (9, 0, False), (15, 30, False), (16, 9, False), (16, 10, True), (23, 59, True)])
 def test_repair_deadline(hour, minute, allowed):
     assert repair.repair_window(AT.replace(hour=hour, minute=minute)) is allowed
 
@@ -205,6 +206,7 @@ def test_no_repair_after_analysis_began(monkeypatch):
 
 
 def test_shadow_day_required_and_transient_errors_never_invoke_model(monkeypatch):
+    monkeypatch.setenv("SIMA_COLLECTOR_AUTOREPAIR", "1")
     value = good_report()
     value["sources"]["index"] = {"status": "structure", "error": "410"}
     monkeypatch.setattr(health, "probe", lambda *a, **k: value)
@@ -212,7 +214,7 @@ def test_shadow_day_required_and_transient_errors_never_invoke_model(monkeypatch
     repair.check(allow_repair=True)
     state = repair.read_state()
     assert state["attempts"] == {}
-    assert state["incidents"]["repair"]["open"] is True
+    assert state["incidents"]["index"]["phase"] == "shadow"
     value["sources"]["index"]["status"] = "transient"
     repair.check(allow_repair=True)
     assert repair.read_state()["attempts"] == {}
@@ -250,7 +252,7 @@ def test_proposal_cannot_change_a_healthy_route(monkeypatch):
     report["sources"]["index"] = {"status": "structure", "error": "410"}
     with pytest.raises(RuntimeError, match="healthy or unrelated"):
         repair.repair(repair.read_state(), routes.default_manifest(), report)
-    assert repair.read_state()["attempts"][AT.date().isoformat()] == 1
+    assert repair.read_state()["attempts"][repair.attempt_window(AT)] == 1
 
 
 def test_identical_aggregate_news_cannot_replace_ticker_feeds():
@@ -404,3 +406,163 @@ def test_actual_pipeline_index_failure_blocks_before_stock_analysis(monkeypatch)
     monkeypatch.setattr(collectors, 'fetch_kospi200_index_bars', lambda *a: None)
     with pytest.raises(DataCollectionUnavailable, match='index_input_unavailable'):
         asyncio.run(pipeline.quant_prefilter([('005930', '반도체')]))
+
+
+def test_daytime_queue_survives_restart_and_repairs_after_close(monkeypatch):
+    monkeypatch.setenv('SIMA_COLLECTOR_AUTOREPAIR', '1')
+    state = repair.read_state()
+    state['shadow_days'] = ['2026-10-16']
+    state['attempts'][repair.attempt_window(AT)] = 2
+    repair.atomic_json(repair.STATE_DIR / 'state.json', state)
+    broken = good_report()
+    broken['sources']['stock_news'] = {'status': 'structure', 'error': 'HTTP 410'}
+    monkeypatch.setattr(health, 'probe', lambda *a, **k: copy.deepcopy(broken))
+    sent, calls = [], []
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: sent.append(m) or True)
+    monkeypatch.setattr(repair, 'repair', lambda *a: calls.append(a) or good_report())
+    monkeypatch.setattr(repair.run_history, 'already_analyzed', lambda *a: True)
+    for hour, minute in [(10, 0), (15, 30), (16, 9)]:
+        monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=hour, minute=minute))
+        repair.check(allow_repair=True, monitoring=True)
+        assert repair.read_state()['pending_repairs']['stock_news']['status'] == 'waiting_close'
+        assert calls == []
+    assert any('16:10' in m for m in sent)
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=16, minute=10))
+    repair.check(allow_repair=True, monitoring=True)
+    assert len(calls) == 1
+    assert repair.read_state()['pending_repairs'] == {}
+    assert any('자동 수리·검증·배포를 시작' in m for m in sent)
+
+
+def test_queued_incident_recovers_without_needless_repair(monkeypatch):
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=10))
+    value = good_report()
+    value['sources']['index'] = {'status': 'structure', 'error': 'HTTP 404'}
+    monkeypatch.setattr(health, 'probe', lambda *a, **k: copy.deepcopy(value))
+    sent = []
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: sent.append(m) or True)
+    repair.check(allow_repair=True, monitoring=True)
+    value = good_report()
+    repair.check(allow_repair=True, monitoring=True)
+    assert repair.read_state()['pending_repairs'] == {}
+    assert any('복구' in m for m in sent)
+    # A recurrence on the same day must alert immediately again.
+    size = len(sent)
+    value['sources']['index'] = {'status': 'structure', 'error': 'HTTP 404'}
+    repair.check(allow_repair=True, monitoring=True)
+    assert len(sent) == size + 1
+
+
+def test_failed_night_repair_cooldown_then_session_budget(monkeypatch):
+    monkeypatch.setenv('SIMA_COLLECTOR_AUTOREPAIR', '1')
+    state = repair.read_state()
+    state['shadow_days'] = ['2026-10-16']
+    repair.atomic_json(repair.STATE_DIR / 'state.json', state)
+    value = good_report()
+    value['sources']['index'] = {'status': 'structure', 'error': '410'}
+    monkeypatch.setattr(health, 'probe', lambda *a, **k: copy.deepcopy(value))
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: True)
+    calls = []
+    def failed(state, *args):
+        slot = repair.attempt_window()
+        state['attempts'][slot] = state['attempts'].get(slot, 0) + 1
+        calls.append(slot)
+        raise RuntimeError('candidate validation failed')
+    monkeypatch.setattr(repair, 'repair', failed)
+    for minute in (0, 5, 30, 35):
+        monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=20, minute=minute))
+        repair.check(allow_repair=True, monitoring=True)
+    assert len(calls) == 2
+    state = repair.read_state()
+    assert state['pending_repairs']['index']['status'] == 'budget'
+    assert state['incidents']['repair']['open'] is True
+
+
+@pytest.mark.parametrize('day,hour,minute', [(19, 16, 10), (19, 23, 55), (17, 10, 0)])
+def test_afterclose_and_weekend_commit_deploy_despite_morning_history(monkeypatch, transaction_fixture, day, hour, minute):
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(day=day, hour=hour, minute=minute))
+    monkeypatch.setattr(repair.run_history, 'already_analyzed', lambda *a: True)
+    state, current, failed, refs, actions = transaction_fixture
+    repair.repair(state, current, failed)
+    assert refs == {'local': 'candidate', 'remote': 'candidate'}
+    assert repair.budget(1) > 0
+
+
+def test_rollback_reserve_closes_before_frozen_deployment_window(monkeypatch):
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=8, minute=22))
+    with pytest.raises(RuntimeError):
+        repair.require_publish_window()
+    repair.require_publish_window(rollback=True)
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=8, minute=23))
+    with pytest.raises(RuntimeError):
+        repair.require_publish_window(rollback=True)
+
+
+def test_interrupted_deployment_does_not_prevent_intraday_monitoring(monkeypatch):
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=10))
+    repair.atomic_json(repair.STATE_DIR / 'transaction.json', {'status': 'publishing'})
+    monkeypatch.setattr(repair, 'recover_transaction', lambda: pytest.fail('intraday mutation'))
+    calls = []
+    monkeypatch.setattr(health, 'probe', lambda *a, **k: calls.append(k) or good_report())
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: True)
+    repair.check(allow_repair=True, monitoring=True)
+    assert len(calls) == 1
+    assert repair.transaction_blocked()
+    assert repair.read_state()['incidents']['deployment']['phase'] == 'waiting_close'
+
+
+def test_intraday_monitor_removes_current_index_bar_but_actual_input_rejects_it():
+    xml = index_xml().replace('</chartdata>', '<item data="20261019|100|102|99|101|2000"/></chartdata>')
+    at = AT.replace(hour=10)
+    assert len(health.index_data(xml, at, monitoring=True)) == 60
+    with pytest.raises(health.ProbeError, match='last session'):
+        health.index_data(xml, at)
+    assert len(health.index_data(xml, AT.replace(hour=16))) == 61
+
+
+def test_intraday_monitor_rejects_frozen_krx_quotes():
+    at = AT.replace(hour=10)
+    rows = [{'itemCode': code, 'stockExchangeType': {'code': 'KS'},
+             'closePriceRaw': 100000, 'localTradedAt': at.isoformat()} for code in health.CANARIES]
+    assert len(health.quotes_data(json.dumps({'datas': rows}), at, monitoring=True)) == 2
+    rows[0]['localTradedAt'] = (at - timedelta(minutes=6)).isoformat()
+    with pytest.raises(health.ProbeError, match='five-minute'):
+        health.quotes_data(json.dumps({'datas': rows}), at, monitoring=True)
+
+
+@pytest.mark.parametrize('running,age,problem', [(False, 11, True), (False, 5, False), (True, 19, False), (True, 21, True)])
+def test_watchdog_works_at_night_with_bounded_worker_grace(monkeypatch, running, age, problem):
+    at = AT.replace(day=17, hour=23)
+    monkeypatch.setattr(repair, 'now', lambda: at)
+    sent = []
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: sent.append(m) or True)
+    state = repair.read_state()
+    state['completed_at'] = (at - timedelta(minutes=age + (5 if running else 0))).isoformat()
+    if running:
+        state['started_at'] = (at - timedelta(minutes=age)).isoformat()
+    repair.atomic_json(repair.STATE_DIR / 'state.json', state)
+    repair.watchdog()
+    assert bool(sent) is problem
+
+
+def test_phase_change_and_failed_enqueue_do_not_lose_notifications(monkeypatch):
+    state = repair.read_state()
+    sent = []
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: sent.append(m) or True)
+    repair.report(state, 'index', True, 'queued', phase='waiting_close')
+    repair.report(state, 'index', True, 'queued', phase='waiting_close')
+    assert len(sent) == 1
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: False)
+    repair.report(state, 'index', True, 'repairing', phase='ready')
+    assert state['incidents']['index']['phase'] == 'waiting_close'
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: sent.append(m) or True)
+    repair.report(state, 'index', True, 'repairing', phase='ready')
+    assert len(sent) == 2
+
+
+def test_controller_error_recovery_and_recurrence_notifications(monkeypatch):
+    sent = []
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: sent.append(m) or True)
+    for error in ('exception', 'exception', None, 'exception'):
+        repair.controller_status('worker_process', error)
+    assert len(sent) == 3
