@@ -748,3 +748,19 @@ def test_parallel_failure_writes_preserve_all_request_samples(monkeypatch):
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(lambda n: repair.request_repair('stock_news', 'timeout', slots={'ticker': f'{n:06d}'}), range(12)))
     assert len(repair.read_workflow()['requests']['stock_news']['samples']) == 12
+
+
+def test_failed_recovery_notice_retries_delivery_without_reprobing_healthy_source(monkeypatch):
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: True)
+    repair.request_repair('stock_news', 'failed', slots={'ticker': '123456'})
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: False)
+    repair.source_succeeded('stock_news', '[]', slots={'ticker': '123456'})
+    assert repair.read_workflow()['requests']['stock_news']['samples'] == {}
+    monkeypatch.setattr(repair, 'check', lambda **k: pytest.fail('healthy source re-probed'))
+    repair.process_pending()
+    assert repair.read_workflow()['requests']
+    sent = []
+    monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: sent.append(m) or True)
+    repair.process_pending()
+    assert len(sent) == 1 and '복구' in sent[0]
+    assert repair.read_workflow()['requests'] == {}

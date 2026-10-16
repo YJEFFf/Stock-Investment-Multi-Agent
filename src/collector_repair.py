@@ -667,8 +667,19 @@ def preanalysis_problem(at=None):
 
 def process_pending():
     """Drain real incidents only. An empty queue performs no probes or alerts."""
+    if read_workflow()["requests"]:
+        with portfolio_lock(STATE_DIR / "workflow.lock"):
+            workflow = read_workflow()
+            for source, entry in list(workflow["requests"].items()):
+                if not entry.get("samples"):
+                    report(workflow, source, False, "실제 워크플로우에서 실패했던 요청의 정상 응답을 확인했습니다.")
+                    if not workflow["incidents"].get(source, {}).get("open"):
+                        del workflow["requests"][source]
+                elif entry.get("diagnosed_generation") == entry["generation"]:
+                    report(workflow, source, True, "수리 점검 경로는 정상입니다. 원래 실패한 업무 요청의 복구 여부는 다음 정규 실행에서 확인합니다.", phase="awaiting_workflow")
+            atomic_json(STATE_DIR / "workflow.json", workflow)
     requests = {k: v for k, v in read_workflow()["requests"].items()
-                if v.get("diagnosed_generation") != v["generation"]}
+                if v.get("samples") and v.get("diagnosed_generation") != v["generation"]}
     state = read_state()
     blocked = transaction_blocked()
     if not requests and not blocked:
