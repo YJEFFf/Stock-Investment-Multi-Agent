@@ -1,4 +1,5 @@
 import asyncio
+from contextvars import ContextVar
 import json
 import logging
 import re
@@ -16,6 +17,7 @@ from src.schemas import (
     DisclosureContext,
     FillRecord,
     GateResult,
+    MarketContext,
     NewsContext,
     OHLCVBar,
     PortfolioState,
@@ -391,6 +393,9 @@ async def execute_buy_order(
             _log_buy_skip(log_path, today, ticker, "order_rejected")
             return portfolio
 
+    if order_no is not None:
+        order_guard.mark_accepted(ticker, order_no)
+
     # 진입가는 손절·익절 판정의 유일한 기준점이라 반드시 **실제 체결가**여야 한다.
     # 주문 직전 호가로 폴백하면 그 오차가 포지션 수명 내내 남는다 — 192820이
     # 호가 210,000에 주문돼 232,000에 체결됐는데 진입가는 210,000으로 남았고,
@@ -631,11 +636,26 @@ def make_dummy_analyst_fn(base_seed: int) -> AnalystFn:
     return _fn
 
 
+# 한 실행에서 프리필터와 차트 분석은 같은 시세 스냅샷을 사용한다. 다음 실행에는 비운다.
+_MARKET_CONTEXTS: ContextVar[dict[tuple[str, int], MarketContext] | None] = ContextVar("market_contexts", default=None)
+
+
+async def _market_context(ticker: str, lookback_days: int) -> MarketContext | None:
+    cache = _MARKET_CONTEXTS.get()
+    key = (ticker, lookback_days)
+    if cache is not None and key in cache:
+        return cache[key]
+    context = await asyncio.to_thread(collectors.fetch_market_context, ticker, lookback_days)
+    if cache is not None and context is not None:
+        cache[key] = context
+    return context
+
+
 def make_chart_analyst_fn(lookback_days: int = 60) -> AnalystFn:
     """실데이터 경로: 차트 분석가만 단독으로 호출. sector는 필요 없어 무시한다."""
 
     async def _fn(ticker: str, sector: str, day: datetime) -> list[AnalystOpinion]:
-        context = await asyncio.to_thread(collectors.fetch_market_context, ticker, lookback_days)
+        context = await _market_context(ticker, lookback_days)
         run_history.observe(ticker, "chart", context.bars if context is not None else None,
                             latest=context.bars[-1].date if context and context.bars else None)
         if context is None:
@@ -789,7 +809,7 @@ async def quant_prefilter(
         record.index_unavailable = index_return_5d_pct is None
 
     async def _check(ticker: str, sector: str) -> tuple[str, str, list[str], dict[str, float]] | None:
-        context = await asyncio.to_thread(collectors.fetch_market_context, ticker, lookback_days)
+        context = await _market_context(ticker, lookback_days)
         if context is None:
             return None
         reasons = quant_filter_reasons(context.indicators, index_return_5d_pct)
@@ -868,29 +888,33 @@ async def run_daily(
     쓸지 무비용 경로(propose_decision/execute_simulated)를 쓸지 호출부가 항상
     명시해야 실수로 비용이나 실주문이 나가지 않는다.
     """
-    log_path = log_path or DEFAULT_LOG_PATH
-    universe = await build_universe_with_sectors()
-    if not universe:
-        logger.error("run_daily_aborted day=%s reason=universe_fetch_failed", day.date().isoformat())
-        raise DataCollectionUnavailable("universe_fetch_failed")
+    token = _MARKET_CONTEXTS.set({})
+    try:
+        log_path = log_path or DEFAULT_LOG_PATH
+        universe = await build_universe_with_sectors()
+        if not universe:
+            logger.error("run_daily_aborted day=%s reason=universe_fetch_failed", day.date().isoformat())
+            raise DataCollectionUnavailable("universe_fetch_failed")
 
-    record = run_history.CURRENT.get()
-    if record is not None:
-        record.universe = len(universe)
-    filtered = await quant_prefilter(universe)
-    if record is not None:
-        record.candidates = len(filtered)
-    logger.info(
-        "run_daily_filtered day=%s universe=%d filtered=%d",
-        day.date().isoformat(),
-        len(universe),
-        len(filtered),
-    )
+        record = run_history.CURRENT.get()
+        if record is not None:
+            record.universe = len(universe)
+        filtered = await quant_prefilter(universe)
+        if record is not None:
+            record.candidates = len(filtered)
+        logger.info(
+            "run_daily_filtered day=%s universe=%d filtered=%d",
+            day.date().isoformat(),
+            len(universe),
+            len(filtered),
+        )
 
-    run_history.claim_analysis()
-    return await run_day(
-        filtered, day, portfolio, config, analyst_fn, judge_fn, execute_fn, total_expected_analysts, log_path
-    )
+        run_history.claim_analysis()
+        return await run_day(
+            filtered, day, portfolio, config, analyst_fn, judge_fn, execute_fn, total_expected_analysts, log_path
+        )
+    finally:
+        _MARKET_CONTEXTS.reset(token)
 
 
 async def run_day(
@@ -913,25 +937,21 @@ async def run_day(
     항상 명시적으로 골라야 한다.
     """
     log_path = log_path or DEFAULT_LOG_PATH
-    raw_results = await asyncio.gather(
-        *(analyst_fn(ticker, sector, day) for ticker, sector in universe), return_exceptions=True
-    )
-
-    opinions_per_ticker: list[list[AnalystOpinion]] = []
-    for (ticker, _), raw in zip(universe, raw_results):
-        if isinstance(raw, BaseException):
-            logger.warning("analyst_fn_failed ticker=%s error=%s", ticker, raw)
+    async def analyze_and_judge(ticker: str, sector: str) -> Decision | None:
+        # 다른 종목의 느린 수집을 기다리지 않고 이 종목의 판단을 이어간다.
+        try:
+            opinions = await analyst_fn(ticker, sector, day)
+        except Exception as exc:
+            logger.warning("analyst_fn_failed ticker=%s error=%s", ticker, exc)
             if run_history.CURRENT.get() is not None:
                 run_history.CURRENT.get().analyst_failed += 1
-            opinions_per_ticker.append([])
-        else:
-            opinions_per_ticker.append(raw)
+            opinions = []
+        return await judge_fn(opinions, total_expected_analysts)
 
     judge_raw_results = await asyncio.gather(
-        *(judge_fn(opinions, total_expected_analysts) for opinions in opinions_per_ticker),
+        *(analyze_and_judge(ticker, sector) for ticker, sector in universe),
         return_exceptions=True,
     )
-
     decisions: list[Decision | None] = []
     for (ticker, _), raw in zip(universe, judge_raw_results):
         if isinstance(raw, BaseException):
@@ -942,6 +962,7 @@ async def run_day(
         else:
             decisions.append(raw)
 
+    # 전체 완료 전에는 게이트/집행을 시작하지 않고 원래 종목 순서를 지킨다.
     results: list[tuple[Decision, GateResult]] = []
     record = run_history.CURRENT.get()
 

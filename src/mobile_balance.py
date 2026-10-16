@@ -40,6 +40,7 @@ def save_observation(fetch, destination: Path) -> bool:
 def serve():
     from src import kis
 
+    kis.RATE_LIMIT_PATH = Path("/var/lib/sima-balance/request-clock")
     kis.TOKEN_CACHE_PATH = Path("/var/lib/sima-balance/token.json")
     destination = Path("/var/lib/sima-balance/account.json")
     socket_path = Path("/run/sima-balance/reader.sock")

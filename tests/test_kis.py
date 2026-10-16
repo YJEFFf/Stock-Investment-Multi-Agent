@@ -704,3 +704,19 @@ def test_fetch_quote_leaves_freshness_fields_none_when_absent(monkeypatch, real_
     quote = kis.fetch_quote("192820")
 
     assert quote.open_price is None and quote.prev_close is None
+
+
+@pytest.mark.parametrize('payload', [
+    {}, {'output1':None}, {'output1':[], 'ctx_area_nk100':'next-page'},
+    {'output1':[{'pdno':'005930','hldg_qty':'bad','pchs_avg_pric':'100'}]},
+    {'output1':[{'pdno':'005930','hldg_qty':'1','pchs_avg_pric':'nan'}]},
+    {'output1':[{'pdno':'005930','hldg_qty':'1'}]},
+])
+def test_recovery_holdings_requires_complete_parse(monkeypatch,payload):
+    monkeypatch.setattr(kis,'_kis_get',lambda *a,**k:payload)
+    assert kis.fetch_holdings(require_complete=True) is None
+
+
+def test_explicit_empty_holdings_can_confirm_no_position(monkeypatch):
+    monkeypatch.setattr(kis,'_kis_get',lambda *a,**k:{'output1':[],'ctx_area_nk100':'  '})
+    assert kis.fetch_holdings(require_complete=True)=={}

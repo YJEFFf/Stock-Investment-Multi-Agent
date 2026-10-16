@@ -64,16 +64,14 @@ async def main() -> None:
     try:
         with portfolio_lock(blocking=False):
             portfolio = load_portfolio()
-            if not portfolio.positions:
-                return
-
-            portfolio = await pipeline.evaluate_holdings(portfolio, day, sell.execute_sell_order)
-            save_portfolio(portfolio)
+            if portfolio.positions:
+                portfolio = await pipeline.evaluate_holdings(portfolio, day, sell.execute_sell_order)
+                save_portfolio(portfolio)
     except PortfolioLockBusy:
         logger.info("check_stop_loss_skipped reason=previous_run_still_holding_lock")
         return
 
-    await asyncio.to_thread(order_recovery.recover_pending_buy, day)
+    await asyncio.to_thread(order_recovery.recover_pending_order, day)
 
 
 if __name__ == "__main__":

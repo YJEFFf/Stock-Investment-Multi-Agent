@@ -158,8 +158,10 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     """
     from src import app_notifications, codex_plan, collectors, evaluation, judgment, llm, notion_sync, order_guard, order_recovery, pipeline, portfolio_store, run_history, translate
 
+    monkeypatch.setattr(kis, "RATE_LIMIT_PATH", tmp_path / "kis_request_clock")
     monkeypatch.setattr(collectors, "TICKER_NAME_CACHE_PATH", tmp_path / "ticker_names.json")
     monkeypatch.setattr(translate, "DEFAULT_CACHE_DIR", tmp_path / "translations")
+    monkeypatch.delenv("SIMA_EXTENDED_ORDER_RECOVERY", raising=False)
     monkeypatch.delenv("SIMA_APP_ALERTS_ENABLED", raising=False)
     monkeypatch.setattr(app_notifications, "DEFAULT_APP_ALERTS_PATH", tmp_path / "app_alerts.jsonl")
 

@@ -662,3 +662,34 @@ def test_corrupt_display_cache_cannot_block_universe(monkeypatch, names):
     monkeypatch.setattr(collectors, "_fetch_with_retries", lambda *a, **k: expected)
     assert collectors.fetch_kospi200_universe() == expected
     assert collectors.fetch_kospi200_ticker_names() == dict(expected)
+
+
+def test_new_sector_endpoint_collects_every_cursor_page(monkeypatch):
+    seen=[]
+    def fetch(url,parse,**kwargs):
+        params=kwargs.get('params',{})
+        seen.append((url,params))
+        if url==collectors.NAVER_SECTOR_GROUP_LIST_URL:return []
+        if url.endswith('/list'):return [{'no':'1','name':'화학','type':'upjong','totalCnt':'2'}]
+        if not params.get('cursor'):
+            return {'items':[{'itemCode':'093370'}],'hasNext':True,'cursor':'next'}
+        return {'items':[{'itemCode':'00000A'}],'hasNext':False}
+    monkeypatch.setattr(collectors,'_fetch_with_retries',fetch)
+    assert collectors._fetch_sector_map_live()=={'093370':'화학','00000A':'화학'}
+    assert seen[-1][1]['cursor']=='next'
+
+
+@pytest.mark.parametrize('problem',['repeat_cursor','missing_cursor','missing_page','missing_member','duplicate','invalid_flag','count_mismatch'])
+def test_new_sector_endpoint_rejects_incomplete_maps(monkeypatch,problem):
+    def fetch(url,parse,**kwargs):
+        if url.endswith('/list'):return [{'no':'1','name':'화학','type':'upjong','totalCnt':'2'}]
+        cursor=kwargs.get('params',{}).get('cursor')
+        if problem=='missing_page':return None
+        if problem=='missing_member':return {'items':[{}],'hasNext':False}
+        if problem=='duplicate':return {'items':[{'itemCode':'093370'}]*2,'hasNext':False}
+        if problem=='invalid_flag':return {'items':[{'itemCode':'093370'}],'hasNext':'false'}
+        if problem=='count_mismatch':return {'items':[{'itemCode':'093370'}],'hasNext':False}
+        return {'items':[{'itemCode':'005930' if cursor else '093370'}], 'hasNext':True,
+                'cursor':None if problem=='missing_cursor' else 'next'}
+    monkeypatch.setattr(collectors,'_fetch_with_retries',fetch)
+    assert collectors._fetch_sector_map_json() is None

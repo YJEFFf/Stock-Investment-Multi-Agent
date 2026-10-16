@@ -39,7 +39,9 @@ AGENTS.md 규칙 7: 모의투자 도메인(openapivts)만 호출한다. 실전�
   후 20여 회를 일부러 한도 넘겨가며 때려도 이 문구는 재현되지 않았다.
 """
 
+import fcntl
 import json
+import math
 import logging
 import os
 import threading
@@ -73,6 +75,7 @@ BALANCE_TR_ID = "VTTC8434R"  # 모의투자 주식잔고조회
 ACCOUNT_PRODUCT_CODE = "01"  # 실측으로 확인됨 — 계좌번호 뒤 2자리
 
 TOKEN_CACHE_PATH = Path(__file__).resolve().parent.parent / ".kis_token_cache.json"
+RATE_LIMIT_PATH = Path(__file__).resolve().parent.parent / ".kis_request_clock"
 
 
 @dataclass(frozen=True)
@@ -211,12 +214,31 @@ def get_access_token() -> str | None:
 
 
 def _throttle() -> None:
+    # 매매 크론과 별도 잔고 서비스가 같은 inode를 flock한다. 파일은 replace하지 않는다.
+    # 실패하면 호출을 진행하지 않는다: 프로세스별 제한으로 조용히 후퇴하면 다시 충돌한다.
     global _last_request_at
-    with _throttle_lock:
-        wait = _last_request_at + MIN_REQUEST_SPACING_SECONDS - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
-        _last_request_at = time.monotonic()
+    with _throttle_lock, RATE_LIMIT_PATH.open("a+") as clock:
+        fcntl.flock(clock.fileno(), fcntl.LOCK_EX)
+        try:
+            clock.seek(0)
+            raw = clock.read()
+            now = time.monotonic()
+            try:
+                previous = float(raw) if raw else 0.0
+                if not math.isfinite(previous) or previous < 0 or previous > now:
+                    previous = now  # 손상/재부팅이면 한 간격을 쉬고 새 시계를 기록한다.
+            except ValueError:
+                previous = now
+            wait = previous + MIN_REQUEST_SPACING_SECONDS - now
+            if wait > 0:
+                time.sleep(wait)
+            _last_request_at = time.monotonic()
+            clock.seek(0)
+            clock.truncate()
+            clock.write(str(_last_request_at))
+            clock.flush()
+        finally:
+            fcntl.flock(clock.fileno(), fcntl.LOCK_UN)
 
 
 def _is_capacity_rejection(data: dict) -> bool:
@@ -801,7 +823,7 @@ def fill_after_order(
     return best.model_copy(update={"complete": False})
 
 
-def fetch_holdings(*, policy: RetryPolicy = DEFAULT_POLICY) -> dict[str, tuple[int, float]] | None:
+def fetch_holdings(*, policy: RetryPolicy = DEFAULT_POLICY, require_complete: bool = False) -> dict[str, tuple[int, float]] | None:
     """브로커가 보고하는 보유 종목 전체: {종목코드: (보유수량, 매입평균가)}.
 
     **브로커가 사실의 출처다.** 자체 상태 파일(logs/portfolio_state.json)의 값과
@@ -829,17 +851,31 @@ def fetch_holdings(*, policy: RetryPolicy = DEFAULT_POLICY) -> dict[str, tuple[i
     if data is None:
         return None
 
+    # 자동 해제는 빈/부분/손상 응답을 "보유 없음"으로 취급하지 않는다.
+    if require_complete and (not isinstance(data.get("output1"), list)
+                             or str(data.get("ctx_area_nk100") or "").strip()):
+        return None
     holdings: dict[str, tuple[int, float]] = {}
     for row in data.get("output1") or []:
+        if not isinstance(row, dict):
+            if require_complete:
+                return None
+            continue
         ticker = row.get("pdno")
         qty_str, price_str = row.get("hldg_qty"), row.get("pchs_avg_pric")
-        if not ticker or not qty_str or not price_str:
+        if not ticker or qty_str in (None, "") or price_str in (None, ""):
+            if require_complete:
+                return None
             continue
         try:
             quantity, price = int(qty_str), float(price_str)
-        except ValueError:
+        except (ValueError, TypeError):
             logger.warning("kis_holdings_unparseable ticker=%s qty=%r price=%r", ticker, qty_str, price_str)
+            if require_complete:
+                return None
             continue
+        if require_complete and (quantity < 0 or not math.isfinite(price) or (quantity > 0 and price <= 0) or ticker in holdings):
+            return None
         if quantity > 0 and price > 0:
             holdings[ticker] = (quantity, price)
     return holdings

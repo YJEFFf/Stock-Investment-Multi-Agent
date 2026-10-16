@@ -22,6 +22,10 @@ test -x "$PWA_UV"
 if ! id sima-web >/dev/null 2>&1; then
   useradd --system --home-dir /var/lib/sima-pwa --shell /usr/sbin/nologin sima-web
 fi
+# 기존 시계 값을 지우지 않고 매매 프로세스와 잔고 서비스가 같은 inode를 공유한다.
+if [ ! -e "$PWA_REPO/.kis_request_clock" ]; then
+  install -m 600 -o ubuntu -g ubuntu /dev/null "$PWA_REPO/.kis_request_clock"
+fi
 install -d -m 755 /opt/sima-pwa/releases
 install -d -m 700 -o sima-web -g sima-web /var/lib/sima-pwa
 install -d -m 755 -o sima-web -g sima-web /var/lib/sima-pwa/data

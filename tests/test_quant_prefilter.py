@@ -271,3 +271,36 @@ def test_prefilter_logs_why_each_passing_ticker_passed(monkeypatch, tmp_path):
     assert rows[0]["ticker"] == "005930"
     assert rows[0]["reasons"] == ["rsi_overbought"]
     assert rows[0]["return_20d_pct"] == 31.5 and rows[0]["rsi14"] == 78.0
+
+
+def test_daily_chart_reuses_prefilter_snapshot_and_next_run_fetches_again(monkeypatch):
+    calls=[]
+    async def universe():return [('005930','semiconductor')]
+    def context(ticker, lookback):
+        calls.append(ticker)
+        return MarketContext(ticker=ticker,as_of=datetime.now(timezone.utc),bars=_bars([100]*21),
+                             indicators={'rsi14':75.0})
+    async def chart(context):return None
+    async def judge(*args):return None
+    monkeypatch.setattr(pipeline,'build_universe_with_sectors',universe)
+    monkeypatch.setattr(collectors,'fetch_market_context',context)
+    monkeypatch.setattr(collectors,'fetch_kospi200_index_bars',lambda n:[])
+    monkeypatch.setattr(pipeline,'chart_analyst',chart)
+    async def scenario():
+        for _ in range(2):
+            await pipeline.run_daily(datetime.now(timezone.utc),PortfolioState(),RiskGateConfig(),
+                                     pipeline.make_chart_analyst_fn(),judge,pipeline.execute_simulated)
+            assert pipeline._MARKET_CONTEXTS.get() is None
+    asyncio.run(scenario())
+    assert calls==['005930','005930']
+
+
+def test_snapshot_scope_cleared_after_failure(monkeypatch):
+    async def fail():raise RuntimeError('network')
+    monkeypatch.setattr(pipeline,'build_universe_with_sectors',fail)
+    async def scenario():
+        with pytest.raises(RuntimeError):
+            await pipeline.run_daily(datetime.now(timezone.utc),PortfolioState(),RiskGateConfig(),
+                                     pipeline.make_chart_analyst_fn(),pipeline.propose_decision,pipeline.execute_simulated)
+        assert pipeline._MARKET_CONTEXTS.get() is None
+    asyncio.run(scenario())

@@ -2,8 +2,8 @@
 
 주문 전 표시하고, 명시적 거부 또는 완전체결의 장부 저장 후에만 해제한다. 응답과 체결을
 모두 확인하지 못한 주문은 날짜가 바뀌어도 자동으로 재전송하지 않는다. 운영 호출자는
-portfolio_lock 안에서 이 함수를 사용한다. 사람이 원장·장부를 대조한 뒤 해제할 수 있다. 접수가 확인된 당일 신규 매수의
-부분 체결은 order_recovery가 원장·잔고·일지를 검증하고 저장한 뒤 해제할 수 있다.
+portfolio_lock 안에서 이 함수를 사용한다. 사람이 원장·장부를 대조한 뒤 해제할 수 있다. 신규 매수와 전량 매도의
+지연 체결은 order_recovery가 주문일 원장·잔고·일지를 검증하고 저장한 뒤 해제할 수 있다.
 """
 
 import json
@@ -50,6 +50,13 @@ def begin(ticker: str, side: str, quantity: int, fills_before: tuple | None) -> 
         ticker=ticker, side=side, quantity=quantity,
         created_at=datetime.now(timezone.utc), fills_before=fills_before,
     )
+    _save(orders)
+
+
+def mark_accepted(ticker: str, order_no: str) -> None:
+    """접수 번호를 영속화해 호가 폴백 매도의 후속 대조에도 접수 증거를 남긴다."""
+    orders = load_orders()
+    orders[ticker].order_no = str(order_no)
     _save(orders)
 
 

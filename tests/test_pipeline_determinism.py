@@ -118,3 +118,28 @@ def test_make_combined_analyst_fn_merges_all_successes():
     opinions = asyncio.run(combined("005930", "반도체", day))
 
     assert {o.agent for o in opinions} == {"a", "b"}
+
+
+def test_each_ticker_judged_without_global_collection_barrier_but_execution_waits(tmp_path):
+    from src.schemas import AnalystOpinion, Decision
+    async def scenario():
+        first_judged=asyncio.Event()
+        all_done=asyncio.Event()
+        executed=[]
+        async def analyst(ticker,sector,day):
+            if ticker=='slow':
+                await asyncio.wait_for(first_judged.wait(), .5)
+                all_done.set()
+            return [AnalystOpinion(agent='chart',ticker=ticker,score=.9,confidence=.9,
+                                   evidence=['prompt:test@1'],as_of=day)]
+        async def judge(opinions,expected):
+            if opinions[0].ticker=='fast':first_judged.set()
+            return Decision(ticker=opinions[0].ticker,action='HOLD',reason='test',inputs=opinions,degraded=False)
+        async def execute(decision,gate,portfolio,sector,weight):
+            assert all_done.is_set()
+            executed.append(decision.ticker)
+            return portfolio
+        await run_day([('slow',''),('fast','')],datetime(2026,10,16),PortfolioState(),RiskGateConfig(),
+                      analyst,judge,execute,log_path=tmp_path/'pipeline.jsonl')
+        assert executed==['slow','fast']
+    asyncio.run(scenario())

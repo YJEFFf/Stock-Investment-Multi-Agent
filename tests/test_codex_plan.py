@@ -328,3 +328,23 @@ def test_deadline_expired_during_login_does_not_start_inference(monkeypatch):
         codex_plan._call_sync("translate", "input", codex_plan.HealthResponse,
                               codex_plan._HEALTH_SCHEMA, codex_plan.DEFAULT_MODEL, 30.0)
     assert len(calls) == 2
+
+
+def test_collection_executor_saturation_does_not_block_codex(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    released=threading.Event()
+    monkeypatch.setattr(codex_plan,'_call_sync',lambda *a:(codex_plan.HealthResponse(status='ok'),{}))
+    async def scenario():
+        loop=asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        busy=loop.run_in_executor(None,released.wait)
+        try:
+            answer=await asyncio.wait_for(codex_plan._call_structured(
+                system='',user='',response_model=codex_plan.HealthResponse,json_schema={},
+                label='chart',model=codex_plan.DEFAULT_MODEL,log_path=tmp_path/'calls.jsonl'),timeout=.5)
+            assert answer.status=='ok'
+        finally:
+            released.set()
+            await busy
+    asyncio.run(scenario())

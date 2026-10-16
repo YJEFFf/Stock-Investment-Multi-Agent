@@ -331,6 +331,69 @@ def _write_sector_cache(sector_map: dict[str, str]) -> None:
         logger.warning("sector_cache_write_failed error=%s", exc)
 
 
+def _parse_sector_json(text: str) -> dict | list:
+    payload = json.loads(text)
+    if not isinstance(payload, (dict, list)):
+        raise ValueError("invalid sector response")
+    return payload
+
+
+def _fetch_sector_map_json() -> dict[str, str] | None:
+    """네이버 개편 후 같은 업종 분류의 JSON 경로. 모든 페이지를 검증한다."""
+    base = "https://stock.naver.com/api/domestic/market/upjong"
+    groups = []
+    seen_groups = set()
+    while True:
+        page = _fetch_with_retries(base + "/list", _parse_sector_json,
+                                  params={"startIdx": len(groups), "pageSize": 100, "sortType": "changeRate"})
+        if not isinstance(page, list):
+            return None
+        for group in page:
+            if (not isinstance(group, dict) or not str(group.get("no", "")).isdigit()
+                    or not isinstance(group.get("name"), str) or not group["name"].strip()
+                    or group["no"] in seen_groups or group.get("type") != "upjong"):
+                return None
+            seen_groups.add(group["no"])
+            groups.append(group)
+        if len(page) < 100:
+            break
+    if not groups:
+        return None
+    sector_map = {}
+    for group in groups:
+        cursor = None
+        cursors = set()
+        members = set()
+        while True:
+            params = {"size": 100, "sortType": "marketCap", "sortDirection": "desc"}
+            if cursor:
+                params["cursor"] = cursor
+            page = _fetch_with_retries(f"{base}/{group['no']}/stocklist", _parse_sector_json, params=params)
+            if (not isinstance(page, dict) or not isinstance(page.get("items"), list)
+                    or type(page.get("hasNext")) is not bool):
+                return None
+            for item in page["items"]:
+                code = item.get("itemCode") if isinstance(item, dict) else None
+                if not isinstance(code, str) or not re.fullmatch(r"[0-9A-Z]{6}", code) or code in members:
+                    return None
+                members.add(code)
+            if not page["hasNext"]:
+                break
+            cursor = page.get("cursor")
+            if not isinstance(cursor, str) or not cursor or cursor in cursors or not page["items"]:
+                return None
+            cursors.add(cursor)
+        try:
+            if len(members) != int(group["totalCnt"]):
+                return None
+        except (KeyError, ValueError, TypeError):
+            return None
+        for code in members:
+            sector_map.setdefault(code, group["name"])
+    logger.info("sector_map_source source=naver_json groups=%d members=%d", len(groups), len(sector_map))
+    return sector_map or None
+
+
 def _fetch_sector_map_live() -> dict[str, str] | None:
     """네이버 업종별 시세(79개 그룹)를 전부 훑어 종목코드 -> 업종명 맵을 만든다.
 
@@ -339,8 +402,10 @@ def _fetch_sector_map_live() -> dict[str, str] | None:
     """
     groups = _fetch_with_retries(NAVER_SECTOR_GROUP_LIST_URL, _parse_sector_groups, params={"type": "upjong"})
     if not groups:
-        logger.error("sector_groups_missing_or_layout_changed")
-        return None
+        fresh = _fetch_sector_map_json()
+        if fresh is None:
+            logger.error("sector_groups_missing_or_layout_changed")
+        return fresh
 
     sector_map: dict[str, str] = {}
     for no, name in groups:

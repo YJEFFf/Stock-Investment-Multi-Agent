@@ -21,6 +21,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 BindPaths=/home/ubuntu/sima/.kis_token_cache.json:/var/lib/sima-balance/token.json
+BindPaths=/home/ubuntu/sima/.kis_request_clock:/var/lib/sima-balance/request-clock
 RestrictSUIDSGID=true
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

@@ -8,3 +8,5 @@ logs/
 .kis_token_cache.json
 .kospi200_sector_cache.json
 .kospi200_ticker_name_cache.json
+
+.kis_request_clock

@@ -12,6 +12,7 @@ NOW = datetime(2026, 10, 12, 9, 4, tzinfo=ZoneInfo('Asia/Seoul'))
 
 @pytest.fixture
 def waiting(monkeypatch):
+    monkeypatch.setenv("SIMA_EXTENDED_ORDER_RECOVERY", "1")
     plan = ExitPlan(stop_loss_pct=-.067715, take_profit_pct=.13543, take_profit_fraction=1/3, trail_pct=-.054172)
     position = Position(ticker='009240', sector='', quantity=183, entry_day=NOW.date(), entry_price=40600,
                         peak_price=41200, weight=.08, exit_plan=plan)
@@ -191,4 +192,147 @@ def test_unattributable_or_committed_orders_are_left_alone(waiting,problem):
         recovery.JOURNAL_PATH.write_text(json.dumps(prior)+'\n'+recovery.JOURNAL_PATH.read_text())
     assert not recovery.recover_pending_buy(NOW)
     assert waiting==[]
+    assert order_guard.is_blocked('009240')
+
+
+@pytest.mark.parametrize('source', ['fill_partial', 'quote_fallback', 'daily_avg', 'position_avg'])
+def test_buy_recovery_survives_next_day_and_all_unverified_sources(waiting, source, monkeypatch):
+    row = json.loads(recovery.JOURNAL_PATH.read_text())
+    row['entry_price_source'] = source
+    recovery.JOURNAL_PATH.write_text(json.dumps(row)+'\n')
+    original = kis.fetch_daily_fill_totals
+    def query(ticker, day, side, **kw):
+        assert day == NOW.date()  # 현재 날짜가 아닌 주문 날짜의 원장
+        return original(ticker, day, side, **kw)
+    monkeypatch.setattr(kis, 'fetch_daily_fill_totals', query)
+    assert recovery.recover_pending_order(NOW + timedelta(days=1))
+    assert not order_guard.load_orders()
+
+
+def test_later_transaction_prevents_old_buy_recovery(waiting):
+    with recovery.JOURNAL_PATH.open('a') as f:
+        f.write(json.dumps(dict(event='sell',ticker='009240',day='2026-10-13',shares_sold=1))+'\n')
+    assert not recovery.recover_pending_order(NOW + timedelta(days=1))
+    assert order_guard.is_blocked('009240')
+
+
+@pytest.fixture
+def waiting_sell(waiting, monkeypatch):
+    buy = json.loads(recovery.JOURNAL_PATH.read_text())
+    buy.update(day='2026-10-09', entry_price_source='fill', quantity=183)
+    row = dict(event='sell',ticker='009240',day=NOW.date().isoformat(),shares_before=183,
+               shares_sold=183,shares_after=0,portfolio_weight_after=0,entry_price=40600,
+               exit_price=38000,exit_price_source='fill_partial',sell_amount=6954000,fee_amount=900)
+    recovery.JOURNAL_PATH.write_text(json.dumps(buy)+'\n'+json.dumps(row)+'\n')
+    orders=order_guard.load_orders();orders['009240'].side='sell';order_guard._save(orders)
+    store.save_portfolio(PortfolioState())
+    def fills(t,d,side,**kw):
+        assert d==NOW.date()
+        assert kw['require_fee']
+        return (183,6960000.,980.) if side=='sell' else (0,0.,0.)
+    monkeypatch.setattr(kis,'fetch_daily_fill_totals',fills)
+    monkeypatch.setattr(kis,'fetch_holdings',lambda **kw:{})
+
+
+def test_full_sell_recovery_persists_actual_amount_costs_before_release(waiting_sell, monkeypatch):
+    state=store.load_portfolio()
+    clear=order_guard.clear
+    def checked(ticker):
+        row=json.loads(recovery.JOURNAL_PATH.read_text().splitlines()[-1])
+        assert row['sell_amount']==6960000
+        assert row['fee_amount']==980
+        assert row['fee_source']=='fill'
+        assert row['sell_amount_source']=='fill'
+        assert row['exit_price']==6960000/183
+        assert row['net_pnl_amount'] < (6960000 - 40600*183)
+        clear(ticker)
+    monkeypatch.setattr(order_guard,'clear',checked)
+    assert recovery.recover_pending_order(NOW+timedelta(days=1))
+    assert store.load_portfolio()==state
+    assert not recovery.recover_pending_order(NOW+timedelta(days=1))
+
+
+@pytest.mark.parametrize('problem', ['partial','overfill','missing_fee','holding','local_holding','buy_same_day',
+                                    'missing_prior','later_trade','duplicate','unaccepted_quote','changed_marker','changed_journal'])
+def test_sell_ambiguity_never_releases(waiting_sell, monkeypatch, problem):
+    rows=[json.loads(l) for l in recovery.JOURNAL_PATH.read_text().splitlines()]
+    if problem in ('partial','overfill','missing_fee','buy_same_day'):
+        def fills(t,d,side,**kw):
+            if side=='buy':return (1,40000.,10.) if problem=='buy_same_day' else (0,0.,0.)
+            if problem=='missing_fee':return None
+            return (182 if problem=='partial' else 184 if problem=='overfill' else 183,6960000.,980.)
+        monkeypatch.setattr(kis,'fetch_daily_fill_totals',fills)
+    elif problem=='holding':monkeypatch.setattr(kis,'fetch_holdings',lambda **kw:{'009240':(1,40600.)})
+    elif problem=='local_holding':
+        store.save_portfolio(PortfolioState(positions=[Position(ticker='009240',sector='',weight=.01,quantity=1)]))
+    elif problem=='missing_prior':rows=rows[1:]
+    elif problem=='later_trade':rows.append(dict(event='buy',ticker='009240',day='2026-10-13',quantity=1))
+    elif problem=='duplicate':rows.append(rows[-1])
+    elif problem=='unaccepted_quote':rows[-1]['exit_price_source']='quote_fallback'
+    elif problem in ('changed_marker','changed_journal'):
+        def race(**kw):
+            if problem=='changed_marker':
+                orders=order_guard.load_orders();orders['009240'].quantity=1;order_guard._save(orders)
+            else:
+                with recovery.JOURNAL_PATH.open('a') as f:f.write('{}\n')
+            return {}
+        monkeypatch.setattr(kis,'fetch_holdings',race)
+    recovery.JOURNAL_PATH.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+    assert not recovery.recover_pending_order(NOW+timedelta(days=1))
+    assert order_guard.is_blocked('009240')
+
+
+def test_accepted_quote_sell_can_recover(waiting_sell):
+    rows=[json.loads(l) for l in recovery.JOURNAL_PATH.read_text().splitlines()]
+    rows[-1]['exit_price_source']='quote_fallback'
+    recovery.JOURNAL_PATH.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+    order_guard.mark_accepted('009240','123')
+    assert recovery.recover_pending_order(NOW)
+
+
+@pytest.mark.parametrize('failure_at',['journal','audit_commit','clear'])
+def test_sell_recovery_crash_resumes_without_unblocking_early(waiting_sell,monkeypatch,failure_at):
+    atomic=recovery._atomic_write;clear=order_guard.clear
+    def fail(*a,**k):raise OSError('injected crash')
+    def write(path,data):
+        if (path==recovery.JOURNAL_PATH and failure_at=='journal') or (path.name=='committed.json' and failure_at=='audit_commit'):fail()
+        atomic(path,data)
+    monkeypatch.setattr(recovery,'_atomic_write',write)
+    if failure_at=='clear':monkeypatch.setattr(order_guard,'clear',fail)
+    with pytest.raises(OSError):recovery.recover_pending_order(NOW)
+    assert order_guard.is_blocked('009240')
+    monkeypatch.setattr(recovery,'_atomic_write',atomic);monkeypatch.setattr(order_guard,'clear',clear)
+    assert recovery.recover_pending_order(NOW+timedelta(days=1))
+
+
+def test_minute_job_recovers_sell_even_with_no_positions(waiting_sell,monkeypatch):
+    from scripts import check_stop_loss as csl
+    import asyncio
+    class Clock(datetime):
+        @classmethod
+        def now(cls,tz=None):return NOW
+    monkeypatch.setattr(csl,'datetime',Clock)
+    monkeypatch.setattr(csl,'is_krx_trading_day',lambda d:True)
+    asyncio.run(csl.main())
+    assert not order_guard.load_orders()
+
+
+def test_unknown_historical_quantity_cannot_be_assumed_zero(waiting):
+    original=recovery.JOURNAL_PATH.read_text()
+    recovery.JOURNAL_PATH.write_text(json.dumps(dict(event='buy',ticker='009240',day='2026-10-01'))+'\n'+original)
+    assert not recovery.recover_pending_order(NOW)
+    assert order_guard.is_blocked('009240')
+
+
+def test_extended_recovery_requires_explicit_activation(waiting_sell, monkeypatch):
+    monkeypatch.delenv("SIMA_EXTENDED_ORDER_RECOVERY")
+    assert not recovery.recover_pending_order(NOW)
+    assert order_guard.is_blocked('009240')
+
+
+def test_legacy_mode_does_not_release_quote_fallback(waiting, monkeypatch):
+    row=json.loads(recovery.JOURNAL_PATH.read_text());row['entry_price_source']='quote_fallback'
+    recovery.JOURNAL_PATH.write_text(json.dumps(row)+'\n')
+    monkeypatch.delenv("SIMA_EXTENDED_ORDER_RECOVERY")
+    assert not recovery.recover_pending_order(NOW)
     assert order_guard.is_blocked('009240')

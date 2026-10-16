@@ -224,7 +224,7 @@ async def main() -> None:
         len(portfolio.positions),
     )
 
-    await asyncio.to_thread(order_recovery.recover_pending_buy, day)
+    await asyncio.to_thread(order_recovery.recover_pending_order, day)
     await _sync_trade_journal()
 
 

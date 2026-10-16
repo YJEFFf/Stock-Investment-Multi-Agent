@@ -431,6 +431,9 @@ async def execute_sell_order(
             return portfolio, None
 
     # 주문 수량이 다 잡힐 때까지 기다린다 — 시장가는 여러 번에 나뉘어 체결되고,
+    if order_no is not None:
+        order_guard.mark_accepted(action.ticker, order_no)
+
     # 곧바로 조회하면 그 중 일부만 잡힌다(kis.fill_after_order docstring, 2026-08-18).
     fill = await asyncio.to_thread(
         kis.fill_after_order, action.ticker, today, "sell", before, shares_to_sell

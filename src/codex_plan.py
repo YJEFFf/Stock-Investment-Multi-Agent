@@ -7,6 +7,9 @@ OPENAI_API_KEY/CODEX_API_KEY를 제거하고, 저장된 Codex 로그인이 ChatG
 """
 
 import asyncio
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import json
 import logging
 import math
@@ -45,6 +48,8 @@ FULL_DAILY_REFERENCE_PERCENT_POINTS = 2.0
 BUY_CAPACITY_FLOOR_PERCENT = 2.0
 
 _CALL_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
+# 수백 개 수집 작업이 기본 executor를 점유해도 CLI 슬롯을 빈 채로 기다리지 않는다.
+_CALL_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CALLS, thread_name_prefix="sima-codex")
 
 
 class CodexPlanUnavailable(RuntimeError):
@@ -399,7 +404,9 @@ async def _call_structured(
         "model": model,
     }
     try:
-        result, usage = await asyncio.to_thread(_call_sync, system, user, response_model, json_schema, model, timeout_s)
+        context = contextvars.copy_context()
+        call = partial(_call_sync, system, user, response_model, json_schema, model, timeout_s)
+        result, usage = await asyncio.get_running_loop().run_in_executor(_CALL_EXECUTOR, context.run, call)
     except asyncio.CancelledError:
         # asyncio.to_thread의 바깥 대기는 취소돼도 이미 시작한 subprocess 스레드는 끝까지
         # 돌 수 있다. 실제 usage는 회수할 수 없지만 호출/실패 자체를 감시에서 잃지 않는다.

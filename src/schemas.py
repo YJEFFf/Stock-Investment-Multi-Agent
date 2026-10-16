@@ -88,6 +88,7 @@ class UnconfirmedOrder(BaseModel):
     quantity: int = Field(gt=0)
     created_at: datetime
     fills_before: tuple[int, float, float | None] | tuple[int, float] | None = None
+    order_no: str | None = None
     ready_to_commit: bool = False
     expected_position: dict | None = None
 
