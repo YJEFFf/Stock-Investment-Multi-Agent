@@ -291,10 +291,15 @@ def test_reports_a_blackout_that_never_recovered_before_close(monkeypatch, tmp_p
 
     from src import notify
 
-    # 같은 날 안에서만 이어 센다(자정을 넘긴 상태 파일은 무시) — 그래서 고정 날짜가
-    # 아니라 "오늘 장중"으로 만든다. 운영에서도 15:35는 공백과 같은 날이다.
+    # Wall-clock midnight must not turn this same-session scenario into a
+    # previous-day blackout. Freeze both setup and close_blackout's clock.
     monkeypatch.setattr(notify, "BLACKOUT_STATE_DIR", tmp_path / "markers")
-    now = datetime.now(notify.KST)
+    now = datetime(2026, 8, 21, 15, 35, tzinfo=notify.KST)
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+    monkeypatch.setattr(notify, "datetime", FixedDateTime)
     notify.track_blackout(dls.pipeline.BLACKOUT_CONTEXT, True, now=now - timedelta(minutes=28))
     notify.track_blackout(dls.pipeline.BLACKOUT_CONTEXT, True, now=now - timedelta(minutes=6))
 
