@@ -19,6 +19,33 @@ UNIVERSE = [
 ]
 
 
+def test_candidate_concurrency_is_bounded_without_dropping_candidates(tmp_path):
+    from src.schemas import Decision
+    universe = [(f"{i:06}", "sector") for i in range(25)]
+    active = 0
+    peak = 0
+    seen = []
+    async def analyst(ticker, sector, day):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.001)
+        seen.append(ticker)
+        active -= 1
+        return [AnalystOpinion(agent="chart", ticker=ticker, score=0, confidence=1,
+                               evidence=["prompt:test@1"], as_of=day)]
+    async def judge(opinions, total):
+        return Decision(ticker=opinions[0].ticker, action="HOLD", reason="test",
+                        inputs=opinions, degraded=False)
+    _, results = asyncio.run(run_day(
+        universe, datetime(2026, 10, 20, tzinfo=timezone.utc),
+        PortfolioState(), RiskGateConfig(), analyst, judge, execute_simulated,
+        log_path=tmp_path / "bounded.jsonl"))
+    assert peak == 8
+    assert sorted(seen) == [t for t, _ in universe]
+    assert [d.ticker for d, _ in results] == [t for t, _ in universe]
+
+
 def test_run_day_is_deterministic(tmp_path):
     day = datetime(2026, 1, 5, tzinfo=timezone.utc)
     config = RiskGateConfig()

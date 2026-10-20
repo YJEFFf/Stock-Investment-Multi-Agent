@@ -545,8 +545,8 @@ def repair_disposition(state, at, *, enabled):
         return "analysis", "오늘 분석이 이미 시작되어 변경을 보류합니다. 16:10 이후 다시 확인합니다."
     if not enabled or os.environ.get("SIMA_COLLECTOR_AUTOREPAIR") != "1":
         return "disabled", "자동 수리 비활성 상태입니다. 실제 업무의 오류 알림은 유지합니다."
-    if not shadow_ready(state, at):
-        return "shadow", "첫 정상 거래일의 매수 판단·장후 측정 완료 기록을 기다립니다. 완료 다음 날부터 자동 수리합니다."
+    # A failed workflow must not prevent its own repair from starting.
+    # Candidate compatibility, full tests and independent review remain mandatory.
     slot = attempt_window(at)
     # Count any attempts made by the previous premarket-only controller too.
     if attempts_used(state, at) >= MAX_ATTEMPTS:

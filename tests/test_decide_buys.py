@@ -37,6 +37,38 @@ def test_duplicate_completed_analysis_keeps_existing_pending(monkeypatch, tmp_pa
     assert db.run_history.load_runs()[-1].status == "completed"
 
 
+def test_supervisor_closes_killed_run_without_reanalysis(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    record = db.run_history.new_run(db.datetime.now(db.KST), "codex_plan", "test")
+    record.analysis_started = True
+    db.run_history.write(record)
+    db._write_pending_state(record.day, [], skipped="decision_in_progress")
+    alerts = []
+    monkeypatch.setattr(db.notify, "send_telegram_alert", lambda m: alerts.append(m))
+    db.finalize_aborted_run(137)
+    final = db.run_history.load_runs()[-1]
+    assert final.status == "failed" and final.reason == "process_exit_137"
+    assert final.ended_at is not None
+    assert db.run_history.already_analyzed(record.day, tmp_path / "absent")
+    assert json.loads(db.PENDING_BUYS_PATH.read_text())["decisions"] == []
+    before = db.run_history.RUN_LOG_PATH.read_bytes()
+    db.finalize_aborted_run(137)
+    assert db.run_history.RUN_LOG_PATH.read_bytes() == before
+    assert len(alerts) == 1
+
+
+def test_supervisor_does_not_overwrite_completed_pending(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    record = db.run_history.new_run(db.datetime.now(db.KST), "codex_plan", "test")
+    record.ended_at = db.datetime.now(db.KST)
+    record.status = "completed"
+    db.run_history.write(record)
+    db._write_pending_state(record.day, [{"ticker": "005930"}])
+    before = db.PENDING_BUYS_PATH.read_bytes()
+    db.finalize_aborted_run(1)
+    assert db.PENDING_BUYS_PATH.read_bytes() == before
+
+
 def test_collection_failure_is_failed_and_can_retry_data_only(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)

@@ -693,19 +693,22 @@ def _parse_news_hub_api(text: str) -> list[NewsItem]:
 
 
 _corp_code_cache: dict[str, str] | None = None
+_corp_code_lock = threading.Lock()
 
 
 def _parse_corp_code_zip(zip_bytes: bytes) -> dict[str, str]:
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        xml_bytes = zf.read(zf.namelist()[0])
-
-    root = ET.fromstring(xml_bytes)
     mapping: dict[str, str] = {}
-    for item in root.iter("list"):
-        stock_code = (item.findtext("stock_code") or "").strip()
-        corp_code = (item.findtext("corp_code") or "").strip()
-        if stock_code:
-            mapping[stock_code] = corp_code
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        with zf.open(zf.namelist()[0]) as stream:
+            parser = ET.iterparse(stream, events=("start", "end"))
+            _, root = next(parser)
+            for event, item in parser:
+                if event == "end" and item.tag == "list":
+                    stock_code = (item.findtext("stock_code") or "").strip()
+                    corp_code = (item.findtext("corp_code") or "").strip()
+                    if stock_code:
+                        mapping[stock_code] = corp_code
+                    root.clear()
     return mapping
 
 
@@ -719,15 +722,18 @@ def _load_corp_code_map() -> dict[str, str]:
     if _corp_code_cache is not None:
         return _corp_code_cache
 
-    api_key = os.getenv("DART_API_KEY", "")
-    mapping = _fetch_with_retries(
-        DART_CORP_CODE_URL, _parse_corp_code_zip, params={"crtfc_key": api_key}, binary=True
-    )
-    if mapping is None:
-        return {}
-
-    _corp_code_cache = mapping
-    return _corp_code_cache
+    # Initial parallel analyst requests must share one download/XML parse.
+    with _corp_code_lock:
+        if _corp_code_cache is not None:
+            return _corp_code_cache
+        api_key = os.getenv("DART_API_KEY", "")
+        mapping = _fetch_with_retries(
+            DART_CORP_CODE_URL, _parse_corp_code_zip, params={"crtfc_key": api_key}, binary=True
+        )
+        if mapping is None:
+            return {}
+        _corp_code_cache = mapping
+        return _corp_code_cache
 
 
 def _parse_disclosure_list(json_text: str) -> list[DisclosureItem]:

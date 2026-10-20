@@ -556,6 +556,35 @@ def test_parse_corp_code_zip_skips_blank_stock_code():
     assert mapping == {"005930": "00126380"}
 
 
+def test_corp_code_initialization_is_shared_across_threads(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    import time
+    monkeypatch.setattr(collectors, "_corp_code_cache", None)
+    calls = []
+    start = threading.Barrier(8)
+    def fetch(*a, **k):
+        calls.append(1)
+        time.sleep(0.03)
+        return {"005930": "00126380"}
+    monkeypatch.setattr(collectors, "_fetch_with_retries", fetch)
+    def load():
+        start.wait(timeout=2)
+        return collectors._load_corp_code_map()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: load(), range(8)))
+    assert len(calls) == 1
+    assert all(r is results[0] for r in results)
+
+
+def test_corp_code_failed_collection_remains_retryable(monkeypatch):
+    monkeypatch.setattr(collectors, "_corp_code_cache", None)
+    results = iter([None, {"005930": "00126380"}])
+    monkeypatch.setattr(collectors, "_fetch_with_retries", lambda *a, **k: next(results))
+    assert collectors._load_corp_code_map() == {}
+    assert collectors._load_corp_code_map() == {"005930": "00126380"}
+
+
 def test_load_corp_code_map_caches_after_first_call(monkeypatch):
     monkeypatch.setattr(collectors, "_corp_code_cache", None)
     calls = {"n": 0}

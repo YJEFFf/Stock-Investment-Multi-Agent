@@ -321,7 +321,33 @@ async def main() -> None:
         logger.warning("decide_buys_already_running — 기존 pending 보존")
 
 
-if __name__ == "__main__":
+def finalize_aborted_run(exit_code: int) -> None:
+    """Supervisor cleanup after SIGKILL/timeout; never rerun analysis."""
+    with portfolio_lock(run_history.RUN_LOCK_PATH, blocking=False):
+        today = datetime.now(KST)
+        rows = [r for r in run_history.load_runs() if r.day == today.date().isoformat()]
+        if not rows or rows[-1].ended_at is not None:
+            return
+        record = rows[-1]
+        token = run_history.CURRENT.set(record)
+        try:
+            _write_pending_state(record.day, [], skipped="decision_process_failed")
+            record.status = "failed"
+            record.reason = f"process_exit_{exit_code}"
+            record.ended_at = today
+            record.elapsed_seconds = (today - record.started_at).total_seconds()
+            record.deadline_margin_seconds = _seconds_until_deadline(today)
+            run_history.write(record)
+        finally:
+            run_history.CURRENT.reset(token)
+        notify.send_telegram_alert(notify.format_error_alert(
+            "매수 판단 프로세스 비정상 종료 — 오늘 신규 매수 없음",
+            f"exit_code={exit_code}; 성공 여부와 무관하게 분석을 다시 실행하지 않습니다."))
+
+
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--finalize-aborted":
+    finalize_aborted_run(int(sys.argv[2]))
+elif __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception as exc:

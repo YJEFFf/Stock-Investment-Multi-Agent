@@ -940,7 +940,15 @@ async def run_day(
     항상 명시적으로 골라야 한다.
     """
     log_path = log_path or DEFAULT_LOG_PATH
+    # Bound live contexts/collector work, not candidate selection. Every candidate
+    # is still evaluated once and results retain the original universe order.
+    active_candidates = asyncio.Semaphore(8)
+
     async def analyze_and_judge(ticker: str, sector: str) -> Decision | None:
+        async with active_candidates:
+            return await analyze_one(ticker, sector)
+
+    async def analyze_one(ticker: str, sector: str) -> Decision | None:
         # 다른 종목의 느린 수집을 기다리지 않고 이 종목의 판단을 이어간다.
         try:
             opinions = await analyst_fn(ticker, sector, day)

@@ -201,19 +201,26 @@ def test_no_repair_after_analysis_began(monkeypatch):
         repair.require_window()
 
 
-def test_shadow_day_required_and_transient_errors_never_invoke_model(monkeypatch):
+def test_initial_failure_can_repair_without_clean_day_and_transients_never_invoke_model(monkeypatch):
     monkeypatch.setenv("SIMA_COLLECTOR_AUTOREPAIR", "1")
     value = good_report()
     value["sources"]["index"] = {"status": "structure", "error": "410"}
     monkeypatch.setattr(health, "probe", lambda *a, **k: value)
     monkeypatch.setattr(notify, "send_telegram_alert", lambda m: True)
+    attempted = []
+    def fail_repair(*args):
+        attempted.append(True)
+        raise RuntimeError("candidate still must pass validation")
+    monkeypatch.setattr(repair, "repair", fail_repair)
     repair.check(allow_repair=True)
     state = repair.read_state()
     assert state["attempts"] == {}
-    assert state["incidents"]["index"]["phase"] == "shadow"
+    assert attempted == [True]
+    assert state["shadow_days"] == []
     value["sources"]["index"]["status"] = "transient"
     repair.check(allow_repair=True)
     assert repair.read_state()["attempts"] == {}
+    assert attempted == [True]
 
 
 def test_watchdog_does_not_alert_about_intentionally_idle_worker(monkeypatch):
