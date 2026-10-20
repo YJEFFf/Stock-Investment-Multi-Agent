@@ -10,7 +10,7 @@ import json
 import logging
 import math
 import os
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -21,6 +21,7 @@ JOURNAL_PATH = Path("logs/trade_journal.jsonl")
 AUDIT_DIR = Path("logs/order_recoveries")
 # 다음 분에 다시 조회한다. 회차 안에서 재시도하거나 체결을 기다리지 않는다.
 QUERY_POLICY = kis.RetryPolicy(timeout_seconds=2.0, max_attempts=1, backoff_seconds=(0,))
+CLOSE_QUERY_POLICY = kis.RetryPolicy(timeout_seconds=10.0, max_attempts=1, backoff_seconds=(0,))
 KST = ZoneInfo("Asia/Seoul")
 
 
@@ -52,7 +53,8 @@ def _historical_quantity(rows: list[dict], ticker: str) -> int | None:
     return quantity
 
 
-def recover_pending_buy(now: datetime, *, ticker: str | None = None, extended: bool = False) -> bool:
+def recover_pending_buy(now: datetime, *, ticker: str | None = None, extended: bool = False,
+                        policy: kis.RetryPolicy | None = None) -> bool:
     """한 회차 한 종목을 순환 대조한다. 호출자는 포트폴리오 락을 잡지 않아야 한다.
 
     여러 미확인 건이 있어도 한 종목의 지연이 다른 종목의 조회를 굶기지 않게 분 단위로
@@ -60,6 +62,7 @@ def recover_pending_buy(now: datetime, *, ticker: str | None = None, extended: b
     False는 확인 못 함/변화 없음이다. 파일 쓰기 실패는 전파하며 마커를 유지한다.
     """
     now = now.astimezone(KST)
+    policy = policy or QUERY_POLICY
     day = now.date().isoformat()
     try:
         with portfolio_store.portfolio_lock(blocking=False):
@@ -118,13 +121,13 @@ def recover_pending_buy(now: datetime, *, ticker: str | None = None, extended: b
         return False
 
     # 순차 GET 세 건, 각 한 번만. 조회 실패는 다음 크론 회차까지 차단 유지.
-    buy = kis.fetch_daily_fill_totals(ticker, order_day, "buy", policy=QUERY_POLICY, require_fee=True)
+    buy = kis.fetch_daily_fill_totals(ticker, order_day, "buy", policy=policy, require_fee=True)
     if buy is None or buy[0] != order.quantity or not all(math.isfinite(x) for x in buy) or buy[1] <= 0 or buy[2] < 0:
         return False
-    sold = kis.fetch_daily_fill_totals(ticker, order_day, "sell", policy=QUERY_POLICY, require_fee=True)
+    sold = kis.fetch_daily_fill_totals(ticker, order_day, "sell", policy=policy, require_fee=True)
     if sold != (0, 0.0, 0.0):
         return False
-    holdings = kis.fetch_holdings(policy=QUERY_POLICY, require_complete=True)
+    holdings = kis.fetch_holdings(policy=policy, require_complete=True)
     price = buy[1] / buy[0]
     if holdings is None or ticker not in holdings:
         return False
@@ -190,10 +193,29 @@ def recover_pending_order(now: datetime) -> bool:
     return _recover_full_sell(now, ticker)
 
 
-def _recover_full_sell(now: datetime, ticker: str) -> bool:
+def recover_after_close(now: datetime) -> list[str]:
+    """장후 대조 전 한 번씩 조회한다. 장중 2초 예산과 주문 경로는 그대로다."""
+    now = now.astimezone(KST)
+    if now.time() < time(15, 40):
+        raise RuntimeError("extended reconciliation is only allowed after 15:40 KST")
+    if os.getenv("SIMA_EXTENDED_ORDER_RECOVERY", "0") != "1":
+        return []
+    recovered = []
+    for ticker, order in list(order_guard.load_orders().items()):
+        if order.ready_to_commit or order.created_at.astimezone(KST).date() > now.date():
+            continue
+        success = (recover_pending_buy(now, ticker=ticker, extended=True, policy=CLOSE_QUERY_POLICY)
+                   if order.side == "buy" else _recover_full_sell(now, ticker, policy=CLOSE_QUERY_POLICY))
+        if success:
+            recovered.append(ticker)
+    return recovered
+
+
+def _recover_full_sell(now: datetime, ticker: str, *, policy: kis.RetryPolicy | None = None) -> bool:
     """단일 전량 매도의 지연 원장을 확정한다. 부분 매도 고점은 재해석하지 않는다."""
     from src.pipeline import _trade_costs
     from src.schemas import FillRecord
+    policy = policy or QUERY_POLICY
 
     try:
         with portfolio_store.portfolio_lock(blocking=False):
@@ -236,14 +258,14 @@ def _recover_full_sell(now: datetime, ticker: str) -> bool:
     except portfolio_store.PortfolioLockBusy:
         return False
 
-    sold = kis.fetch_daily_fill_totals(ticker, day, "sell", policy=QUERY_POLICY, require_fee=True)
+    sold = kis.fetch_daily_fill_totals(ticker, day, "sell", policy=policy, require_fee=True)
     if (sold is None or sold[0] != order.quantity or not all(math.isfinite(x) for x in sold)
             or sold[1] <= 0 or sold[2] < 0):
         return False
-    bought = kis.fetch_daily_fill_totals(ticker, day, "buy", policy=QUERY_POLICY, require_fee=True)
+    bought = kis.fetch_daily_fill_totals(ticker, day, "buy", policy=policy, require_fee=True)
     if bought != (0, 0.0, 0.0):
         return False
-    holdings = kis.fetch_holdings(policy=QUERY_POLICY, require_complete=True)
+    holdings = kis.fetch_holdings(policy=policy, require_complete=True)
     if holdings is None or ticker in holdings:
         return False
     fill = FillRecord(quantity=sold[0], amount=sold[1], fee=sold[2])

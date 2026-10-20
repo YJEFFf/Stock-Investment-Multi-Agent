@@ -18,11 +18,12 @@
 
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import kis, notify, order_guard, reconcile  # noqa: E402
+from src import kis, notify, order_guard, order_recovery, reconcile  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.pipeline import _kst_today  # noqa: E402
 from src.portfolio_store import load_portfolio, portfolio_lock, save_portfolio  # noqa: E402
@@ -45,6 +46,15 @@ def main() -> int:
     if ALERT and not is_krx_trading_day(_kst_today()):
         logger.info("not_a_trading_day day=%s — skip", _kst_today().isoformat())
         return 0
+
+    if "--recover" in sys.argv:
+        recovered = order_recovery.recover_after_close(datetime.now(order_recovery.KST))
+        if recovered:
+            logger.info("after_close_orders_recovered tickers=%s", recovered)
+            if ALERT:
+                notify.send_telegram_alert(
+                    "✅ [SIMA] 지연 체결 대조·복구 완료\n"
+                    + ", ".join(recovered) + "\n브로커 원장·잔고 확인 후 장부를 교정했습니다. 주문 재전송 없음.")
 
     holdings = kis.fetch_holdings()
     if holdings is None:

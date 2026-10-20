@@ -45,6 +45,7 @@ TRADING_PATHS=(
   src/app_notifications.py
   src/codex_plan.py
   src/order_guard.py src/order_recovery.py
+  scripts/reconcile_portfolio.py scripts/reconcile_check.sh
   src/run_history.py
   src/collector_routes.py src/collector_health.py src/collector_repair.py
   config/collector_routes.json prompts/collector_repair.md prompts/collector_repair_review.md

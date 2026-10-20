@@ -55,6 +55,32 @@ def test_complete_late_fill_persists_before_unblock_and_is_idempotent(waiting, m
     assert waiting==['buy','sell']
 
 
+def test_after_close_uses_longer_reads_but_never_retries_orders(waiting, monkeypatch):
+    fills = kis.fetch_daily_fill_totals
+    policies = []
+    def slow_broker(ticker, day, side, **kwargs):
+        policies.append(kwargs["policy"])
+        if kwargs["policy"].timeout_seconds <= 2:
+            return None
+        return fills(ticker, day, side, **kwargs)
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", slow_broker)
+    assert not recovery.recover_pending_order(NOW)
+    assert recovery.recover_after_close(NOW.replace(hour=15, minute=50)) == ["009240"]
+    assert policies[0].timeout_seconds == 2
+    assert all(p.timeout_seconds == 10 and p.max_attempts == 1 for p in policies[1:])
+    assert not order_guard.load_orders()
+    assert recovery.recover_after_close(NOW.replace(hour=15, minute=51)) == []
+
+
+def test_after_close_recovery_rejects_intraday_and_disabled_mode(waiting, monkeypatch):
+    with pytest.raises(RuntimeError, match="after 15:40"):
+        recovery.recover_after_close(NOW)
+    monkeypatch.delenv("SIMA_EXTENDED_ORDER_RECOVERY")
+    assert recovery.recover_after_close(NOW.replace(hour=15, minute=50)) == []
+    assert waiting == []
+    assert order_guard.load_orders()
+
+
 @pytest.mark.parametrize('problem',['partial','overfill','timeout','sold','quantity','average','nan','old_day','addon','lost_response','missing_journal','changed_marker','changed_journal','changed_position'])
 def test_ambiguous_evidence_never_unblocks(waiting,monkeypatch,problem):
     before=store.load_portfolio()
