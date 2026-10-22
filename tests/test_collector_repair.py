@@ -771,3 +771,44 @@ def test_failed_recovery_notice_retries_delivery_without_reprobing_healthy_sourc
     repair.process_pending()
     assert len(sent) == 1 and '복구' in sent[0]
     assert repair.read_workflow()['requests'] == {}
+
+
+@pytest.mark.parametrize('hour,minute,recorded', [(6, 59, False), (7, 0, True), (7, 45, True), (8, 55, True), (9, 0, False)])
+def test_passive_completion_observes_earlier_analysis(monkeypatch, hour, minute, recorded):
+    monkeypatch.setenv('SIMA_COLLECTOR_AUTOREPAIR', '1')
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=hour, minute=minute))
+    repair.workflow_finished('premarket', healthy=True)
+    assert ('premarket' in repair.read_workflow()['days'][AT.date().isoformat()]) is recorded
+
+
+def test_pending_incident_runs_repair_chain_and_requires_original_request_success(monkeypatch, transaction_fixture):
+    state, current, failed, refs, actions = transaction_fixture
+    monkeypatch.setenv('SIMA_COLLECTOR_AUTOREPAIR', '1')
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=16, minute=10))
+    repair.atomic_json(repair.STATE_DIR / 'state.json', state)
+    healthy_probe = health.probe
+    probes = []
+    def probe(*args, **kwargs):
+        probes.append(1)
+        return copy.deepcopy(failed) if len(probes) == 1 else healthy_probe(*args, **kwargs)
+    monkeypatch.setattr(health, 'probe', probe)
+    repair.request_repair('stock_news', 'HTTP 410', slots={'ticker': '005930'})
+    repair.process_pending()
+    assert len(probes) == 3  # initial incident, candidate, deployed candidate
+    assert refs == {'remote': 'candidate', 'local': 'candidate'}
+    assert repair.read_workflow()['incidents']['stock_news']['open'] is True
+    assert repair.read_workflow()['requests']['stock_news']['diagnosed_generation']
+    repair.process_pending()
+    assert len(probes) == 3  # no repeated analysis or probe of diagnosed generation
+    repair.source_succeeded('stock_news', slots={'ticker': '005930'})
+    assert repair.read_workflow()['requests'] == {}
+    assert repair.read_workflow()['incidents']['stock_news']['open'] is False
+
+
+def test_upstream_mismatch_prevents_automatic_repair_publish(monkeypatch, transaction_fixture):
+    state, current, failed, refs, actions = transaction_fixture
+    refs['remote'] = 'documentation_commit'
+    monkeypatch.setattr(repair, 'model_call', lambda *a, **k: pytest.fail('model must not run on stale code'))
+    with pytest.raises(RuntimeError, match='upstream moved'):
+        repair.repair(state, current, failed)
+    assert not any(a[0] == 'push' for a in actions)

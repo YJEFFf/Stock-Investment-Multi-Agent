@@ -217,7 +217,7 @@ def workflow_finished(stage, *, healthy):
         at = now()
         state = read_workflow()
         day = state["days"].setdefault(at.date().isoformat(), {})
-        in_stage = ((stage == "premarket" and time(8) <= at.time() < time(9))
+        in_stage = ((stage == "premarket" and time(7) <= at.time() < time(9))
                     or (stage == "afterclose" and at.time() >= time(16)))
         if not healthy:
             day["failed"] = True
@@ -558,7 +558,7 @@ def repair_disposition(state, at, *, enabled):
 
 
 def scheduled_full(at):
-    return is_krx_trading_day(at.date()) and (at.hour, at.minute) in {(7, 30), (16, 10), (16, 20)}
+    return is_krx_trading_day(at.date()) and (at.hour, at.minute) in {(5, 55), (16, 10), (16, 20)}
 
 
 def check(*, allow_repair=False, full=False, monitoring=False):
