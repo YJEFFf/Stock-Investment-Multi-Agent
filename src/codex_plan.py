@@ -10,11 +10,13 @@ import asyncio
 import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from dataclasses import dataclass
 import json
 import logging
 import math
 import os
 import queue
+import re
 import subprocess
 import tempfile
 import threading
@@ -33,7 +35,8 @@ DEFAULT_TIMEOUT_S = 120.0
 DEFAULT_CALL_LOG_PATH = Path("logs/codex_plan_calls.jsonl")
 DEFAULT_JUDGMENT_CALL_LOG_PATH = Path("logs/llm_calls.jsonl")
 DEFAULT_CAPACITY_STATE_PATH = Path("logs/codex_plan_capacity.json")
-MAX_CONCURRENT_CALLS = 8
+# 2026-10-22 EC2 실측: 8동시/2초 간격은 각각 6/8건429, 2동시는12/12성공.
+MAX_CONCURRENT_CALLS = 2
 CODEX_OS_USER = "sima-codex"
 CODEX_EXECUTABLE = "/home/sima-codex/.local/bin/codex"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -54,6 +57,50 @@ _CALL_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CALLS, thread_nam
 
 class CodexPlanUnavailable(RuntimeError):
     """ChatGPT 로그인·CLI·플랜 호출 중 하나를 사용할 수 없을 때."""
+
+
+class CodexProviderRejected(CodexPlanUnavailable):
+    def __init__(self, message: str, code: str, *, attempted: bool = True):
+        super().__init__(message)
+        self.code = code
+        self.attempted = attempted
+
+
+@dataclass
+class CallSession:
+    """한 분석 회차의 공급자 거부를 공유한다. 성공한 판단은 재시도하지 않는다."""
+    rejected: CodexProviderRejected | None = None
+    skipped: int = 0
+
+
+CALL_SESSION: contextvars.ContextVar[CallSession | None] = contextvars.ContextVar("codex_call_session", default=None)
+
+
+def _execution_error(result) -> CodexPlanUnavailable:
+    # stderr의 부수적인 shell 경고가 stdout의 실제 turn.failed를 가리지 않게 한다.
+    messages = []
+    for line in result.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "turn.failed":
+            error = event.get("error")
+            messages.append(str(error.get("message", error) if isinstance(error, dict) else error))
+        elif event.get("type") == "error":
+            messages.append(str(event.get("message", "")))
+    detail = "\n".join(dict.fromkeys(messages))[-2000:]
+    diagnostic = result.stderr[-1000:].strip()
+    combined = f"{detail}\n{diagnostic}".strip() or result.stdout[-1000:].strip() or "No error details"
+    message = f"Codex execution failed ({result.returncode}): {combined}"
+    # 최종 turn error를 우선한다. WebSocket 403 뒤 HTTP 429가 최종 오류일 수 있다.
+    for evidence in (detail, diagnostic):
+        for status, code in ((429, "rate_limited"), (401, "authentication_failed"), (403, "access_denied")):
+            if re.search(rf"\b{status}\b", evidence):
+                return CodexProviderRejected(message, code)
+    return CodexPlanUnavailable(message)
 
 
 class HealthResponse(BaseModel):
@@ -361,6 +408,8 @@ def _call_sync(
             "--json",
             "--ephemeral",
             "--ignore-user-config",
+            "--disable",
+            "shell_snapshot",
             "--skip-git-repo-check",
             "--sandbox",
             "read-only",
@@ -379,8 +428,7 @@ def _call_sync(
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
             raise CodexPlanUnavailable(f"Codex execution unavailable: {exc}") from exc
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout)[-1000:].strip()
-            raise CodexPlanUnavailable(f"Codex execution failed ({result.returncode}): {detail}")
+            raise _execution_error(result)
         try:
             parsed = json.loads(output_path.read_text())
             validated = response_model.model_validate(parsed)
@@ -466,19 +514,24 @@ async def call_structured(
     else:
         await asyncio.wait_for(_CALL_SEMAPHORE.acquire(), timeout=timeout_s)
     try:
+        session = CALL_SESSION.get()
+        if session is not None and session.rejected is not None:
+            session.skipped += 1
+            raise CodexProviderRejected("Codex calls stopped for this run: " + session.rejected.code,
+                                        session.rejected.code, attempted=False)
         remaining = None if timeout_s is None else timeout_s - (time.monotonic() - started)
         if remaining is not None and remaining <= 0:
             raise CodexPlanUnavailable("Codex call deadline exceeded while queued")
-        return await _call_structured(
-            system=system,
-            user=user,
-            response_model=response_model,
-            json_schema=json_schema,
-            label=label,
-            model=model,
-            log_path=log_path or DEFAULT_JUDGMENT_CALL_LOG_PATH,
-            timeout_s=remaining,
-        )
+        try:
+            return await _call_structured(
+                system=system, user=user, response_model=response_model, json_schema=json_schema,
+                label=label, model=model,
+                log_path=log_path or DEFAULT_JUDGMENT_CALL_LOG_PATH, timeout_s=remaining,
+            )
+        except CodexProviderRejected as exc:
+            if session is not None and session.rejected is None:
+                session.rejected = exc
+            raise
     finally:
         _CALL_SEMAPHORE.release()
 

@@ -348,3 +348,84 @@ def test_collection_executor_saturation_does_not_block_codex(monkeypatch, tmp_pa
             released.set()
             await busy
     asyncio.run(scenario())
+
+
+def test_execution_error_preserves_turn_failure_over_shell_warning():
+    result = _Completed(returncode=1, stderr='shell_snapshot: file missing', stdout=json.dumps({
+        'type': 'turn.failed', 'error': {'message': '429 Too Many Requests'},
+    }))
+    error = codex_plan._execution_error(result)
+    assert isinstance(error, codex_plan.CodexProviderRejected)
+    assert error.code == 'rate_limited'
+    assert '429' in str(error) and 'shell_snapshot' in str(error)
+
+
+@pytest.mark.parametrize('status,code', [(401, 'authentication_failed'), (403, 'access_denied'), (429, 'rate_limited')])
+def test_execution_error_classifies_stderr(status, code):
+    error = codex_plan._execution_error(_Completed(returncode=1, stderr=f'HTTP {status}'))
+    assert error.code == code
+
+
+def test_provider_rejection_stops_queued_calls_but_next_session_is_fresh(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(codex_plan, '_CALL_SEMAPHORE', asyncio.Semaphore(1))
+        actual = []
+        async def fail(**kwargs):
+            actual.append(1)
+            raise codex_plan.CodexProviderRejected('429', 'rate_limited')
+        monkeypatch.setattr(codex_plan, '_call_structured', fail)
+        session = codex_plan.CallSession()
+        token = codex_plan.CALL_SESSION.set(session)
+        kwargs = dict(system='', user='', response_model=codex_plan.HealthResponse, json_schema={})
+        try:
+            results = await asyncio.gather(*(codex_plan.call_structured(**kwargs) for _ in range(12)), return_exceptions=True)
+            assert len(actual) == 1
+            assert session.skipped == 11
+            assert all(isinstance(r, codex_plan.CodexProviderRejected) for r in results)
+            assert sum(r.attempted for r in results) == 1
+        finally:
+            codex_plan.CALL_SESSION.reset(token)
+        with pytest.raises(codex_plan.CodexProviderRejected):
+            await codex_plan.call_structured(**kwargs)
+        assert len(actual) == 2
+    asyncio.run(scenario())
+
+
+def test_shared_limit_bounds_running_calls(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(codex_plan, '_CALL_SEMAPHORE', asyncio.Semaphore(codex_plan.MAX_CONCURRENT_CALLS))
+        active = peak = 0
+        async def success(**kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(.001)
+            active -= 1
+            return codex_plan.HealthResponse(status='ok')
+        monkeypatch.setattr(codex_plan, '_call_structured', success)
+        await asyncio.gather(*(codex_plan.call_structured(system='', user='', response_model=codex_plan.HealthResponse,
+                            json_schema={}) for _ in range(12)))
+        assert peak == 2
+    asyncio.run(scenario())
+
+
+def test_concurrent_readiness_failure_removes_old_permission(monkeypatch, tmp_path):
+    from scripts import check_codex_plan as script
+    monkeypatch.setattr(script, 'is_krx_trading_day', lambda day: True)
+    state = tmp_path / 'capacity.json'
+    state.write_text('previous permission')
+    monkeypatch.setattr(codex_plan, 'DEFAULT_CAPACITY_STATE_PATH', state)
+    calls = []
+    async def health():
+        calls.append(1)
+        if len(calls) == 1:
+            raise codex_plan.CodexProviderRejected('429', 'rate_limited')
+        return codex_plan.HealthResponse(status='ok')
+    async def forbidden():
+        raise AssertionError('failed health must not save permission')
+    monkeypatch.setattr(codex_plan, 'check_health', health)
+    monkeypatch.setattr(codex_plan, 'read_capacity', forbidden)
+    with pytest.raises(codex_plan.CodexPlanUnavailable, match='Concurrent'):
+        asyncio.run(script.main())
+    assert len(calls) == 2
+    assert not state.exists()

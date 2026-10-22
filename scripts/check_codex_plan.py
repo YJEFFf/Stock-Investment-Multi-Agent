@@ -27,8 +27,15 @@ async def main() -> None:
         return
     # 같은 날 수동 재실행이 뒤에서 실패해도 앞선 "허용" 파일이 남아 08:30에 쓰이지 않게 한다.
     codex_plan.DEFAULT_CAPACITY_STATE_PATH.unlink(missing_ok=True)
-    result = await codex_plan.check_health()
-    logger.info("codex_plan_health_check_ok day=%s status=%s", today.isoformat(), result.status)
+    # 단일 성공만으로 운영 동시 호출을 허용하면 10/21·22의429폭주를 놓친다.
+    results = await asyncio.gather(
+        *(codex_plan.check_health() for _ in range(codex_plan.MAX_CONCURRENT_CALLS)),
+        return_exceptions=True,
+    )
+    failures = [result for result in results if isinstance(result, BaseException)]
+    if failures:
+        raise codex_plan.CodexPlanUnavailable(f"Concurrent Codex readiness failed: {failures[0]}")
+    logger.info("codex_plan_health_check_ok day=%s concurrent=%d", today.isoformat(), len(results))
     capacity = await codex_plan.read_capacity()
     codex_plan.save_capacity_status(capacity)
     if not capacity.buy_judgment_allowed:

@@ -500,3 +500,70 @@ def test_main_reports_backend_usage_block_separately_from_low_capacity(monkeypat
     assert "잔여 50.00%" in alerts[0]
     assert "일반 사용을 허용하지 않음" in alerts[0]
     assert "2% 이하 보호 기준 도달" not in alerts[0]
+
+
+@pytest.mark.parametrize('completed,unavailable,expected_status', [(0, 3, 'failed'), (2, 1, 'degraded'), (3, 0, 'completed')])
+def test_completion_alert_distinguishes_unavailable_from_hold(monkeypatch, tmp_path, completed, unavailable, expected_status):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, 'is_krx_trading_day', lambda day: True)
+    monkeypatch.setattr(db, 'load_portfolio', lambda: PortfolioState(cash_weight=1.0))
+    alerts = []
+    monkeypatch.setattr(db.notify, 'send_telegram_alert', lambda m: alerts.append(m) or True)
+    async def run(*args, **kwargs):
+        db.run_history.claim_analysis()
+        record = db.run_history.CURRENT.get()
+        record.candidates = 3
+        record.decisions = completed
+        record.hold = completed
+        record.unavailable_decisions = unavailable
+        return args[1], []
+    monkeypatch.setattr(db.pipeline, 'run_daily', run)
+    asyncio.run(db.main())
+    assert db.run_history.load_runs()[-1].status == expected_status
+    assert any('매수 판단 완료' in m for m in alerts) == (expected_status == 'completed')
+    if completed == 0:
+        assert json.loads(db.PENDING_BUYS_PATH.read_text())['skipped'] == 'all_decisions_unavailable'
+    before = db.PENDING_BUYS_PATH.read_bytes()
+    asyncio.run(db.main())
+    assert db.PENDING_BUYS_PATH.read_bytes() == before
+
+
+def test_provider_rejection_discards_partial_pending_and_does_not_retry(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, 'is_krx_trading_day', lambda day: True)
+    monkeypatch.setattr(db, 'BUY_LLM_PROVIDER', 'codex_plan')
+    monkeypatch.setattr(db, 'load_portfolio', lambda: PortfolioState(cash_weight=1.0))
+    alerts, calls = [], []
+    monkeypatch.setattr(db.notify, 'send_telegram_alert', lambda m: alerts.append(m) or True)
+    async def reject(**kwargs):
+        calls.append(1)
+        raise db.codex_plan.CodexProviderRejected('429 Too Many Requests', 'rate_limited')
+    monkeypatch.setattr(db.codex_plan, '_call_structured', reject)
+    async def run(*args, **kwargs):
+        db.run_history.claim_analysis()
+        record = db.run_history.CURRENT.get()
+        record.candidates = 2
+        record.decisions = 1
+        record.buy = 1
+        try:
+            await db.llm.call_structured(system='', user='', response_model=db.codex_plan.HealthResponse, json_schema={})
+        except db.codex_plan.CodexProviderRejected:
+            pass
+        try:
+            await db.llm.call_structured(system='', user='', response_model=db.codex_plan.HealthResponse, json_schema={})
+        except db.codex_plan.CodexProviderRejected:
+            pass
+        return args[1], []
+    monkeypatch.setattr(db.pipeline, 'run_daily', run)
+    asyncio.run(db.main())
+    result = db.run_history.load_runs()[-1]
+    assert result.status == 'failed'
+    assert result.provider_attempted == result.provider_failed == 1
+    assert json.loads(db.PENDING_BUYS_PATH.read_text()) == {
+        'day': result.day, 'decisions': [], 'skipped': 'codex_provider_unavailable:rate_limited',
+    }
+    assert len(alerts) == 1 and '중단' in alerts[0]
+    assert 'not_attempted=1' in alerts[0]
+    assert db.codex_plan.CALL_SESSION.get() is None
+    asyncio.run(db.main())
+    assert len(calls) == 1

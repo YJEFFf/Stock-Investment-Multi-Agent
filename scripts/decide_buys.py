@@ -203,6 +203,8 @@ async def _main() -> None:
     recorded: list[dict] = []
     original_call_structured = llm.call_structured
     provider_stats = {"attempted": 0, "failed": 0}
+    call_session = codex_plan.CallSession()
+    session_token = codex_plan.CALL_SESSION.set(call_session)
     if BUY_LLM_PROVIDER == "codex_plan":
         async def _tracked_codex_call(*args, **kwargs):
             provider_stats["attempted"] += 1
@@ -210,6 +212,12 @@ async def _main() -> None:
                 return await codex_plan.call_structured(*args, **kwargs)
             except asyncio.CancelledError:
                 provider_stats["failed"] += 1
+                raise
+            except codex_plan.CodexProviderRejected as exc:
+                if exc.attempted:
+                    provider_stats["failed"] += 1
+                else:
+                    provider_stats["attempted"] -= 1
                 raise
             except Exception:
                 provider_stats["failed"] += 1
@@ -241,6 +249,7 @@ async def _main() -> None:
     finally:
         # main()은 단발 프로세스지만 테스트·수동 import에서도 공급자 변경이 새지 않게 한다.
         llm.call_structured = original_call_structured
+        codex_plan.CALL_SESSION.reset(session_token)
         record = run_history.CURRENT.get()
         if record is not None:
             record.provider_attempted = provider_stats["attempted"]
@@ -256,18 +265,50 @@ async def _main() -> None:
         )
         return
 
-    if provider_stats["failed"]:
+    record = run_history.CURRENT.get()
+    if call_session.rejected is not None:
+        reason = "codex_provider_unavailable:" + call_session.rejected.code
+        _write_pending_state(today_kst.isoformat(), [], skipped=reason)
+        notify.send_telegram_alert(notify.format_error_alert(
+            "매수 판단 중단 — Codex 공급자 거부로 오늘 신규 매수 없음",
+            f"reason={call_session.rejected.code} failed={provider_stats['failed']} "
+            f"attempted={provider_stats['attempted']} not_attempted={call_session.skipped}\n"
+            "부분 승인 결과는 폐기했습니다. 정상 관망이 아니며 오늘 분석을 재실행하지 않습니다.",
+        ))
+        return
+
+    if record is not None and record.candidates > 0 and record.decisions == 0:
+        _write_pending_state(today_kst.isoformat(), [], skipped="all_decisions_unavailable")
+        notify.send_telegram_alert(notify.format_error_alert(
+            "매수 판단 실패 — 모든 후보의 판단 불가",
+            f"후보 {record.candidates}종목 / 완료 판단 0건 / "
+            f"failed={provider_stats['failed']} attempted={provider_stats['attempted']}\n"
+            "정상 관망이 아니며 오늘 신규 매수를 건너뜁니다.",
+        ))
+        return
+
+    incomplete = bool(provider_stats["failed"] or (record is not None and (
+        run_history.input_failed(record) or record.unavailable_decisions
+    )))
+    if incomplete:
         notify.send_telegram_alert(
             notify.format_error_alert(
-                "Codex 매수 판단 일부 실패 — 실패한 분석가는 제외되고 degraded 기준 적용",
-                f"failed={provider_stats['failed']} attempted={provider_stats['attempted']}",
+                "매수 판단 일부 실패 — 불완전한 분석 결과",
+                f"failed={provider_stats['failed']} attempted={provider_stats['attempted']} "
+                f"판단 완료={record.decisions if record else 0} "
+                f"판단 불가={record.unavailable_decisions if record else 0} 승인={len(recorded)}\n"
+                "승인분은 기존 리스크 게이트를 통과한 결과이며 정상 관망으로 집계하지 않습니다.",
             )
         )
 
     _write_pending_state(today_kst.isoformat(), recorded)
+    if incomplete and record is not None:
+        record.status = "degraded"
+        record.reason = "partial_analysis_unavailable"
 
     names = [pipeline.display_name(d["ticker"]) for d in recorded]
-    notify.send_telegram_alert(notify.format_buy_decision_alert(today_kst.isoformat(), names))
+    if not incomplete:
+        notify.send_telegram_alert(notify.format_buy_decision_alert(today_kst.isoformat(), names))
 
     logger.info(
         "decide_buys_done day=%s approved=%d tickers=%s",
