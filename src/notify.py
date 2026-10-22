@@ -161,7 +161,7 @@ def format_blackout_unresolved_alert(minutes: float) -> str:
 
 
 def format_buy_decision_alert(day: str, names: list[str]) -> str:
-    """decide_buys.py(08:30)가 판단만 마쳤을 때 보내는 요약 — 0건이어도 보낸다.
+    """decide_buys.py(07:00)가 판단만 마쳤을 때 보내는 요약 — 0건이어도 보낸다.
     실제 매수 체결 알림(format_buy_alert)과 달리 "판단 단계가 살아서 끝까지
     돌았다"는 것 자체가 목적이라, 승인 0건도 조용히 넘기지 않는다(사용자 요청,
     2026-08-11 — 침묵이 "신호 없음"인지 "cron이 안 돎"인지 구분이 안 되는 문제)."""
@@ -212,7 +212,7 @@ def format_buy_decision_skipped_alert(day: str) -> str:
 
 def format_codex_capacity_alert(capacity: dict) -> str:
     if capacity["buy_judgment_allowed"]:
-        action = "08:30 매수 판단 진행"
+        action = "07:00 매수 판단 진행"
     elif not capacity["ordinary_usage_allowed"]:
         action = "백엔드 일반 사용 불허 — 오늘 신규 매수 판단 중지"
     else:
@@ -259,7 +259,7 @@ def format_reconcile_drift_alert(day: str, drifts: list) -> str:
     매수·매도 판단 알림(format_*_decision_alert)과 달리 "이상 없음"은 안 보낸다 —
     저쪽은 크론이 돌았는지 자체가 궁금해서 0건도 보내지만, 이 대조는 이상 없는 날이
     정상이자 대다수라 매일 보내면 알림이 배경 소음이 되고 진짜 드리프트가 묻힌다.
-    크론이 살아있는지는 08:30·15:35 알림이 이미 답한다.
+    크론이 살아있는지는 07:00·15:35 알림이 이미 답한다.
 
     교정은 하지 않는다(드라이런). 진입가는 손절·익절 판정의 유일한 기준점이라
     상태 파일을 코드가 조용히 고치면 그 판정이 어느 값 기준이었는지 되짚기 어렵다 —

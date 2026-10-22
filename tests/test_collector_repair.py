@@ -11,7 +11,7 @@ from src import collector_routes as routes, collector_health as health, collecto
 
 REAL_NAVER_QUOTES = health.collectors.fetch_naver_quotes
 
-AT = datetime(2026, 10, 19, 8, 0, tzinfo=health.KST)
+AT = datetime(2026, 10, 19, 6, 20, tzinfo=health.KST)
 
 
 @pytest.fixture(autouse=True)
@@ -190,7 +190,7 @@ def test_optional_news_failure_is_visible_without_mandatory_block(monkeypatch):
     assert repair.preanalysis_problem(AT) is None
 
 
-@pytest.mark.parametrize("hour,minute,allowed", [(0, 0, True), (7, 29, True), (8, 14, True), (8, 15, False), (9, 0, False), (15, 30, False), (16, 9, False), (16, 10, True), (23, 59, True)])
+@pytest.mark.parametrize("hour,minute,allowed", [(0, 0, True), (6, 39, True), (6, 40, False), (6, 55, False), (7, 0, False), (8, 14, False), (9, 0, False), (15, 30, False), (16, 9, False), (16, 10, True), (23, 59, True)])
 def test_repair_deadline(hour, minute, allowed):
     assert repair.repair_window(AT.replace(hour=hour, minute=minute)) is allowed
 
@@ -224,7 +224,7 @@ def test_initial_failure_can_repair_without_clean_day_and_transients_never_invok
 
 
 def test_watchdog_does_not_alert_about_intentionally_idle_worker(monkeypatch):
-    monkeypatch.setattr(repair, "now", lambda: AT.replace(hour=8, minute=23))
+    monkeypatch.setattr(repair, "now", lambda: AT.replace(hour=6, minute=48))
     sent = []
     monkeypatch.setattr(notify, "send_telegram_alert", lambda m: sent.append(m) or True)
     state = repair.read_state()
@@ -390,12 +390,12 @@ def test_shadow_requires_same_revision_premarket_and_close(monkeypatch):
     assert repair.read_state()['shadow_days'] == ['2026-10-19']
 
 
-def test_0815_completion_does_not_trigger_0822_watchdog(monkeypatch):
-    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=8, minute=23))
+def test_recent_completion_does_not_trigger_watchdog(monkeypatch):
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=6, minute=48))
     sent = []
     monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: sent.append(m) or True)
     state = repair.read_state()
-    state['completed_at'] = AT.replace(hour=8, minute=15, second=30).isoformat()
+    state['completed_at'] = AT.replace(hour=6, minute=40, second=30).isoformat()
     repair.atomic_json(repair.STATE_DIR / 'state.json', state)
     repair.watchdog()
     assert sent == []
@@ -492,11 +492,11 @@ def test_afterclose_and_weekend_commit_deploy_despite_morning_history(monkeypatc
 
 
 def test_rollback_reserve_closes_before_frozen_deployment_window(monkeypatch):
-    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=8, minute=22))
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=6, minute=47))
     with pytest.raises(RuntimeError):
         repair.require_publish_window()
     repair.require_publish_window(rollback=True)
-    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=8, minute=23))
+    monkeypatch.setattr(repair, 'now', lambda: AT.replace(hour=6, minute=48))
     with pytest.raises(RuntimeError):
         repair.require_publish_window(rollback=True)
 

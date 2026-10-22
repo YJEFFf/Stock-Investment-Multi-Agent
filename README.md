@@ -62,7 +62,7 @@ src/
   notion_sync.py         # 매매일지·일일 리포트 노션 동기화
   evaluation.py          # IC(information coefficient) 측정
 scripts/
-  decide_buys.py         # 08:30 — 신규 매수 판단만 (집행 안 함)
+  decide_buys.py         # 07:00 — 신규 매수 판단만 (집행 안 함)
   execute_open.py        # 09:01 — 보류 중인 매도·매수 집행 (현재 신규 매수 없음)
   check_stop_loss.py     # 09:00–15:30 매분 — 결정론적 손절/익절만 (LLM 없음)
   decide_llm_sell.py     # 15:35 — 장 마감 집계·노션 동기화 (LLM 재량 매도 정지)
@@ -82,9 +82,9 @@ docs/PLAN.md            # 설계 배경과 근거
 
 | 시각 | 스크립트 | 하는 일 |
 |---|---|---|
-| 08:05 | `check_codex_plan.sh` | API 키 없이 저장된 ChatGPT 로그인으로 GPT-5.6 Sol 구조화 출력 연결 상태만 확인. 주식 판단·주문 없음 |
-| 08:30 | `decide_buys.sh` | 기존 Anthropic API 스위치가 꺼져 있어 판단을 건너뛰고 빈 `pending_buys.json`만 기록. 신규 매수 없음 |
-| 09:01 | `execute_open.sh` | 보류 중인 매도를 먼저 처리하고 매수 파일을 확인한 뒤 노션 매매일지를 동기화. 현재 매수 파일은 비어 있음 |
+| 06:55 | `check_codex_plan.sh` | API 키 없이 저장된 ChatGPT 로그인으로 GPT-5.6 Sol 구조화 출력 연결 상태만 확인. 주식 판단·주문 없음 |
+| 07:00 | `decide_buys.sh` | Codex Sol로 전체 후보를 독립 분석. 승인분을 `pending_buys.json`에 기록하며 08:55 마감 |
+| 09:01 | `execute_open.sh` | 보류 중인 매도를 먼저 처리하고 매수 파일을 확인한 뒤 노션 매매일지를 동기화. 승인된 매수는 집행 직전 게이트를 다시 확인 |
 | 09:00–15:30 (매분) | `check_stop_loss.sh` | 보유 종목별 진입 시점 `ExitPlan`으로 결정론적 손절·트레일링 익절 체크·집행. LLM 없음 |
 | 15:35 | `decide_llm_sell.sh` | 시세 공백·감시 지표를 집계하고 노션 매매일지와 일일 리포트를 동기화. LLM 재량 매도는 정지 상태 |
 
@@ -174,7 +174,7 @@ sudo -u sima-web /opt/sima-pwa/current/.venv/bin/python /opt/sima-pwa/current/sc
 - 주문 집행: 매수·매도 둘 다 KIS 모의투자 시장가 주문으로 실제 연결 완료.
   계좌·잔고·현재가 조회, 주문 접수·거부 응답까지 라이브 검증 완료
 - **AWS EC2 배포 + cron 자동 실행: 완료, 실서비스 중** (모의투자, 실거래
-  연결 없음 — 규칙 7). 하루 운영이 4단계(08:30 매수 판단 / 09:01 보류 주문 처리 /
+  연결 없음 — 규칙 7). 하루 운영이 4단계(07:00 매수 판단 / 09:01 보류 주문 처리 /
   09:00–15:30 매분 손절 체크 / 15:35 장 마감·노션 동기화)로 나뉘어 자동 실행된다
   — 자세한 스케줄은 위 "실행 스케줄" 참고
 - 휴장일 자동 판정(`market_calendar.is_krx_trading_day`), cron 실패·개별 단계

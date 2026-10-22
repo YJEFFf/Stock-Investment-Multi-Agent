@@ -10,7 +10,7 @@ from src import kis
 REPO_ROOT = Path(__file__).resolve().parent
 OPERATIONAL_LOGS = REPO_ROOT / "logs"
 PRODUCTION_REPO = Path("/home/ubuntu/sima")
-CRON_WINDOW = (time(8, 25), time(16, 10))  # deploy/pull.sh와 같은 창. 16:00 IC 측정까지 포함
+CRON_WINDOW = (time(6, 50), time(16, 10))  # deploy/pull.sh와 같은 창. 16:00 IC 측정까지 포함
 
 
 def pytest_sessionstart(session):

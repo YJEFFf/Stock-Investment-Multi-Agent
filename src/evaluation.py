@@ -8,7 +8,7 @@
 보고서 안에 진입 시점 관례가 세 가지(전일 종가·당일 시가·당일 종가) 섞였고 그것만으로
 결과가 1.2%p 움직였다.
 
-- 판단은 08:30에 전일 데이터로 내려지고 집행은 09:01이다. 그래서 진입은 **판단일 D의
+- 판단은 07:00에 전일 데이터로 내려지고 집행은 09:01이다. 그래서 진입은 **판단일 D의
   시가**, 청산은 **D+k 거래일의 종가**다. 종목과 벤치마크(코스피200) 둘 다 같은 창으로
   재고 그 차(초과수익)를 쓴다.
 - (day, ticker)가 중복이면 **마지막 것만** 쓴다. 2026-08-12는 UTC 날짜 버그로 유니버스가
@@ -181,7 +181,7 @@ def forward_excess_return(
 def trailing_return(stock: dict[date, OHLCVBar], day: date, lookback: int = MOMENTUM_LOOKBACK) -> float | None:
     """판단일 D **직전** 거래일 종가 대비, 그보다 lookback 거래일 전 종가의 수익률.
 
-    판단이 08:30에 전일 데이터로 내려지므로 D 당일은 포함하지 않는다."""
+    판단이 07:00에 전일 데이터로 내려지므로 D 당일은 포함하지 않는다."""
     dates = _trading_dates(stock)
     start = next((i for i, d in enumerate(dates) if d >= day), None)
     if start is None or start - 1 - lookback < 0:

@@ -40,7 +40,7 @@ KST = ZoneInfo("Asia/Seoul")
 #
 # 코드 상수로 둔 이유: .env나 서버 파일로 두면 git에 흔적이 안 남는다(2026-08-19 크론
 # 직접 수정이 하루 만에 출처 불명이 된 사고). **다시 켤 때는 이 값을 True로 바꾸는 커밋과
-# docs/CHANGELOG.md 항목을 같이 남기고, deploy/pull.sh로 08:25 전에 배포한다.**
+# docs/CHANGELOG.md 항목을 같이 남기고, deploy/pull.sh로 06:50 전에 배포한다.**
 CLAUDE_API_ENABLED = False
 
 
@@ -63,7 +63,7 @@ def _append_call_log(log_path: Path, entry: dict) -> None:
 def _call_log_entry(label: str, model: str, **fields) -> dict:
     """호출 로그 한 줄. timestamp(UTC)와 day(KST)를 **둘 다** 남긴다.
 
-    timestamp만으로는 일별 집계가 하루씩 밀린다: 매수 판단 cron은 08:30 KST인데
+    timestamp만으로는 일별 집계가 하루씩 밀린다: 매수 판단 cron은 07:00 KST인데
     그건 UTC로 전날 23:30이라, 하루 호출의 대부분(분석가·토론·매니저 수백 건)이
     전날 몫으로 잡히고 그날엔 15:35 KST 매도 판단분만 남는다. 2026-08-20이
     실제로 그랬다 — 파일상 35건, 실제로는 그 10배 이상. AGENTS.md 감시 지표의

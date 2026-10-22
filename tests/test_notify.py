@@ -299,4 +299,4 @@ def test_codex_capacity_alert_preserves_exact_two_percent_boundary():
     )
 
     assert "잔여 2.01%" in message
-    assert "08:30 매수 판단 진행" in message
+    assert "07:00 매수 판단 진행" in message

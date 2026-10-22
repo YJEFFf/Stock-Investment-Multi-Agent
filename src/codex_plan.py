@@ -317,7 +317,7 @@ def _read_capacity_sync() -> CapacityStatus:
 
 
 def save_capacity_status(status: CapacityStatus, path: Path | None = None) -> None:
-    """08:30 판단이 부분 파일을 읽지 않도록 원자적으로 교체한다."""
+    """07:00 판단이 부분 파일을 읽지 않도록 원자적으로 교체한다."""
     path = path or DEFAULT_CAPACITY_STATE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(path.suffix + ".tmp")
@@ -326,7 +326,7 @@ def save_capacity_status(status: CapacityStatus, path: Path | None = None) -> No
 
 
 def load_capacity_status(day: str, path: Path | None = None) -> CapacityStatus:
-    """당일 08:05 상태만 허용한다. 없거나 낡거나 손상되면 매수 판단을 실패 폐쇄한다."""
+    """당일 06:55 상태만 허용한다. 없거나 낡거나 손상되면 매수 판단을 실패 폐쇄한다."""
     path = path or DEFAULT_CAPACITY_STATE_PATH
     try:
         status = CapacityStatus.model_validate_json(path.read_text())

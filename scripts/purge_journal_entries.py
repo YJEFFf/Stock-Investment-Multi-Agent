@@ -36,7 +36,7 @@ SYNC_STATE_PATH = Path("logs/notion_sync_state.json")
 
 # 크론이 이 파일들에 쓸 수 있는 구간. 15:50 reconcile은 읽기 전용이지만 그 뒤로
 # 물러선다(deploy/crontab의 15:50 주석과 같은 여유).
-CRON_WRITE_WINDOW = (time(8, 25), time(15, 55))
+CRON_WRITE_WINDOW = (time(6, 50), time(15, 55))
 
 
 def _market_hours_now() -> bool:

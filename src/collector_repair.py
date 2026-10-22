@@ -238,7 +238,7 @@ def shadow_ready(state, at):
 
 def repair_window(at=None):
     at = at or now()
-    return not is_krx_trading_day(at.date()) or at.time() < time(8, 15) or at.time() >= time(16, 10)
+    return not is_krx_trading_day(at.date()) or at.time() < time(6, 40) or at.time() >= time(16, 10)
 
 
 def next_repair_time(at=None):
@@ -272,7 +272,7 @@ def require_window():
 def require_publish_window(*, rollback=False):
     at = now()
     # Reserve ten minutes for deployment, read-only checks and a rollback.
-    cutoff = time(8, 23) if rollback else time(8, 15)
+    cutoff = time(6, 48) if rollback else time(6, 40)
     if is_krx_trading_day(at.date()) and cutoff <= at.time() < time(16, 10):
         raise RuntimeError("deployment time reserve exhausted")
     if current_analysis_blocks(at):
@@ -444,8 +444,8 @@ def repair(state, current, report_data):
     # Ten minutes for proposal/review, separate bounded activation/rollback.
     at = now()
     seconds = 600
-    if is_krx_trading_day(at.date()) and at.time() < time(8, 15):
-        seconds = min(seconds, (at.replace(hour=8, minute=15, second=0, microsecond=0) - at).total_seconds())
+    if is_krx_trading_day(at.date()) and at.time() < time(6, 40):
+        seconds = min(seconds, (at.replace(hour=6, minute=40, second=0, microsecond=0) - at).total_seconds())
     WORK_DEADLINE = clock.monotonic() + seconds
     require_window()
     slot = attempt_window(at)
@@ -614,7 +614,7 @@ def check(*, allow_repair=False, full=False, monitoring=False):
         observation = state.setdefault("shadow_observations", {}).setdefault(at.date().isoformat(), {})
         if not all_ok:
             observation["failed"] = True
-        if all_ok and full and time(7, 30) <= at.time() < time(8, 25):
+        if all_ok and full and time(5, 55) <= at.time() < time(6, 50):
             observation["premarket"] = result["manifest"]
         if (all_ok and full and observation.get("premarket") == result["manifest"] and not observation.get("failed")
                 and is_krx_trading_day(at.date()) and at.time() >= time(16, 10)):

@@ -201,7 +201,7 @@ def main() -> None:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
     now = datetime.now(KST)
-    if is_krx_trading_day(now.date()) and time(8, 25) <= now.time() < time(16, 10):
+    if is_krx_trading_day(now.date()) and time(6, 50) <= now.time() < time(16, 10):
         raise RuntimeError("no operational repair during cron trading window")
     if "openapivts." not in kis.BASE_URL:
         raise RuntimeError("paper broker required")

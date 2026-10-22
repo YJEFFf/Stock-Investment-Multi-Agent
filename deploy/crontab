@@ -7,19 +7,19 @@
 # 2026-08-19 execute_open을 09:00에서 09:01로 옮긴 변경이 정확히 그렇게 유실될 뻔했다
 # (docs/CHANGELOG.md 2026-08-20 항목).
 
-# 08:05 — ChatGPT 플랜 기반 Codex 연결과 7일 잔여 한도 확인. 주식 판단·주문 없음.
+# 06:55 — ChatGPT 플랜 기반 Codex 연결과 7일 잔여 한도 확인. 주식 판단·주문 없음.
 # Claude API와 OpenAI API 키를 모두 쓰지 않고, 저장된 ChatGPT 로그인 + Sol 구조화
 # 출력이 살아 있는지 확인한 뒤 잔여율을 앱 알림으로 보낸다. 잔여 2% 이하거나
-# 한도 상태를 확인할 수 없으면 08:30 신규 매수 판단은 실패 폐쇄한다.
-5 8 * * 1-5      /home/ubuntu/sima/scripts/check_codex_plan.sh
+# 한도 상태를 확인할 수 없으면 07:00 신규 매수 판단은 실패 폐쇄한다.
+55 6 * * 1-5      /home/ubuntu/sima/scripts/check_codex_plan.sh
 
 # 상시/주기 수집 감시 없음. 매수 판단·보유 감시·장후 측정의 실제 실패만 수리 요청으로 저장.
 # 아래는 오류가 있을 때만 조회·수리하는 대기열 처리. 오류 없으면 HTTP/모델/정상 알림 없음.
 # 16:10 장후 수리, 실패 시 16:40 재시도(최대2회). 성공한 분석은 재실행하지 않는다.
 10,40 16 * * 1-5 /home/ubuntu/sima/scripts/collector_preflight.sh --pending
 
-# 08:30 — Codex Sol 매수 판단만. 승인분을 pending에 기록하고 집행은 안 함. 개장 30분 전.
-30 8 * * 1-5    /home/ubuntu/sima/scripts/decide_buys.sh
+# 07:00 — Codex Sol 매수 판단만. 승인분을 pending에 기록하고 집행은 안 함. 08:55까지 전체 판단을 완료한다.
+0 7 * * 1-5    /home/ubuntu/sima/scripts/decide_buys.sh
 
 # 09:01 — 전날 매도 → 오늘 매수 집행 + 노션 매매일지 동기화.
 # 09:00이 아니라 09:01인 이유: 개장 직후 KIS 모의투자 원장이 용량을 떨어뜨린다.

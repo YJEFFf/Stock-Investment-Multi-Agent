@@ -1,4 +1,4 @@
-"""장 시작 전(08:30 KST cron) 신규 매수 판단만 하는 진입점 — 집행은 안 한다.
+"""장 시작 전(07:00 KST cron) 신규 매수 판단만 하는 진입점 — 집행은 안 한다.
 
 전일 데이터 기준으로 유니버스 구성 -> 정량 필터 -> 분석가 -> 토론+매니저 ->
 게이트까지 마치고, 승인된 BUY만 logs/pending_buys.json에 남긴다. 실제 주문은
@@ -75,7 +75,7 @@ def _make_recording_execute_fn(recorded: list[dict]):
     **승인분은 반환 포트폴리오에 반영한다(`pipeline.execute`).** 이게 없으면
     게이트의 누적 판정이 통째로 죽는다 — run_day는
     `portfolio = await execute_fn(...)`로 받은 걸 다음 종목의 `check_gate` 입력으로
-    쓰는데, 여기서 받은 걸 그대로 돌려주면 그날 후보 **전부가 08:30 스냅샷 하나**를
+    쓰는데, 여기서 받은 걸 그대로 돌려주면 그날 후보 **전부가 07:00 스냅샷 하나**를
     상대로 독립 판정된다. 그러면 N건이 각자 한도 안이라는 이유로 다 통과하고,
     합쳐서 넘는 건 아무도 안 본다(2026-09-01 발견, CHANGELOG "발견 1").
 
@@ -118,7 +118,7 @@ async def _main() -> None:
         logger.info("not_a_trading_day day=%s — skip (주말/공휴일, LLM 호출 없음)", today_kst.isoformat())
         return
 
-    # KST로 만든다(UTC 아님) — 08:30 KST cron은 UTC로는 전날 23:30이라, UTC로 찍으면
+    # KST로 만든다(UTC 아님) — 07:00 KST cron은 UTC로는 전날 22:00이라, UTC로 찍으면
     # pipeline.jsonl에 "day"가 전날 날짜로 남는다. notion_sync.sync_daily_report가
     # today_kst로 그날 날짜를 필터링하므로 하루씩 어긋나 매일 "판단 로그가 없다"로
     # 나왔던 버그(2026-08-13 발견).
@@ -148,7 +148,7 @@ async def _main() -> None:
         except codex_plan.CodexPlanUnavailable as exc:
             _write_pending_state(today_kst.isoformat(), [], skipped="codex_capacity_unavailable")
             notify.send_telegram_alert(
-                notify.format_error_alert("08:05 Codex 한도 점검을 확인할 수 없어 오늘 신규 매수 판단 중지", str(exc))
+                notify.format_error_alert("06:55 Codex 한도 점검을 확인할 수 없어 오늘 신규 매수 판단 중지", str(exc))
             )
             return
         if not capacity.ordinary_usage_allowed:

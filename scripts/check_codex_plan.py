@@ -1,4 +1,4 @@
-"""08:05 KST — API 키 없이 ChatGPT 플랜의 Codex 비대화형 호출 상태를 확인한다.
+"""06:55 KST — API 키 없이 ChatGPT 플랜의 Codex 비대화형 호출 상태를 확인한다.
 
 주식 데이터·판단·주문은 전혀 다루지 않는다. 신규 매수는 계속 정지된 상태에서
 EC2의 로그인, 플랜 한도, Sol 구조화 출력이 다음 단계에 쓸 수 있는지만 한 번 확인한다.
@@ -25,7 +25,7 @@ async def main() -> None:
     today = datetime.now(KST).date()
     if not is_krx_trading_day(today):
         return
-    # 같은 날 수동 재실행이 뒤에서 실패해도 앞선 "허용" 파일이 남아 08:30에 쓰이지 않게 한다.
+    # 같은 날 수동 재실행이 뒤에서 실패해도 앞선 "허용" 파일이 남아 07:00에 쓰이지 않게 한다.
     codex_plan.DEFAULT_CAPACITY_STATE_PATH.unlink(missing_ok=True)
     # 단일 성공만으로 운영 동시 호출을 허용하면 10/21·22의429폭주를 놓친다.
     results = await asyncio.gather(
