@@ -1,0 +1,23 @@
+{
+  "AlarmName": "sima-ec2-reboot",
+  "AlarmDescription": "SIMA automatic reboot on confirmed EC2 status failure; no missing-data action",
+  "ActionsEnabled": true,
+  "AlarmActions": [
+    "arn:aws:automate:ap-northeast-2:ec2:reboot"
+  ],
+  "MetricName": "StatusCheckFailed_Instance",
+  "Namespace": "AWS/EC2",
+  "Statistic": "Minimum",
+  "Dimensions": [
+    {
+      "Name": "InstanceId",
+      "Value": "i-046b6d6e98e015bc8"
+    }
+  ],
+  "Period": 60,
+  "EvaluationPeriods": 3,
+  "DatapointsToAlarm": 3,
+  "Threshold": 0,
+  "ComparisonOperator": "GreaterThanThreshold",
+  "TreatMissingData": "missing"
+}

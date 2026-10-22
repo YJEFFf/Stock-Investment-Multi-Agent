@@ -318,7 +318,7 @@ async def _main() -> None:
     )
 
 
-async def main() -> None:
+async def main(*, recovery: bool = False) -> None:
     now = datetime.now(KST)
     if not is_krx_trading_day(now.date()):
         logger.info("not_a_trading_day day=%s — skip", now.date())
@@ -326,6 +326,10 @@ async def main() -> None:
     # 포트폴리오 락과 다른 파일이다. 매분 안전장치는 이 분석 작업을 기다리지 않는다.
     try:
         with portfolio_lock(run_history.RUN_LOCK_PATH, blocking=False):
+            if recovery:
+                rows = [r for r in run_history.load_runs() if r.day == now.date().isoformat()]
+                if now.hour >= 8 or (rows and rows[-1].reason != "codex_capacity_unavailable"):
+                    return
             if run_history.already_analyzed(now.date().isoformat(), pipeline.DEFAULT_LOG_PATH):
                 logger.warning("decide_buys_duplicate_blocked day=%s — 기존 pending 보존", now.date())
                 return

@@ -1,0 +1,10 @@
+[Unit]
+Description=SIMA local recovery schedule
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=60s
+Unit=sima-recovery.service
+
+[Install]
+WantedBy=timers.target

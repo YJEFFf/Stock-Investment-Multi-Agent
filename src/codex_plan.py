@@ -59,6 +59,10 @@ class CodexPlanUnavailable(RuntimeError):
     """ChatGPT 로그인·CLI·플랜 호출 중 하나를 사용할 수 없을 때."""
 
 
+class CodexTransientFailure(CodexPlanUnavailable):
+    """A failed turn with a confirmed temporary provider error, never a completed turn."""
+
+
 class CodexProviderRejected(CodexPlanUnavailable):
     def __init__(self, message: str, code: str, *, attempted: bool = True):
         super().__init__(message)
@@ -79,6 +83,7 @@ CALL_SESSION: contextvars.ContextVar[CallSession | None] = contextvars.ContextVa
 def _execution_error(result) -> CodexPlanUnavailable:
     # stderr의 부수적인 shell 경고가 stdout의 실제 turn.failed를 가리지 않게 한다.
     messages = []
+    completed = False
     for line in result.stdout.splitlines():
         try:
             event = json.loads(line)
@@ -86,6 +91,8 @@ def _execution_error(result) -> CodexPlanUnavailable:
             continue
         if not isinstance(event, dict):
             continue
+        if event.get("type") == "turn.completed":
+            completed = True
         if event.get("type") == "turn.failed":
             error = event.get("error")
             messages.append(str(error.get("message", error) if isinstance(error, dict) else error))
@@ -95,11 +102,15 @@ def _execution_error(result) -> CodexPlanUnavailable:
     diagnostic = result.stderr[-1000:].strip()
     combined = f"{detail}\n{diagnostic}".strip() or result.stdout[-1000:].strip() or "No error details"
     message = f"Codex execution failed ({result.returncode}): {combined}"
+    if completed:
+        return CodexPlanUnavailable(message)
     # 최종 turn error를 우선한다. WebSocket 403 뒤 HTTP 429가 최종 오류일 수 있다.
-    for evidence in (detail, diagnostic):
+    for evidence in ([messages[-1]] if messages else [diagnostic]):
         for status, code in ((429, "rate_limited"), (401, "authentication_failed"), (403, "access_denied")):
             if re.search(rf"\b{status}\b", evidence):
                 return CodexProviderRejected(message, code)
+    if re.search(r"\b(500|502|503|504)\b", messages[-1] if messages else ""):
+        return CodexTransientFailure(message)
     return CodexPlanUnavailable(message)
 
 
@@ -428,6 +439,8 @@ def _call_sync(
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
             raise CodexPlanUnavailable(f"Codex execution unavailable: {exc}") from exc
         if result.returncode != 0:
+            if output_path.exists() and output_path.read_text().strip():
+                raise CodexPlanUnavailable("Codex exited with output but uncertain completion; no retry")
             raise _execution_error(result)
         try:
             parsed = json.loads(output_path.read_text())
@@ -452,9 +465,24 @@ async def _call_structured(
         "model": model,
     }
     try:
-        context = contextvars.copy_context()
-        call = partial(_call_sync, system, user, response_model, json_schema, model, timeout_s)
-        result, usage = await asyncio.get_running_loop().run_in_executor(_CALL_EXECUTOR, context.run, call)
+        deadline = started + (DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s)
+        for attempt in range(3):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CodexPlanUnavailable("Codex recovery deadline exceeded")
+            context = contextvars.copy_context()
+            call = partial(_call_sync, system, user, response_model, json_schema, model, remaining)
+            try:
+                result, usage = await asyncio.get_running_loop().run_in_executor(_CALL_EXECUTOR, context.run, call)
+                break
+            except (CodexProviderRejected, CodexTransientFailure) as exc:
+                retryable = isinstance(exc, CodexTransientFailure) or exc.code == "rate_limited"
+                delay = 15.0 * (2 ** attempt)
+                if not retryable or attempt == 2 or deadline - time.monotonic() <= delay + 5:
+                    raise
+                _append_log(path, {**base, "success": False, "attempt": attempt + 1,
+                                   "recovery_retry": True, "retry_delay_s": delay, "error": repr(exc)})
+                await asyncio.sleep(delay)
     except asyncio.CancelledError:
         # asyncio.to_thread의 바깥 대기는 취소돼도 이미 시작한 subprocess 스레드는 끝까지
         # 돌 수 있다. 실제 usage는 회수할 수 없지만 호출/실패 자체를 감시에서 잃지 않는다.

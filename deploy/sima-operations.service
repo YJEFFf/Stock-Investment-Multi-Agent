@@ -1,0 +1,13 @@
+[Unit]
+Description=SIMA missed premarket and interrupted-run recovery
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/sima
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/sima/.venv/bin/python scripts/recover_operations.py
+TimeoutStartSec=7200
+KillMode=control-group

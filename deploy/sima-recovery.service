@@ -1,0 +1,12 @@
+[Unit]
+Description=SIMA bounded service recovery
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/sima-recover-services.py
+TimeoutStartSec=240
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sima-recovery /var/lib/logrotate /home/ubuntu/sima/logs

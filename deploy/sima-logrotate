@@ -1,0 +1,11 @@
+/home/ubuntu/sima/logs/cron.log {
+    daily
+    maxsize 25M
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su ubuntu ubuntu
+}

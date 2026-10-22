@@ -43,7 +43,9 @@ TRADING_PATHS=(
   src/sell.py src/pipeline.py src/kis.py src/collectors.py src/schemas.py src/portfolio_store.py
   src/notify.py src/judgment.py src/translate.py src/llm.py src/analysts.py
   src/app_notifications.py
-  src/codex_plan.py
+  src/codex_plan.py scripts/recover_operations.py scripts/check_codex_plan.sh scripts/decide_buys.sh
+  deploy/recover_services.py deploy/install_recovery.sh deploy/sima-recovery.service
+  deploy/sima-recovery.timer deploy/sima-operations.service deploy/sima-logrotate deploy/sima-journald.conf
   src/order_guard.py src/order_recovery.py
   scripts/reconcile_portfolio.py scripts/reconcile_check.sh
   src/run_history.py

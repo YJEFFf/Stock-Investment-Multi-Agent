@@ -429,3 +429,44 @@ def test_concurrent_readiness_failure_removes_old_permission(monkeypatch, tmp_pa
         asyncio.run(script.main())
     assert len(calls) == 2
     assert not state.exists()
+
+@pytest.mark.parametrize('error,retries', [
+    (codex_plan.CodexProviderRejected('429','rate_limited'),1),
+    (codex_plan.CodexTransientFailure('503'),1),
+    (codex_plan.CodexProviderRejected('403','access_denied'),0),
+    (codex_plan.CodexPlanUnavailable('timeout: outcome unknown'),0),
+])
+def test_transport_recovery_never_repeats_success(monkeypatch,tmp_path,error,retries):
+    calls=[]
+    sleeps=[]
+    def fake(*args):
+        calls.append(args)
+        if len(calls)==1: raise error
+        return codex_plan.HealthResponse(status='ok'), {}
+    async def sleep(seconds): sleeps.append(seconds)
+    monkeypatch.setattr(codex_plan,'_call_sync',fake)
+    monkeypatch.setattr(codex_plan.asyncio,'sleep',sleep)
+    call=codex_plan.check_health(log_path=tmp_path/'calls.jsonl')
+    if retries:
+        assert asyncio.run(call).status=='ok'
+        assert len(calls)==2 and sleeps==[15]
+    else:
+        with pytest.raises(type(error)): asyncio.run(call)
+        assert len(calls)==1 and not sleeps
+
+
+def test_recovery_respects_remaining_deadline(monkeypatch,tmp_path):
+    def fail(*args): raise codex_plan.CodexProviderRejected('429','rate_limited')
+    async def sleep(seconds): pytest.fail('backoff exceeds remaining budget')
+    monkeypatch.setattr(codex_plan,'_call_sync',fail)
+    monkeypatch.setattr(codex_plan.asyncio,'sleep',sleep)
+    with pytest.raises(codex_plan.CodexProviderRejected):
+        asyncio.run(codex_plan._call_structured(system='',user='',response_model=codex_plan.HealthResponse,
+            json_schema={},label='test',model=codex_plan.DEFAULT_MODEL,log_path=tmp_path/'calls',timeout_s=10))
+
+
+def test_completed_turn_and_final_auth_error_are_not_retryable():
+    result=_Completed(1,stdout='{"type":"turn.completed"}\n{"type":"error","message":"429"}')
+    assert type(codex_plan._execution_error(result)) is codex_plan.CodexPlanUnavailable
+    result=_Completed(1,stdout='{"type":"error","message":"429"}\n{"type":"turn.failed","error":{"message":"403"}}')
+    assert codex_plan._execution_error(result).code=='access_denied'
