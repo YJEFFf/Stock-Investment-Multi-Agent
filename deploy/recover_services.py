@@ -27,6 +27,7 @@ def tick(now, state, run):
         # Persist attempt before mutation, so a supervisor crash cannot erase the budget.
         row['attempts'].append(now)
         row['last_attempt'] = now
+        row.pop('result', None)
         yield state
         run(['systemctl', 'reset-failed', service], capture_output=True, text=True)
         result = run(['systemctl', 'restart', service], capture_output=True, text=True)

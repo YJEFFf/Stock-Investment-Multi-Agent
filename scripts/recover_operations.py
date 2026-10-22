@@ -43,8 +43,8 @@ def main():
         state = json.loads(STATE.read_text()) if STATE.exists() else {}
         if SERVICES.exists():
             for name, row in json.loads(SERVICES.read_text()).items():
-                stamp = row.get('last_attempt')
-                if stamp and state.get(name) != stamp:
+                stamp = [row.get('last_attempt'), row.get('result'), row.get('status')]
+                if stamp[0] and 'result' in row and state.get(name) != stamp:
                     notify.send_telegram_alert(notify.format_error_alert(
                         '서비스 자동 복구 결과', f'{name}: {row.get("status")}; exit={row.get("result", "pending")}'))
                     state[name] = stamp
@@ -75,8 +75,16 @@ def main():
             save(state)
         # Readiness has its own cross-process lock. Analysis rechecks its own lock
         # and durable analysis_started marker after we release it above.
-        result = subprocess.run(['bash', 'scripts/check_codex_plan.sh'], timeout=500)
-        if result.returncode:
+        try:
+            result = subprocess.run(['bash', 'scripts/check_codex_plan.sh'], timeout=500)
+            code = result.returncode
+        except subprocess.TimeoutExpired:
+            code = 124
+        if code:
+            if attempts[day] >= 2:
+                notify.send_telegram_alert(notify.format_error_alert(
+                    '장전 준비 자동 복구 실패 — 확인 필요',
+                    f'{day}: 2회 복구 소진, exit={code}; 신규 매수 판단 차단 유지'))
             return
         capacity = codex_plan.load_capacity_status(day)
         if not capacity.buy_judgment_allowed or datetime.now(codex_plan.KST).time() >= time(8):
