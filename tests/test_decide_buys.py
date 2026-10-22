@@ -545,6 +545,7 @@ def test_provider_rejection_discards_partial_pending_and_does_not_retry(monkeypa
         record.candidates = 2
         record.decisions = 1
         record.buy = 1
+        await args[5](_decision(), GateResult(approved=True, rejected_by=None), args[1], '반도체', 0.08)
         try:
             await db.llm.call_structured(system='', user='', response_model=db.codex_plan.HealthResponse, json_schema={})
         except db.codex_plan.CodexProviderRejected:
