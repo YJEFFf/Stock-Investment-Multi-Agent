@@ -84,3 +84,18 @@ def test_recovery_rechecks_latest_run_inside_analysis_lock(monkeypatch,tmp_path)
     monkeypatch.setattr(db,'_main',forbidden)
     asyncio.run(db.main(recovery=True))
     assert len(run_history.load_runs())==1
+
+
+def test_health_probe_uses_deployed_trusted_host():
+    commands=[]
+    state={}
+    def run(args,**kwargs):
+        commands.append(args)
+        if args[0]=='curl':
+            assert args[args.index('--header')+1]=='Host: sima.example.com'
+            return SimpleNamespace(returncode=0,stdout='{"ok":true}')
+        return SimpleNamespace(returncode=0,stdout='active')
+    for now in [1000,1060,1120]:
+        list(services.tick(now,state,run,'sima.example.com'))
+    assert state['sima-pwa']['health_failures']==0
+    assert not any(c[0]=='systemctl' and c[1]=='restart' for c in commands)

@@ -9,12 +9,12 @@ SERVICES = ('cron', 'sima-balance', 'sima-pwa', 'sima-push', 'caddy')
 STATE = Path('/var/lib/sima-recovery/services.json')
 
 
-def tick(now, state, run):
+def tick(now, state, run, health_host=None):
     for service in SERVICES:
         status = run(['systemctl', 'is-active', service], capture_output=True, text=True).stdout.strip()
         row = state.setdefault(service, {'attempts': []})
-        if service == 'sima-pwa' and status == 'active':
-            probe = run(['curl', '--fail', '--silent', '--max-time', '3', 'http://127.0.0.1:8765/healthz'], capture_output=True, text=True)
+        if service == 'sima-pwa' and status == 'active' and health_host:
+            probe = run(['curl', '--fail', '--silent', '--max-time', '3', '--header', 'Host: ' + health_host, 'http://127.0.0.1:8765/healthz'], capture_output=True, text=True)
             row['health_failures'] = row.get('health_failures', 0) + 1 if probe.returncode else 0
             if row['health_failures'] >= 3:
                 status = 'unresponsive'
@@ -43,7 +43,9 @@ def main():
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
     def run(args, **kwargs):
         return subprocess.run(args, timeout=20, check=False, **kwargs)
-    for snapshot in tick(time.time(), state, run):
+    host_file = Path('/etc/sima-recovery-host')
+    host = host_file.read_text().strip() if host_file.exists() else None
+    for snapshot in tick(time.time(), state, run, host):
         tmp = STATE.with_suffix('.tmp')
         tmp.write_text(json.dumps(snapshot))
         tmp.chmod(0o644)
