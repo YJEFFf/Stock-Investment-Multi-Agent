@@ -99,3 +99,97 @@ def test_health_probe_uses_deployed_trusted_host():
         list(services.tick(now,state,run,'sima.example.com'))
     assert state['sima-pwa']['health_failures']==0
     assert not any(c[0]=='systemctl' and c[1]=='restart' for c in commands)
+
+
+@pytest.mark.parametrize('failed_command', ['is-active', 'reset-failed', 'restart'])
+def test_service_timeout_isolated_and_reported(failed_command):
+    import subprocess
+    commands = []
+    state = {}
+    def run(args, **kwargs):
+        commands.append(args)
+        if args[1] == failed_command and args[-1] == 'cron':
+            raise subprocess.TimeoutExpired(args, 20)
+        return SimpleNamespace(stdout='failed' if args[-1] == 'cron' else 'active', returncode=0)
+    list(services.tick(1000, state, run))
+    assert ['systemctl', 'is-active', 'caddy'] in commands
+    assert state['cron']['result'] == 124
+    assert state['cron']['status'] == 'unknown'
+    if failed_command != 'is-active':
+        assert state['cron']['attempts'] == [1000]
+        commands.clear()
+        list(services.tick(1060, state, run))
+        assert ['systemctl', 'restart', 'cron'] not in commands
+
+
+@pytest.mark.parametrize('raw', ['{broken', '[]', '{"cron":{"attempts":["oops"]}}', '{"cron":{"attempts":[],"health_failures":null}}'])
+def test_corrupt_state_preserves_evidence_and_budget(monkeypatch, tmp_path, raw):
+    monkeypatch.setattr(services, 'STATE', tmp_path / 'services.json')
+    services.STATE.write_text(raw)
+    state = services.load_state(1000)
+    assert list(tmp_path.glob('*.corrupt-*'))[0].read_text() == raw
+    commands = []
+    def run(args, **kwargs):
+        commands.append(args)
+        return SimpleNamespace(stdout='failed', returncode=0)
+    list(services.tick(1000, state, run))
+    assert not any(c[1] == 'restart' for c in commands)
+    services.persist(state)
+    state = services.load_state(2000)
+    list(services.tick(2000, state, run))
+    assert not any(c[1] == 'restart' for c in commands)
+    assert state['_state_error']['result'] == 1
+    list(services.tick(4601, state, run))
+    assert len([c for c in commands if c[1] == 'restart']) == len(services.SERVICES)
+
+
+def test_logrotate_timeout_still_dispatches_operations(monkeypatch, tmp_path):
+    import subprocess
+    monkeypatch.setattr(services, 'STATE', tmp_path / 'services.json')
+    commands = []
+    def run(args, **kwargs):
+        commands.append(args)
+        if args[0] == 'logrotate':
+            raise subprocess.TimeoutExpired(args, 20)
+        return SimpleNamespace(stdout='active', returncode=0)
+    monkeypatch.setattr(services.subprocess, 'run', run)
+    with pytest.raises(subprocess.TimeoutExpired):
+        services.main()
+    assert commands[-1] == ['systemctl', 'start', '--no-block', 'sima-operations.service']
+
+
+def test_corrupt_state_alert_is_delivered_once(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(services, 'STATE', tmp_path / 'services.json')
+    services.STATE.write_text('{broken')
+    services.load_state(1000)
+    monkeypatch.setattr(recovery, 'STATE', tmp_path / 'operations.json')
+    monkeypatch.setattr(recovery, 'SERVICES', services.STATE)
+    monkeypatch.setattr(run_history, 'RUN_LOG_PATH', tmp_path / 'runs')
+    monkeypatch.setattr(run_history, 'RUN_LOCK_PATH', tmp_path / 'run.lock')
+    at = datetime(2026, 10, 23, 18, tzinfo=codex_plan.KST)
+    class Clock:
+        @staticmethod
+        def now(tz): return at
+    monkeypatch.setattr(recovery, 'datetime', Clock)
+    alerts = []
+    monkeypatch.setattr(recovery.notify, 'send_telegram_alert', alerts.append)
+    recovery.main()
+    recovery.main()
+    assert len(alerts) == 1
+    assert 'state_corrupt' in alerts[0]
+
+
+@pytest.mark.parametrize('probe', ['is-active', 'curl'])
+def test_repeated_probe_timeout_has_stable_notification_stamp(probe):
+    import subprocess
+    state = {}
+    def run(args, **kwargs):
+        if (probe == 'is-active' and args[:2] == ['systemctl', probe]) or args[0] == probe:
+            raise subprocess.TimeoutExpired(args, 20)
+        return SimpleNamespace(stdout='active', returncode=0)
+    list(services.tick(1000, state, run, 'example.test'))
+    stamp = dict(state['sima-pwa'])
+    list(services.tick(1060, state, run, 'example.test'))
+    assert state['sima-pwa']['last_attempt'] == stamp['last_attempt']
+    assert state['sima-pwa']['attempts'] == []
