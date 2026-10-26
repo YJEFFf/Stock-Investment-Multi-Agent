@@ -107,6 +107,14 @@ def format_sell_alert(
     return "\n".join(lines)
 
 
+def format_order_recovery_alert(ticker: str, side: str, quantity: int, price: float, at: datetime) -> str:
+    label = "매수" if side == "buy" else "매도"
+    return (f"✅ [SIMA] 체결 확인 복구 완료\n"
+            f"{ticker} · {label} {quantity}주 · 확정 평균가 {price:,.2f}원\n"
+            f"{at.astimezone(KST):%m/%d %H:%M} 원장·잔고 대조 완료, 해당 주문의 차단 해제\n"
+            "주문 재전송 없이 기존 체결을 확인했습니다.")
+
+
 def format_error_alert(context: str, error: str) -> str:
     return f"⚠️ [SIMA] 오류 — {context}\n{_truncate(error, 500)}"
 

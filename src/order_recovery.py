@@ -14,7 +14,7 @@ from datetime import datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from src import kis, order_guard, portfolio_store
+from src import kis, notify, order_guard, portfolio_store
 
 logger = logging.getLogger(__name__)
 JOURNAL_PATH = Path("logs/trade_journal.jsonl")
@@ -33,6 +33,39 @@ def _atomic_write(path: Path, data: bytes) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def _flush_recovery_alerts() -> None:
+    """확정·차단 해제 후에만 알린다. 발송함 실패는 다음 회차에 다시 저장한다."""
+    try:
+        with portfolio_store.portfolio_lock(blocking=False):
+            orders = order_guard.load_orders()
+            for path in sorted(AUDIT_DIR.glob("*/committed.json")):
+                try:
+                    receipt = json.loads(path.read_text())
+                    message = receipt.get("notification")
+                    if not message or receipt.get("notification_queued"):
+                        continue  # 이전 버전의 과거 복구를 소급 발송하지 않는다.
+                    if receipt["ticker"] in orders:
+                        continue
+                    if notify.send_telegram_alert(message):
+                        receipt["notification_queued"] = True
+                        _atomic_write(path, json.dumps(receipt, ensure_ascii=False).encode())
+                    break  # 한 번에 한 건만: 발송함 잠금 대기가 손절 점검을 오래 막지 않는다.
+                except Exception:
+                    logger.exception("order_recovery_notification_failed path=%s", path)
+    except portfolio_store.PortfolioLockBusy:
+        pass
+    except Exception:
+        logger.exception("order_recovery_notifications_failed")
+
+
+def _recovery_receipt(now, order, quantity, price, fee):
+    return {"at": now.isoformat(), "quantity": quantity, "price": price, "fee": fee,
+            "ticker": order.ticker,
+            "notification": notify.format_order_recovery_alert(
+                order.ticker, order.side, quantity, price, now),
+            "notification_queued": False}
 
 
 def _position_values(position):
@@ -61,6 +94,7 @@ def recover_pending_buy(now: datetime, *, ticker: str | None = None, extended: b
     순환한다. 매수 후보를 제한하는 정책과는 무관한 조회 부하 제한이다.
     False는 확인 못 함/변화 없음이다. 파일 쓰기 실패는 전파하며 마커를 유지한다.
     """
+    _flush_recovery_alerts()
     now = now.astimezone(KST)
     policy = policy or QUERY_POLICY
     day = now.date().isoformat()
@@ -168,17 +202,18 @@ def recover_pending_buy(now: datetime, *, ticker: str | None = None, extended: b
             portfolio_store.save_portfolio(portfolio)
             if (portfolio_store.load_portfolio() != portfolio or JOURNAL_PATH.read_bytes() != corrected):
                 raise RuntimeError("recovery persistence verification failed")
-            _atomic_write(audit / "committed.json", json.dumps({"at": now.isoformat(), "quantity": quantity,
-                          "price": price, "fee": buy[2]}, indent=2).encode())
+            _atomic_write(audit / "committed.json", json.dumps(_recovery_receipt(now, order, quantity, price, buy[2]), ensure_ascii=False).encode())
             order_guard.clear(ticker)
             logger.info("buy_fill_recovered ticker=%s quantity=%d price=%.8f fee=%.2f", ticker, quantity, price, buy[2])
-            return True
     except portfolio_store.PortfolioLockBusy:
         return False
+    _flush_recovery_alerts()
+    return True
 
 
 def recover_pending_order(now: datetime) -> bool:
     """미확인 주문을 순환 대조한다. 한 회차 한 종목, 주문 재전송 없음."""
+    _flush_recovery_alerts()
     if os.getenv("SIMA_EXTENDED_ORDER_RECOVERY", "0") != "1":
         return recover_pending_buy(now)
     now = now.astimezone(KST)
@@ -198,6 +233,7 @@ def recover_after_close(now: datetime) -> list[str]:
     now = now.astimezone(KST)
     if now.time() < time(15, 40):
         raise RuntimeError("extended reconciliation is only allowed after 15:40 KST")
+    _flush_recovery_alerts()
     if os.getenv("SIMA_EXTENDED_ORDER_RECOVERY", "0") != "1":
         return []
     recovered = []
@@ -297,10 +333,10 @@ def _recover_full_sell(now: datetime, ticker: str, *, policy: kis.RetryPolicy | 
             _atomic_write(JOURNAL_PATH, corrected)
             if JOURNAL_PATH.read_bytes() != corrected:
                 raise RuntimeError("sell recovery persistence verification failed")
-            _atomic_write(audit / "committed.json", json.dumps({"at": now.isoformat(),
-                          "quantity": fill.quantity, "price": fill.price, "fee": fill.fee}).encode())
+            _atomic_write(audit / "committed.json", json.dumps(_recovery_receipt(now, order, fill.quantity, fill.price, fill.fee), ensure_ascii=False).encode())
             order_guard.clear(ticker)
             logger.info("sell_fill_recovered ticker=%s quantity=%d price=%.8f fee=%.2f", ticker, fill.quantity, fill.price, fill.fee)
-            return True
     except portfolio_store.PortfolioLockBusy:
         return False
+    _flush_recovery_alerts()
+    return True

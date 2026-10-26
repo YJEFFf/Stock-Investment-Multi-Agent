@@ -362,3 +362,61 @@ def test_legacy_mode_does_not_release_quote_fallback(waiting, monkeypatch):
     monkeypatch.delenv("SIMA_EXTENDED_ORDER_RECOVERY")
     assert not recovery.recover_pending_order(NOW)
     assert order_guard.is_blocked('009240')
+
+
+@pytest.mark.parametrize('side', ['buy', 'sell'])
+def test_recovery_alert_only_after_commit_and_release(side, request, monkeypatch):
+    request.getfixturevalue('waiting_sell' if side == 'sell' else 'waiting')
+    messages = []
+    def enqueue(message):
+        assert not order_guard.load_orders()
+        row = json.loads(recovery.JOURNAL_PATH.read_text().splitlines()[-1])
+        assert row['entry_price_source' if side == 'buy' else 'exit_price_source'] == 'fill'
+        messages.append(message)
+        return True
+    monkeypatch.setattr(recovery.notify, 'send_telegram_alert', enqueue)
+    assert recovery.recover_pending_order(NOW)
+    assert not recovery.recover_pending_order(NOW + timedelta(minutes=1))
+    assert len(messages) == 1
+    assert '체결 확인 복구 완료' in messages[0]
+    assert '183주' in messages[0]
+
+
+def test_failed_notification_retries_without_orders_or_broker_reads(waiting_sell, monkeypatch):
+    monkeypatch.setattr(recovery.notify, 'send_telegram_alert', lambda message: False)
+    assert recovery.recover_pending_order(NOW)
+    assert not order_guard.load_orders()
+    def forbidden(*args, **kwargs):
+        raise AssertionError('notification retry must not query broker or resubmit orders')
+    monkeypatch.setattr(kis, 'fetch_daily_fill_totals', forbidden)
+    monkeypatch.setattr(kis, 'fetch_holdings', forbidden)
+    messages = []
+    monkeypatch.setattr(recovery.notify, 'send_telegram_alert', lambda message: messages.append(message) or True)
+    assert not recovery.recover_pending_order(NOW + timedelta(minutes=1))
+    assert not recovery.recover_pending_order(NOW + timedelta(minutes=2))
+    assert len(messages) == 1
+
+
+def test_recovery_alert_waits_for_release_after_crash(waiting_sell, monkeypatch):
+    clear = order_guard.clear
+    def crash(ticker):
+        raise OSError('crash before release')
+    messages = []
+    monkeypatch.setattr(recovery.notify, 'send_telegram_alert', lambda message: messages.append(message) or True)
+    monkeypatch.setattr(order_guard, 'clear', crash)
+    with pytest.raises(OSError):
+        recovery.recover_pending_order(NOW)
+    recovery._flush_recovery_alerts()
+    assert messages == []
+    monkeypatch.setattr(order_guard, 'clear', clear)
+    assert recovery.recover_pending_order(NOW + timedelta(minutes=1))
+    assert len(messages) == 1
+
+
+def test_incomplete_sell_never_announces_recovery(waiting_sell, monkeypatch):
+    messages = []
+    monkeypatch.setattr(recovery.notify, 'send_telegram_alert', lambda message: messages.append(message) or True)
+    monkeypatch.setattr(kis, 'fetch_daily_fill_totals', lambda *a, **kw: (13, 494000., 65.))
+    assert not recovery.recover_pending_order(NOW)
+    assert order_guard.load_orders()
+    assert not messages
