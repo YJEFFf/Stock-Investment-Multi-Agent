@@ -420,3 +420,19 @@ def test_incomplete_sell_never_announces_recovery(waiting_sell, monkeypatch):
     assert not recovery.recover_pending_order(NOW)
     assert order_guard.load_orders()
     assert not messages
+
+
+def test_notification_attempt_limit_survives_receipt_write_failure(waiting_sell, monkeypatch):
+    monkeypatch.setattr(recovery.notify, 'send_telegram_alert', lambda message: False)
+    assert recovery.recover_pending_order(NOW)
+    receipt = next(recovery.AUDIT_DIR.glob('*/committed.json'))
+    other = recovery.AUDIT_DIR / 'another' / 'committed.json'
+    other.parent.mkdir()
+    other.write_bytes(receipt.read_bytes())
+    def fail(*args):
+        raise OSError('receipt disk failure')
+    monkeypatch.setattr(recovery, '_atomic_write', fail)
+    messages = []
+    monkeypatch.setattr(recovery.notify, 'send_telegram_alert', lambda message: messages.append(message) or True)
+    recovery._flush_recovery_alerts()
+    assert len(messages) == 1

@@ -41,6 +41,7 @@ def _flush_recovery_alerts() -> None:
         with portfolio_store.portfolio_lock(blocking=False):
             orders = order_guard.load_orders()
             for path in sorted(AUDIT_DIR.glob("*/committed.json")):
+                attempted = False
                 try:
                     receipt = json.loads(path.read_text())
                     message = receipt.get("notification")
@@ -48,12 +49,14 @@ def _flush_recovery_alerts() -> None:
                         continue  # 이전 버전의 과거 복구를 소급 발송하지 않는다.
                     if receipt["ticker"] in orders:
                         continue
+                    attempted = True
                     if notify.send_telegram_alert(message):
                         receipt["notification_queued"] = True
                         _atomic_write(path, json.dumps(receipt, ensure_ascii=False).encode())
-                    break  # 한 번에 한 건만: 발송함 잠금 대기가 손절 점검을 오래 막지 않는다.
                 except Exception:
                     logger.exception("order_recovery_notification_failed path=%s", path)
+                if attempted:
+                    break  # 영수증 저장 실패 때도 발송함 대기는 한 건만 허용한다.
     except portfolio_store.PortfolioLockBusy:
         pass
     except Exception:
