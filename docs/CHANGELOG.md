@@ -14,6 +14,27 @@
 
 ---
 
+## 2026-11-04 (6차 — 기록 전용 근거 감시 섀도 서버 배포 완료)
+
+- 사용자 승인 뒤 16:45~16:46 KST에 EC2를 24bd3a4에서
+  `606b85786fa593016b46750d71d4162bcaf416a2`로 배포했다.
+  독립 리뷰어는 이 정확한 커밋을 확인해 기록 전용 섀도의 차단 결함이 없음을 보고했다.
+  c58a338 이후 README/CHANGELOG만 다르고, f40ddab 이후 구현·프롬프트·설정은 동일하다.
+- `SIMA_REVIEWED=606b85786fa593016b46750d71d4162bcaf416a2 bash ~/sima/deploy/pull.sh`
+  경로만 사용했다. 서버의 격리 체크아웃 테스트는 992 passed, 5 skipped,
+  3 warnings(18.77초). 성공 후 코드 fast-forward와 deploy/crontab 설치를 확인했다.
+  운영 추적 파일 변경 없음, cron active, 설치된 크론과 저장소 원본 일치를 확인했다.
+- 새 크론은 평일 16:20 보유 감시와 17:05 측정이다. 배포 당일 16:20이 지나서
+  16:46에 기존 wrapper로 review/measure를 각각 한 번 실행해 연결을 확인했다.
+  기존 보유 12종목은 전부 unavailable/no_pre_entry_thesis, 모델 호출 0회,
+  훼손 표본 0건으로 기록됐다. 과거 진입 근거를 만들거나 매수 판단을 재실행하지 않았다.
+- 배포 전후 portfolio_state, trade_journal, pending_sells, unconfirmed_orders,
+  llm_calls, daily_runs 파일의 SHA-256이 같고 pending_buys도 계속 없는 상태였다.
+  LLM_SELL_ENABLED=False 유지. 손절·익절·리스크 한도와 주문 동작은 변경하지 않았다.
+- 다음 거래일 매수 판단부터 승인된 신규 매수의 원래 근거 저장을 시작한다.
+  실제 새 근거의 LLM 추출·훼손 감시·미래 수익률 표본은 아직 관측 전이다.
+  배포 전후 검증 자료: logs/audits/2026-11-04/shadow-deploy-606b857.json(로컬 비커밋 로그).
+
 ## 2026-11-04 (5차 — 기록 전용 섀도 배포 승인·원격 문서 병합)
 
 - 사용자가 “그럼 배포해줘”로 기록 전용 섀도의 서버 반영을 명시 승인했다.
