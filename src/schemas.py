@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AppAlert(BaseModel):
@@ -159,6 +159,10 @@ class AnalystOpinion(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     evidence: list[str]  # 원문 ID + 프롬프트 버전 ("prompt:chart@a3f2c1")
     as_of: datetime  # 이 판단이 사용한 데이터의 최신 시점
+    # Original analyst output and the exact injected data; optional for old journals.
+    # These fields do not change the production score-only judgment prompt.
+    reasoning: str | None = None
+    source_context: MarketContext | NewsContext | DisclosureContext | None = None
 
 
 class DebateArgument(BaseModel):
@@ -307,3 +311,92 @@ class MobileAccountObservation(BaseModel):
     cash: float = Field(allow_inf_nan=False)
     securities: float = Field(ge=0, allow_inf_nan=False)
     holdings: list[dict]
+
+
+class ThesisDocument(BaseModel):
+    """A preserved input, never an instruction and never a model-written source."""
+
+    source_id: str
+    ticker: str
+    kind: Literal["chart", "news", "disclosure"]
+    scope: Literal["market_data", "headline", "full_text"]
+    content: str
+    observed_at: datetime
+    published_at: datetime | None = None
+    published_on: date | None = None
+
+
+class ThesisCitation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_id: str
+    quote: str
+
+
+class ThesisClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    statement: str
+    invalidation_condition: str
+    reasoning_quote: str
+    citations: list[ThesisCitation]
+
+
+class EntryThesisResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["documented", "unavailable"]
+    explanation: str
+    claims: list[ThesisClaim]
+
+
+class HoldingThesisCheck(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    condition_index: int
+    status: Literal["intact", "invalidated", "unavailable"]
+    reasoning: str
+    citations: list[ThesisCitation]
+
+
+class HoldingThesisResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    checks: list[HoldingThesisCheck]
+
+
+class EntryThesisRecord(BaseModel):
+    """Frozen before entry. A started/failed attempt is never generated again."""
+
+    shadow_only: Literal[True] = True
+    day: date
+    ticker: str
+    started_at: datetime
+    completed_at: datetime | None = None
+    status: Literal["started", "documented", "unavailable"] = "started"
+    reason: str = "analysis_in_progress"
+    decision: Decision
+    decision_hash: str
+    prompt_version: str
+    model: str
+    git_commit: str = "unknown"
+    documents: list[ThesisDocument] = Field(default_factory=list)
+    claims: list[ThesisClaim] = Field(default_factory=list)
+
+
+class HoldingThesisRecord(BaseModel):
+    """Observation only: deliberately has neither action nor sell_fraction."""
+
+    shadow_only: Literal[True] = True
+    day: date
+    ticker: str
+    started_at: datetime
+    completed_at: datetime | None = None
+    status: Literal["started", "intact", "invalidated", "unavailable", "no_new_evidence"] = "started"
+    reason: str = "analysis_in_progress"
+    position: Position
+    thesis_hash: str | None = None
+    prompt_version: str
+    model: str
+    git_commit: str = "unknown"
+    documents: list[ThesisDocument] = Field(default_factory=list)
+    source_failures: list[str] = Field(default_factory=list)
+    unconfirmed_order: bool = False
+    checks: list[HoldingThesisCheck] = Field(default_factory=list)
+    hypothetical_sell_fee_rate: float = Field(ge=0, lt=1, allow_inf_nan=False)
+    hypothetical_sell_tax_rate: float = Field(ge=0, lt=1, allow_inf_nan=False)

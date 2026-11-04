@@ -156,9 +156,10 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     `trade_journal.jsonl`에 적힌 뒤 다음 날 노션 매매일지까지 동기화됐다.
     그래서 이제 **`src` 전체의 `logs/` 기본값을 빠짐없이 등록한다.**
     """
-    from src import app_notifications, codex_plan, collectors, collector_repair, collector_routes, evaluation, judgment, llm, notion_sync, order_guard, order_recovery, pipeline, portfolio_store, run_history, translate
+    from src import app_notifications, codex_plan, collectors, collector_repair, collector_routes, evaluation, judgment, llm, notion_sync, order_guard, order_recovery, pipeline, portfolio_store, run_history, thesis_shadow, translate
 
     monkeypatch.setattr(collector_repair, "STATE_DIR", tmp_path / "collector_repair")
+    monkeypatch.setattr(thesis_shadow, "STATE_DIR", tmp_path / "thesis_shadow")
     monkeypatch.delenv("SIMA_COLLECTOR_AUTOREPAIR", raising=False)
     # Unit fixtures use the fixed canonical contract. Proposed route artifacts
     # are separately checked by full live probes and historical semantic replay.

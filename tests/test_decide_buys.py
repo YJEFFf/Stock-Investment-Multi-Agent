@@ -20,6 +20,26 @@ import scripts.decide_buys as db
 from src.schemas import AnalystOpinion, Decision, GateResult, PortfolioState
 
 
+def test_shadow_failure_preserves_completed_buy_run_and_pending(monkeypatch, tmp_path):
+    from src import thesis_shadow
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+    pending = []
+    async def fake_run(*a, **k):
+        db.run_history.claim_analysis()
+        return a[1], []
+    async def shadow_failure(path):
+        pending.append(path.read_bytes())
+        assert db.run_history.CURRENT.get() is None
+        assert db.run_history.load_runs()[-1].status == "completed"
+        raise RuntimeError("shadow unavailable")
+    monkeypatch.setattr(db.pipeline, "run_daily", fake_run)
+    monkeypatch.setattr(thesis_shadow, "capture_entries", shadow_failure)
+    asyncio.run(db.main())
+    assert pending == [db.PENDING_BUYS_PATH.read_bytes()]
+    assert db.run_history.load_runs()[-1].status == "completed"
+
+
 def test_duplicate_completed_analysis_keeps_existing_pending(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)

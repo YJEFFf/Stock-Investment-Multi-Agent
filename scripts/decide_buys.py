@@ -364,6 +364,17 @@ async def main(*, recovery: bool = False) -> None:
                     run_history.CURRENT.reset(token)
     except PortfolioLockBusy:
         logger.warning("decide_buys_already_running — 기존 pending 보존")
+        return
+
+    # The production run is finished and its session/lock have been released.
+    # This covers scheduled and recovered starts equally. Shadow failure must
+    # never clear pending buys or rewrite the completed daily-run status.
+    try:
+        from src import thesis_shadow
+        summary = await thesis_shadow.capture_entries(PENDING_BUYS_PATH)
+        logger.info("entry_thesis_shadow %s", summary.get("counts", summary.get("status")))
+    except Exception:
+        logger.exception("entry_thesis_shadow_failed — 매수 판단 결과 유지")
 
 
 def finalize_aborted_run(exit_code: int) -> None:

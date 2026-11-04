@@ -1036,6 +1036,8 @@ async def run_day(
                         "prompt": next((x for x in o.evidence if x.startswith("prompt:")), None),
                         "as_of": o.as_of.isoformat(),
                         "evidence": o.evidence,
+                        "reasoning": o.reasoning,
+                        "source_context": o.source_context.model_dump(mode="json") if o.source_context else None,
                     }
                     for o in sorted(decision.inputs, key=lambda o: o.agent)
                 ],

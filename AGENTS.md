@@ -89,6 +89,8 @@ class AnalystOpinion(BaseModel):
     confidence: float                # 0.0 ~ 1.0
     evidence: list[str]              # 원문 ID + 프롬프트 버전 ("prompt:chart@a3f2c1")
     as_of: datetime                  # 이 판단이 사용한 데이터의 최신 시점
+    reasoning: str | None = None     # 분석가 원문, 구형 로그 호환
+    source_context: MarketContext | NewsContext | DisclosureContext | None = None
 
 class Decision(BaseModel):
     ticker: str
@@ -205,6 +207,13 @@ IC(information coefficient, 예측값과 실제 수익률의 순위상관)를 �
   트레일링 3~12%, 익절 비중 1/3. 계수(2.5·2.0)를 바꾸는 것도 사용자 결정이다.
   LLM 재량 매도(보유 종목 재평가 기반)는 2026-09-14 정지(71/71 HOLD, 출력이 상수) —
   다시 켜려면 발동 조건부터 사용자와 정할 것.
+
+  2026-11-04 사용자가 승인한 근거 감시는 `thesis_shadow`의 **기록 전용 실험**이다.
+  새 매수의 원래 근거·주입 자료·무효화 관찰 조건을 진입 전에 고정하고, 장마감 새
+  자료와 비교한다. 기존 보유분의 진입 근거를 사후 생성하지 않는다. 종목·날짜당
+  한 번만 시도하며 중단·실패도 다시 분석하지 않는다. 자료 부족은 판단 불가로 남긴다.
+  이 기록을 주문·매수 게이트·ExitPlan에 연결하거나, 자동 매도 발동 조건·수량을
+  정하는 것은 별도 사용자 결정이다. 상세 절차·측정 한계는 PLAN §5 참조.
 
   **보유 중에는 이 문턱을 절대 재결정하지 않는다.** 편의를 위해 "보유 종목도
   다시 평가해서 손절선을 조정" 같은 경로를 만들지 말 것 — 이미 손실 중인 포지션

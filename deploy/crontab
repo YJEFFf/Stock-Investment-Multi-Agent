@@ -61,3 +61,8 @@
 # 16:00인 이유: 15:50 대조가 끝난 뒤이고, 종목 ~200개 일봉 조회(레이트리밋 회피용
 # 간격 포함 약 1분)가 다른 크론과 겹치지 않는다.
 0 16 * * 1-5    /home/ubuntu/sima/scripts/measure_ic.sh
+
+# 16:20 — 보유 근거 감시 섀도. 고정된 진입 근거와 새 자료 비교만 기록, 주문 연결 없음.
+20 16 * * 1-5   /bin/bash /home/ubuntu/sima/scripts/thesis_shadow.sh review
+# 17:05 — 첫 근거 훼손 관측의 미래 결과 측정. 기존 IC 가격 캐시/매매일지만 읽는다.
+5 17 * * 1-5    /bin/bash /home/ubuntu/sima/scripts/thesis_shadow.sh measure
