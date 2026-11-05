@@ -436,3 +436,170 @@ def test_notification_attempt_limit_survives_receipt_write_failure(waiting_sell,
     monkeypatch.setattr(recovery.notify, 'send_telegram_alert', lambda message: messages.append(message) or True)
     recovery._flush_recovery_alerts()
     assert len(messages) == 1
+
+
+@pytest.fixture
+def waiting_partial_sell(waiting_sell, monkeypatch):
+    """11/5 롯데칠성: 72주 매수 → 24주 익절 → 16주 지연 체결, 잔여 32주."""
+    plan = ExitPlan(stop_loss_pct=-.042739, take_profit_pct=.085478,
+                    take_profit_fraction=1/3, trail_pct=-.034191)
+    entry = 6915800 / 72
+    rows = [
+        dict(event='buy', ticker='009240', day='2026-10-08', quantity=72),
+        dict(event='sell', ticker='009240', day='2026-10-09', shares_sold=24,
+             exit_price_source='fill', sell_amount_source='fill', fee_source='fill',
+             sell_amount=2505000., fee_amount=350.),
+        dict(event='sell', ticker='009240', day=NOW.date().isoformat(), shares_before=48,
+             shares_sold=16, shares_after=32, portfolio_weight_after=.03555555555555556,
+             entry_price=entry, exit_price=110000., exit_price_source='fill_partial',
+             sell_amount=1760000., sell_amount_source='estimated', fee_amount=240.,
+             fee_source='estimated', reason='take_profit_trail', take_profit_stage=1,
+             exit_plan=plan.model_dump(mode='json')),
+    ]
+    recovery.JOURNAL_PATH.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+    state = PortfolioState(positions=[Position(
+        ticker='009240', sector='', weight=rows[-1]['portfolio_weight_after'], quantity=32,
+        entry_day=NOW.date()-timedelta(days=4), entry_price=entry, peak_price=112700.,
+        peak_reset_day=NOW.date(), take_profit_stage=2, exit_plan=plan)],
+        cash_weight=1-rows[-1]['portfolio_weight_after'])
+    store.save_portfolio(state)
+    orders = order_guard.load_orders()
+    orders['009240'].quantity = 16
+    orders['009240'].order_no = '33386'
+    order_guard._save(orders)
+    monkeypatch.setattr(kis, 'fetch_daily_fill_totals', lambda t,d,side,**kw:
+                        (16,1765500.,250.) if side=='sell' else (0,0.,0.))
+    monkeypatch.setattr(kis, 'fetch_holdings', lambda **kw: {'009240':(32,96052.777)})
+
+
+def test_partial_sell_confirms_amount_without_rewriting_position(waiting_partial_sell, monkeypatch):
+    original = store.PORTFOLIO_STATE_PATH.read_bytes()
+    messages = []
+    clear = order_guard.clear
+    def checked_clear(ticker):
+        row = json.loads(recovery.JOURNAL_PATH.read_text().splitlines()[-1])
+        assert (row['shares_sold'], row['shares_after']) == (16,32)
+        assert (row['sell_amount'], row['fee_amount']) == (1765500.,250.)
+        assert row['exit_price'] == 110343.75
+        assert row['fee_source'] == row['sell_amount_source'] == 'fill'
+        assert store.PORTFOLIO_STATE_PATH.read_bytes() == original
+        clear(ticker)
+    monkeypatch.setattr(order_guard, 'clear', checked_clear)
+    monkeypatch.setattr(recovery.notify, 'send_telegram_alert', lambda m: messages.append(m) or True)
+    assert recovery.recover_after_close(NOW.replace(hour=15,minute=50)) == ['009240']
+    assert not recovery.recover_pending_order(NOW+timedelta(days=1))
+    assert store.PORTFOLIO_STATE_PATH.read_bytes() == original
+    assert len(messages) == 1
+    assert '16주' in messages[0]
+
+
+@pytest.mark.parametrize('problem', [
+    'remaining_qty','entry_price','exit_plan','stage','weight','missing_position','unaccepted',
+    'bad_chain','bad_after','broker_qty','broker_average','partial_fill','overfill','timeout',
+    'missing_fee','same_day_buy','baseline','later_trade',
+])
+def test_partial_sell_ambiguous_evidence_stays_blocked(waiting_partial_sell, monkeypatch, problem):
+    state = store.load_portfolio()
+    rows = [json.loads(l) for l in recovery.JOURNAL_PATH.read_text().splitlines()]
+    p = state.positions[0]
+    if problem == 'remaining_qty': p.quantity = 31
+    elif problem == 'entry_price': p.entry_price += 1
+    elif problem == 'exit_plan': p.exit_plan.trail_pct = -.04
+    elif problem == 'stage': p.take_profit_stage += 1
+    elif problem == 'weight': p.weight += .001
+    elif problem == 'missing_position': state.positions = []
+    elif problem == 'unaccepted':
+        orders=order_guard.load_orders(); orders['009240'].order_no=None; order_guard._save(orders)
+    elif problem == 'bad_chain': rows[0]['quantity'] = 73
+    elif problem == 'bad_after': rows[-1]['shares_after'] = 31
+    elif problem in ('broker_qty','broker_average'):
+        monkeypatch.setattr(kis,'fetch_holdings',lambda **kw:
+                            {'009240':(31 if problem=='broker_qty' else 32,96053.)})
+    elif problem in ('partial_fill','overfill','timeout','missing_fee','same_day_buy'):
+        def fills(t,d,side,**kw):
+            if problem in ('timeout','missing_fee'): return None
+            if side=='buy': return (1,100000.,10.) if problem=='same_day_buy' else (0,0.,0.)
+            return (4 if problem=='partial_fill' else 17 if problem=='overfill' else 16,1765500.,250.)
+        monkeypatch.setattr(kis,'fetch_daily_fill_totals',fills)
+    elif problem == 'baseline':
+        orders=order_guard.load_orders(); orders['009240'].fills_before=(24,2505000.,350.); order_guard._save(orders)
+    elif problem == 'later_trade':
+        rows.append(dict(event='buy',ticker='009240',day='2026-10-13',quantity=1))
+    store.save_portfolio(state)
+    recovery.JOURNAL_PATH.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+    original = recovery.JOURNAL_PATH.read_bytes()
+    assert not recovery.recover_pending_order(NOW+timedelta(days=1))
+    assert order_guard.is_blocked('009240')
+    assert recovery.JOURNAL_PATH.read_bytes() == original
+
+
+@pytest.mark.parametrize('problem', [None,'estimated_prior','baseline_amount','baseline_fee'])
+def test_same_day_prior_sell_requires_exact_confirmed_baseline(waiting_partial_sell, monkeypatch, problem):
+    rows = [json.loads(l) for l in recovery.JOURNAL_PATH.read_text().splitlines()]
+    rows[1]['day'] = NOW.date().isoformat()
+    if problem == 'estimated_prior': rows[1]['sell_amount_source'] = 'estimated'
+    recovery.JOURNAL_PATH.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+    orders = order_guard.load_orders()
+    orders['009240'].fills_before = (24,2505001. if problem=='baseline_amount' else 2505000.,
+                                     351. if problem=='baseline_fee' else 350.)
+    order_guard._save(orders)
+    monkeypatch.setattr(kis,'fetch_daily_fill_totals',lambda t,d,side,**kw:
+                        (40,4270500.,600.) if side=='sell' else (0,0.,0.))
+    assert recovery.recover_pending_order(NOW) is (problem is None)
+    if problem is None:
+        recovered = [json.loads(l) for l in recovery.JOURNAL_PATH.read_text().splitlines()]
+        assert recovered[:2] == rows[:2]
+        assert (recovered[-1]['sell_amount'],recovered[-1]['fee_amount']) == (1765500.,250.)
+
+
+@pytest.mark.parametrize('change', ['peak','position','journal','marker'])
+def test_partial_sell_query_races_preserve_updates(waiting_partial_sell, monkeypatch, change):
+    def holding(**kw):
+        with store.portfolio_lock(blocking=False):
+            state = store.load_portfolio()
+            if change == 'peak':
+                state.positions[0].peak_price=114000.
+                state.positions[0].peak_reset_day=NOW.date()-timedelta(days=1)
+                store.save_portfolio(state)
+            elif change == 'position':
+                state.positions[0].take_profit_stage += 1
+                store.save_portfolio(state)
+            elif change == 'journal':
+                with recovery.JOURNAL_PATH.open('a') as f: f.write('{}\n')
+            else:
+                orders=order_guard.load_orders(); orders['009240'].order_no='changed'; order_guard._save(orders)
+        return {'009240':(32,96052.777)}
+    monkeypatch.setattr(kis,'fetch_holdings',holding)
+    assert recovery.recover_pending_order(NOW) is (change=='peak')
+    if change=='peak': assert store.load_portfolio().positions[0].peak_price==114000.
+    else: assert order_guard.is_blocked('009240')
+
+
+@pytest.mark.parametrize('failure_at', ['journal','audit_commit','clear'])
+def test_partial_sell_crash_retries_without_changing_position(waiting_partial_sell, monkeypatch, failure_at):
+    original = store.PORTFOLIO_STATE_PATH.read_bytes()
+    atomic, clear = recovery._atomic_write, order_guard.clear
+    def fail(*a,**kw): raise OSError('injected crash')
+    def write(path,data):
+        if ((path==recovery.JOURNAL_PATH and failure_at=='journal')
+                or (path.name=='committed.json' and failure_at=='audit_commit')): fail()
+        atomic(path,data)
+    monkeypatch.setattr(recovery,'_atomic_write',write)
+    if failure_at=='clear': monkeypatch.setattr(order_guard,'clear',fail)
+    with pytest.raises(OSError): recovery.recover_pending_order(NOW)
+    assert order_guard.is_blocked('009240')
+    monkeypatch.setattr(recovery,'_atomic_write',atomic)
+    monkeypatch.setattr(order_guard,'clear',clear)
+    assert recovery.recover_pending_order(NOW+timedelta(days=1))
+    assert store.PORTFOLIO_STATE_PATH.read_bytes()==original
+    row=json.loads(recovery.JOURNAL_PATH.read_text().splitlines()[-1])
+    assert row['fill_recovery']['amount_before']==1760000.
+
+
+@pytest.mark.parametrize('baseline', [(0,0.), (0,0.,None), (0,float('nan'),0.), (0,0.,-1.)])
+def test_sell_unknown_or_invalid_prior_fee_never_releases(waiting_partial_sell, monkeypatch, baseline):
+    orders=order_guard.load_orders(); orders['009240'].fills_before=baseline; order_guard._save(orders)
+    def forbidden(*a,**kw): raise AssertionError('invalid baseline must be rejected before broker reads')
+    monkeypatch.setattr(kis,'fetch_daily_fill_totals',forbidden)
+    assert not recovery.recover_pending_order(NOW)
+    assert order_guard.is_blocked('009240')

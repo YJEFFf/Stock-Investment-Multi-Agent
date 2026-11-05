@@ -1,7 +1,8 @@
-"""신규 매수와 전량 매도의 지연 체결을 재대조한다. 주문·분석·출구 재설정 없음.
+"""신규 매수와 매도의 지연 체결을 재대조한다. 주문·분석·출구 재설정 없음.
 
 브로커 조회는 포트폴리오 락 밖에서 하고, 짧은 커밋 락 안에서 원본을 다시 비교한다.
-추가매수/부분매도/귀속 불명확한 응답 유실/애매한 원장은 자동 해제하지 않는다.
+부분 익절은 확정된 선행 체결과 잔여 포지션까지 일치해야 해제한다.
+추가매수/귀속 불명확한 응답 유실/애매한 원장은 자동 해제하지 않는다.
 주문 날짜가 지나도 이후 거래가 없고 원장·장부·잔고가 모두 일치하면 복구한다.
 """
 
@@ -228,7 +229,7 @@ def recover_pending_order(now: datetime) -> bool:
     ticker = candidates[int(now.timestamp() // 60) % len(candidates)]
     if orders[ticker].side == "buy":
         return recover_pending_buy(now, ticker=ticker, extended=True)
-    return _recover_full_sell(now, ticker)
+    return _recover_sell(now, ticker)
 
 
 def recover_after_close(now: datetime) -> list[str]:
@@ -244,14 +245,30 @@ def recover_after_close(now: datetime) -> list[str]:
         if order.ready_to_commit or order.created_at.astimezone(KST).date() > now.date():
             continue
         success = (recover_pending_buy(now, ticker=ticker, extended=True, policy=CLOSE_QUERY_POLICY)
-                   if order.side == "buy" else _recover_full_sell(now, ticker, policy=CLOSE_QUERY_POLICY))
+                   if order.side == "buy" else _recover_sell(now, ticker, policy=CLOSE_QUERY_POLICY))
         if success:
             recovered.append(ticker)
     return recovered
 
 
-def _recover_full_sell(now: datetime, ticker: str, *, policy: kis.RetryPolicy | None = None) -> bool:
-    """단일 전량 매도의 지연 원장을 확정한다. 부분 매도 고점은 재해석하지 않는다."""
+def _sell_baseline(rows: list[dict]) -> tuple[int, float, float] | None:
+    """같은 날 선행 매도는 확정 원장값만 누적 집계에서 빼낼 수 있다."""
+    quantity, amount, fee = 0, 0.0, 0.0
+    for row in rows:
+        if (row.get("event") != "sell" or row.get("exit_price_source") != "fill"
+                or row.get("sell_amount_source") != "fill" or row.get("fee_source") != "fill"):
+            return None
+        q, a, f = row.get("shares_sold"), row.get("sell_amount"), row.get("fee_amount")
+        if (type(q) is not int or q <= 0
+                or not isinstance(a, (int, float)) or not math.isfinite(a) or a <= 0
+                or not isinstance(f, (int, float)) or not math.isfinite(f) or f < 0):
+            return None
+        quantity, amount, fee = quantity + q, amount + a, fee + f
+    return quantity, amount, fee
+
+
+def _recover_sell(now: datetime, ticker: str, *, policy: kis.RetryPolicy | None = None) -> bool:
+    """마지막 매도의 지연 원장을 확정한다. 잔여 수량·출구 규칙·고점은 보존한다."""
     from src.pipeline import _trade_costs
     from src.schemas import FillRecord
     policy = policy or QUERY_POLICY
@@ -259,7 +276,10 @@ def _recover_full_sell(now: datetime, ticker: str, *, policy: kis.RetryPolicy | 
     try:
         with portfolio_store.portfolio_lock(blocking=False):
             order = order_guard.load_orders().get(ticker)
-            if order is None or order.side != "sell" or order.ready_to_commit or order.fills_before != (0, 0.0, 0.0):
+            if (order is None or order.side != "sell" or order.ready_to_commit
+                    or order.fills_before is None or len(order.fills_before) != 3
+                    or any(not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
+                           for value in order.fills_before)):
                 return False
             day = order.created_at.astimezone(KST).date()
             if day > now.date() or not JOURNAL_PATH.exists():
@@ -269,12 +289,18 @@ def _recover_full_sell(now: datetime, ticker: str, *, policy: kis.RetryPolicy | 
             rows = [json.loads(line) for line in lines]
             matches = [(i, r) for i, r in enumerate(rows) if r.get("ticker") == ticker
                        and r.get("day") == day.isoformat() and r.get("event") in ("buy", "sell")]
-            if len(matches) != 1:
+            if not matches:
                 return False
-            index, row = matches[0]
+            index, row = matches[-1]
+            baseline = _sell_baseline([r for _, r in matches[:-1]])
+            if (baseline is None or baseline[0] != order.fills_before[0]
+                    or any(abs(a - b) > 0.005 for a, b in zip(baseline[1:], order.fills_before[1:]))):
+                return False
+            shares_before, shares_after = row.get("shares_before"), row.get("shares_after")
             if (row.get("event") != "sell" or row.get("shares_sold") != order.quantity
-                    or row.get("shares_before") != order.quantity or row.get("shares_after") != 0
-                    or row.get("portfolio_weight_after") != 0):
+                    or type(shares_before) is not int or type(shares_after) is not int
+                    or shares_after < 0 or shares_before - order.quantity != shares_after
+                    or (shares_after == 0 and row.get("portfolio_weight_after") != 0)):
                 return False
             if any(r.get("ticker") == ticker and r.get("event") in ("buy", "sell") for r in rows[index + 1:]):
                 return False
@@ -285,36 +311,58 @@ def _recover_full_sell(now: datetime, ticker: str, *, policy: kis.RetryPolicy | 
             elif row.get("exit_price_source") != "fill_partial" and not (
                     row.get("exit_price_source") == "quote_fallback" and order.order_no):
                 return False
-            # 과거 보유 수량과 현재 장부의 부재가 모두 일치해야 한다.
+            # 과거 수량 체인·잔여 장부와 브로커 잔고가 같은 거래를 가리켜야 한다.
             previous_qty = _historical_quantity(rows[:index], ticker)
-            if previous_qty != order.quantity:
+            if previous_qty != shares_before:
                 return False
             entry_price = row.get("entry_price")
             if not isinstance(entry_price, (int, float)) or not math.isfinite(entry_price) or entry_price <= 0:
                 return False
-            if any(p.ticker == ticker for p in portfolio_store.load_portfolio().positions):
+            position = next((p for p in portfolio_store.load_portfolio().positions if p.ticker == ticker), None)
+            before_position = _position_values(position) if position else None
+            if shares_after:
+                stage = row.get("take_profit_stage")
+                if (not order.order_no or row.get("reason") != "take_profit_trail"
+                        or position is None or position.quantity != shares_after
+                        or position.entry_price != entry_price
+                        or position.weight != row.get("portfolio_weight_after")
+                        or position.exit_plan is None or position.exit_plan.model_dump(mode="json") != row.get("exit_plan")
+                        or type(stage) is not int or position.take_profit_stage != stage + 1):
+                    return False
+            elif position is not None:
                 return False
     except portfolio_store.PortfolioLockBusy:
         return False
 
     sold = kis.fetch_daily_fill_totals(ticker, day, "sell", policy=policy, require_fee=True)
-    if (sold is None or sold[0] != order.quantity or not all(math.isfinite(x) for x in sold)
+    if (sold is None or sold[0] != baseline[0] + order.quantity or not all(math.isfinite(x) for x in sold)
             or sold[1] <= 0 or sold[2] < 0):
         return False
     bought = kis.fetch_daily_fill_totals(ticker, day, "buy", policy=policy, require_fee=True)
     if bought != (0, 0.0, 0.0):
         return False
     holdings = kis.fetch_holdings(policy=policy, require_complete=True)
-    if holdings is None or ticker in holdings:
+    if holdings is None:
         return False
-    fill = FillRecord(quantity=sold[0], amount=sold[1], fee=sold[2])
+    holding = holdings.get(ticker)
+    if shares_after:
+        if (holding is None or holding[0] != shares_after or not math.isfinite(holding[1])
+                or abs(holding[1] - entry_price) > 0.001):
+            return False
+    elif holding is not None:
+        return False
+    amount, fee = sold[1] - baseline[1], sold[2] - baseline[2]
+    if amount <= 0 or fee < 0:
+        return False
+    fill = FillRecord(quantity=order.quantity, amount=amount, fee=fee)
     if recovery and (row.get("sell_amount") != fill.amount or row.get("fee_amount") != fill.fee):
         return False
     try:
         with portfolio_store.portfolio_lock(blocking=False):
             if order_guard.load_orders().get(ticker) != order or JOURNAL_PATH.read_bytes() != original:
                 return False
-            if any(p.ticker == ticker for p in portfolio_store.load_portfolio().positions):
+            current = next((p for p in portfolio_store.load_portfolio().positions if p.ticker == ticker), None)
+            if (_position_values(current) if current else None) != before_position:
                 return False
             key = hashlib.sha256(f"{ticker}:{order.created_at.isoformat()}".encode()).hexdigest()[:20]
             audit = AUDIT_DIR / key
@@ -322,7 +370,8 @@ def _recover_full_sell(now: datetime, ticker: str, *, policy: kis.RetryPolicy | 
                 _atomic_write(audit / "before.json", json.dumps({
                     "observed_at": now.isoformat(), "order": order.model_dump(mode="json"),
                     "journal_row": row, "journal_sha256": hashlib.sha256(original).hexdigest(),
-                    "buy": bought, "sell": sold, "holding": None,
+                    "buy": bought, "sell": sold, "holding": holding,
+                    "position": before_position, "fills_before": baseline,
                 }, ensure_ascii=False, indent=2).encode())
             evidence = recovery or {"order_created_at": order.created_at.isoformat(),
                                    "exit_price_before": row.get("exit_price"),

@@ -46,6 +46,7 @@ def replay(source: Path) -> dict:
               patch.object(portfolio_store,"PORTFOLIO_LOCK_PATH",tmp/"portfolio.lock"),
               patch.object(kis,"fetch_daily_fill_totals",fills),
               patch.object(kis,"fetch_holdings",lambda **kw:evidence["holdings"]),
+              patch.object(order_recovery.notify,"send_telegram_alert",lambda message: True),
               patch.object(kis.requests,"get",forbidden),patch.object(kis.requests,"post",forbidden)):
             for i in range(len(orders)*2):
                 order_recovery.recover_pending_order(now+timedelta(minutes=i))
