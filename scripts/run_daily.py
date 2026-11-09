@@ -45,6 +45,10 @@ KST = ZoneInfo("Asia/Seoul")
 
 
 async def main() -> None:
+    from src import operating_mode
+    if operating_mode.EXIT_ONLY:
+        logger.info("exit_only: buy analysis disabled")
+        return
     today_kst = datetime.now(KST).date()
     if not is_krx_trading_day(today_kst):
         logger.info("not_a_trading_day day=%s — skip (주말/공휴일, LLM 호출 없음)", today_kst.isoformat())

@@ -55,10 +55,15 @@ def _lock_with_deadline(fd: int) -> None:
 
 
 def enqueue(message: str) -> bool:
+    return enqueue_alert(make_alert(message))
+
+
+def enqueue_alert(alert: AppAlert) -> bool:
+    """Stable IDs allow a durable producer to retry after a crash without duplicate UI alerts."""
     if os.environ.get("SIMA_APP_ALERTS_ENABLED") != "1":
         return False
     try:
-        payload = (make_alert(message).model_dump_json() + "\n").encode()
+        payload = (alert.model_dump_json() + "\n").encode()
         DEFAULT_APP_ALERTS_PATH.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(DEFAULT_APP_ALERTS_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:

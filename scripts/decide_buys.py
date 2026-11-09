@@ -319,6 +319,9 @@ async def _main() -> None:
 
 
 async def main(*, recovery: bool = False) -> None:
+    from src import operating_mode
+    if operating_mode.EXIT_ONLY:
+        return
     now = datetime.now(KST)
     if not is_krx_trading_day(now.date()):
         logger.info("not_a_trading_day day=%s — skip", now.date())

@@ -12,6 +12,9 @@ from src.portfolio_store import PortfolioLockBusy
 
 
 def main():
+    from src import operating_mode
+    if operating_mode.EXIT_ONLY:
+        return
     parser = argparse.ArgumentParser()
     parser.add_argument("--repair", action="store_true")
     parser.add_argument("--full", action="store_true")

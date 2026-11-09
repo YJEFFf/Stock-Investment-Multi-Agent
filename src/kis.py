@@ -280,6 +280,9 @@ def _kis_request(
     접수 여부를 알 수 없는 상태라 OrderResponseLost로 올린다 — 호출부가 원장에서
     확인해야 한다.
     """
+    from src import operating_mode
+    if operating_mode.EXIT_ONLY and (method != "GET" or path != CURRENT_PRICE_PATH):
+        operating_mode.require_broker_mode()
     token = get_access_token()
     if token is None:
         return None

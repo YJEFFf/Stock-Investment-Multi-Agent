@@ -166,6 +166,14 @@ def create_app(config: dict | None = None) -> Flask:
 
     @app.post("/api/account/refresh")
     def refresh_account():
+        from src import operating_mode
+        if operating_mode.EXIT_ONLY:
+            if not store.allow("snapshot:" + g.session, limit=30):
+                abort(429)
+            # The minute monitor owns quotes and simulated sales. A UI refresh only reads it.
+            cached.update(at=time.monotonic(), data=snapshot(Path(app.config["DATA_DIR"]),
+                          initial_capital=app.config["INITIAL_CAPITAL"]).model_dump(mode="json"))
+            return jsonify(cached["data"])
         if not store.allow("broker-refresh", limit=3):
             abort(429)
         try:

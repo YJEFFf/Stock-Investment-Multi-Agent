@@ -67,6 +67,14 @@ def _never_send_web_push(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_operating_mode(monkeypatch, tmp_path):
+    """Existing broker-path regression tests stay isolated; exit-only tests explicitly enable it."""
+    from src import operating_mode, exit_only
+    monkeypatch.setattr(operating_mode, "EXIT_ONLY", False)
+    monkeypatch.setattr(exit_only, "STATE_PATH", tmp_path / "exit_only_state.json")
+
+
+@pytest.fixture(autouse=True)
 def _never_reach_notion(monkeypatch):
     """노션은 requests.request 지점에서 막는다. _notion_request는 400 이상을 재시도
     없이 None으로 돌려주므로 599를 주면 대기 없이 곧바로 실패한다."""

@@ -106,6 +106,8 @@ async def call_structured(
     분석가·토론·매니저가 공유하는 통로라 여기서 남기지 않으면 나중에 호출별
     분석가 귀속이 불가능해진다.
     """
+    from src import operating_mode
+    operating_mode.require_broker_mode()
     if not CLAUDE_API_ENABLED:
         raise ClaudeApiDisabled(f"Claude API is switched off (llm.CLAUDE_API_ENABLED=False), label={label}")
 

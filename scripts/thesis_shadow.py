@@ -15,6 +15,9 @@ from src.market_calendar import is_krx_trading_day
 
 
 def main(argv=None):
+    from src import operating_mode
+    if operating_mode.EXIT_ONLY:
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("phase", choices=("capture", "review", "measure"))
     parser.add_argument("--data-dir", type=Path, default=Path("logs"))

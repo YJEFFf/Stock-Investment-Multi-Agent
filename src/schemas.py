@@ -313,6 +313,57 @@ class MobileAccountObservation(BaseModel):
     holdings: list[dict]
 
 
+class ExitOnlyQuote(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    price: float = Field(gt=0, allow_inf_nan=False)
+    observed_at: datetime
+    source: Literal["kis", "naver", "transition_snapshot"]
+
+
+class ExitOnlySale(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    at: datetime
+    ticker: str
+    reason: Literal["stop_loss", "take_profit_first", "take_profit_trail"]
+    shares_before: int = Field(gt=0)
+    shares_sold: int = Field(gt=0)
+    shares_after: int = Field(ge=0)
+    entry_price: float = Field(gt=0, allow_inf_nan=False)
+    exit_price: float = Field(gt=0, allow_inf_nan=False)
+    sell_amount: float = Field(gt=0, allow_inf_nan=False)
+    fee_amount: float = Field(ge=0, allow_inf_nan=False)
+    tax_amount: float = Field(ge=0, allow_inf_nan=False)
+    net_pnl_amount: float = Field(allow_inf_nan=False)
+    from_day_range: bool
+    quote_source: Literal["kis", "naver"]
+
+
+class ExitOnlyState(BaseModel):
+    """One atomic ledger: positions, cash, hypothetical sales and notification outbox."""
+    model_config = ConfigDict(extra="forbid")
+    version: Literal[1] = 1
+    session_id: str
+    started_at: datetime
+    updated_at: datetime
+    source_portfolio_sha256: str
+    source_portfolio: PortfolioState
+    portfolio: PortfolioState
+    names: dict[str, str]
+    cash: float = Field(ge=0, allow_inf_nan=False)  # includes unsettled cash at transition
+    initial_cash: float = Field(ge=0, allow_inf_nan=False)
+    initial_total: float = Field(gt=0, allow_inf_nan=False)
+    fee_rate: float = Field(ge=0, allow_inf_nan=False)
+    tax_rate: float = Field(ge=0, allow_inf_nan=False)
+    quotes: dict[str, ExitOnlyQuote]
+    sales: list[ExitOnlySale] = Field(default_factory=list)
+    outbox: list[AppAlert] = Field(default_factory=list)
+    nav_history: list[dict] = Field(default_factory=list)
+    last_checked_at: datetime | None = None
+    missing_quotes: list[str] = Field(default_factory=list)
+    completed_at: datetime | None = None
+
+
 class ThesisDocument(BaseModel):
     """A preserved input, never an instruction and never a model-written source."""
 

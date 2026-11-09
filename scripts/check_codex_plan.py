@@ -22,6 +22,9 @@ KST = ZoneInfo("Asia/Seoul")
 
 
 async def main() -> None:
+    from src import operating_mode
+    if operating_mode.EXIT_ONLY:
+        return
     today = datetime.now(KST).date()
     if not is_krx_trading_day(today):
         return

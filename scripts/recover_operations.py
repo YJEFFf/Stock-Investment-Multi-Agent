@@ -49,6 +49,9 @@ def main():
                         '서비스 자동 복구 결과', f'{name}: {row.get("status")}; exit={row.get("result", "pending")}'))
                     state[name] = stamp
                     save(state)
+        from src import operating_mode
+        if operating_mode.EXIT_ONLY:
+            return
         at = datetime.now(codex_plan.KST)
         # Use exactly the analysis lock. A live run is never finalized or replaced.
         with portfolio_lock(run_history.RUN_LOCK_PATH, blocking=False):

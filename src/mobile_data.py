@@ -81,6 +81,13 @@ def trading_days(through: date, count: int) -> list[str]:
 
 def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float = 100_000_000, account_path: Path | None = None) -> MobileSnapshot:
     now = (now or datetime.now(KST)).astimezone(KST)
+    from src import exit_only, operating_mode
+    monitoring_day = now.date()
+    if operating_mode.EXIT_ONLY:
+        try:
+            monitoring_day = min(monitoring_day, exit_only.load(root / "exit_only_state.json").started_at.date())
+        except (OSError, ValueError, TypeError):
+            pass  # The projection below fails closed; no broker fallback.
     today = now.date().isoformat()
     data = Records(root)
     nav_rows = data.rows("account_nav.jsonl")
@@ -150,7 +157,7 @@ def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float 
     run = runs.get(today)
     try:
         market_open_day = is_krx_trading_day(now.date())
-        days = trading_days(now.date(), 20)
+        days = trading_days(monitoring_day, 20)
         expected_nav_day = trading_days(now.date() if now.time() >= time(15, 40) else now.date() - timedelta(days=1), 1)[0]
         if daily_latest and daily_latest["day"] < expected_nav_day:
             data.warnings.append(f"일별 계좌 기록이 {daily_latest['day']} 이후 갱신되지 않았습니다.")
@@ -235,7 +242,69 @@ def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float 
         ic = {}
     measurements = {"normal_days": normal_days, "target_days": 60, "as_of": ic.get("as_of"),
                     "segments": ic.get("segments", {}), "first_nav_day": valid_nav[0]["day"] if valid_nav else None}
-    return MobileSnapshot(generated_at=now, account=account, holdings=holdings, trades=trades[:250],
+    result = MobileSnapshot(generated_at=now, account=account, holdings=holdings, trades=trades[:250],
                           nav_history=[{k: r.get(k) for k in ("day", "total", "daily_return")} for r in valid_nav],
                           operation=operation, monitoring=monitoring, measurements=measurements,
                           warnings=list(dict.fromkeys(data.warnings)))
+    if operating_mode.EXIT_ONLY:
+        return exit_only_snapshot(result, root, now, initial_capital)
+    return result
+
+
+def exit_only_snapshot(result: MobileSnapshot, root: Path, now: datetime, initial_capital: float) -> MobileSnapshot:
+    from src import exit_only
+    result.account, result.holdings = None, []
+    result.warnings = []
+    result.operation.update(mode="exit_only", status="exit_only", label="기존 보유분 가상 매도 추적",
+                            reason="신규 매수 판단 중단", run={}, capacity={}, unconfirmed_orders=0)
+    result.measurements["paused"] = True
+    try:
+        state = exit_only.load(root / "exit_only_state.json")
+    except (OSError, ValueError, TypeError):
+        result.operation.update(status="failed", label="가상 매도 장부 확인 필요")
+        result.warnings.append("가상 매도 장부를 읽지 못했습니다. 이전 증권사 잔고를 현재 보유분으로 표시하지 않습니다.")
+        return result
+    result.operation.update(started_at=state.started_at.isoformat(),
+                            last_checked_at=state.last_checked_at.isoformat() if state.last_checked_at else None,
+                            completed_at=state.completed_at.isoformat() if state.completed_at else None)
+    for day in result.monitoring.get("days", []):
+        if day["day"] > state.started_at.date().isoformat():
+            day.update(status="paused", signal=False)
+    if state.completed_at:
+        result.operation.update(status="completed", label="기존 보유분 가상 매도 완료")
+    for p in state.portfolio.positions:
+        q = state.quotes[p.ticker]
+        value, cost = p.quantity * q.price, p.quantity * p.entry_price
+        result.holdings.append({"ticker": p.ticker, "name": state.names[p.ticker], "quantity": p.quantity,
+                               "entry_price": p.entry_price, "price": q.price, "value": value,
+                               "pnl": value - cost, "pnl_pct": (value / cost - 1) * 100,
+                               "observed_at": q.observed_at.isoformat(), "simulated": True})
+    stocks = sum(h["value"] for h in result.holdings)
+    costs = sum(h["quantity"] * h["entry_price"] for h in result.holdings)
+    total = state.cash + stocks
+    observed = min((state.quotes[p.ticker].observed_at for p in state.portfolio.positions), default=state.updated_at)
+    result.account = {"day": observed.astimezone(KST).date().isoformat(), "observed_at": observed.isoformat(),
+                      "total": total, "cash": state.cash, "securities": stocks, "initial_capital": initial_capital,
+                      "pnl": total - initial_capital, "return_since_start": total / initial_capital - 1 if initial_capital else None,
+                      "cash_ratio": state.cash / total if total else None, "securities_pnl": stocks - costs,
+                      "securities_return_pct": (stocks / costs - 1) * 100 if costs else None,
+                      "simulated": True, "transition_total": state.initial_total,
+                      "return_since_transition": total / state.initial_total - 1}
+    result.nav_history = [r for r in result.nav_history if r["day"] < state.started_at.date().isoformat()] + state.nav_history
+    for sale in state.sales:
+        result.trades.append({"id": sale.id, "event": "sell", "day": sale.at.date().isoformat(),
+                              "at": sale.at.isoformat(), "ticker": sale.ticker, "name": state.names[sale.ticker],
+                              "reason": sale.reason, "shares_sold": sale.shares_sold, "shares_after": sale.shares_after,
+                              "position_fraction_sold": sale.shares_sold / sale.shares_before,
+                              "entry_price": sale.entry_price, "exit_price": sale.exit_price,
+                              "sell_amount": sale.sell_amount, "fee_amount": sale.fee_amount,
+                              "tax_amount": sale.tax_amount, "net_pnl_amount": sale.net_pnl_amount,
+                              "simulated": True, "sell_amount_source": "simulated_quote"})
+    result.trades.sort(key=lambda r: (r["day"], r.get("at", "")), reverse=True)
+    result.trades = result.trades[:250]
+    if state.missing_quotes:
+        result.warnings.append("시세 미확인: " + ", ".join(state.names[t] for t in state.missing_quotes) + ". 해당 종목은 마지막 가격을 표시합니다.")
+    if (state.portfolio.positions and is_krx_trading_day(now.date()) and time(9, 2) <= now.time() < time(15, 36)
+            and (state.last_checked_at is None or (now - state.last_checked_at).total_seconds() > 120)):
+        result.warnings.append("가상 매도 감시가 2분 넘게 갱신되지 않았습니다. 표시된 가격 확인 시각을 확인하세요.")
+    return result

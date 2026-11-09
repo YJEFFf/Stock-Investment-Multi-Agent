@@ -667,6 +667,9 @@ def preanalysis_problem(at=None):
 
 def process_pending():
     """Drain real incidents only. An empty queue performs no probes or alerts."""
+    from src import operating_mode
+    if operating_mode.EXIT_ONLY:
+        return None
     if read_workflow()["requests"]:
         with portfolio_lock(STATE_DIR / "workflow.lock"):
             workflow = read_workflow()
@@ -716,6 +719,9 @@ def process_pending():
 
 
 def watchdog():
+    from src import operating_mode
+    if operating_mode.EXIT_ONLY:
+        return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     # Different lock from worker so a hung worker cannot silence its watchdog.
     with portfolio_lock(STATE_DIR / "watchdog.lock", blocking=False):

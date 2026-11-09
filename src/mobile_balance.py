@@ -62,6 +62,10 @@ def serve():
                 if self.rfile.readline(32) != b"refresh\n":
                     self.wfile.write(b"invalid\n")
                     return
+                from src import operating_mode
+                if operating_mode.EXIT_ONLY:
+                    self.wfile.write(b"disabled\n")
+                    return
                 if time.monotonic() - last_request < 15:
                     self.wfile.write(b"busy\n")
                     return

@@ -41,6 +41,10 @@ KST = ZoneInfo("Asia/Seoul")
 
 
 async def main() -> None:
+    from src import operating_mode, exit_only
+    if operating_mode.EXIT_ONLY:
+        await exit_only.monitor()
+        return
     today_kst = datetime.now(KST).date()
     if not is_krx_trading_day(today_kst):
         return  # 주말/공휴일 — 로그도 안 남긴다(매분 도는 잡이라 휴장일에 조용한 게 정상)

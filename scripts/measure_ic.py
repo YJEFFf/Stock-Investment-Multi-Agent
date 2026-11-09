@@ -36,6 +36,9 @@ FETCH_PAUSE_S = 0.15  # 초당 거래건수 제한(EGW00201)에 안 걸리게 �
 
 
 def main() -> int:
+    from src import operating_mode
+    if operating_mode.EXIT_ONLY:
+        return 0
     today = datetime.now(KST).date()
     if not is_krx_trading_day(today):
         logger.info("not_a_trading_day day=%s — skip", today.isoformat())

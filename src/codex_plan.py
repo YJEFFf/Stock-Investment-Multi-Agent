@@ -177,6 +177,8 @@ def _codex_command(*args: str) -> list[str]:
 
 
 def _run(command: list[str], *, env: dict[str, str], input_text: str | None = None, cwd: str | None = None, timeout_s: float = DEFAULT_TIMEOUT_S):
+    from src import operating_mode
+    operating_mode.require_broker_mode()
     return subprocess.run(
         command,
         input=input_text,
@@ -244,6 +246,8 @@ def _app_server_response(
 
 def _read_capacity_sync() -> CapacityStatus:
     """ChatGPT 계정의 일반 Codex 7일 한도를 조회한다(LLM 추론 호출 없음)."""
+    from src.operating_mode import require_broker_mode
+    require_broker_mode()
     env = _subscription_environment()
     _ensure_filesystem_isolation(env)
     _ensure_chatgpt_login(env)
@@ -533,6 +537,8 @@ async def call_structured(
     모델로 바꾸지 않고 실패시킨다. 파이프라인이 종목을 병렬 처리할 때 CLI 프로세스가
     한꺼번에 수백 개 뜨지 않도록 동시 실행도 제한한다.
     """
+    from src import operating_mode
+    operating_mode.require_broker_mode()
     del max_tokens, effort
     if model != DEFAULT_MODEL:
         raise CodexPlanUnavailable(f"Unsupported Codex plan model: {model}")

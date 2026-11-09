@@ -178,6 +178,9 @@ async def _sync_trade_journal() -> None:
 
 
 async def main() -> None:
+    from src import operating_mode
+    if operating_mode.EXIT_ONLY:
+        return
     today_kst = datetime.now(KST).date()
     if not is_krx_trading_day(today_kst):
         logger.info("not_a_trading_day day=%s — skip", today_kst.isoformat())

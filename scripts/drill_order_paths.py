@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import requests  # noqa: E402
 
-from src import collectors, kis, notify, order_guard, pipeline, sell, translate  # noqa: E402
+from src import app_notifications, collectors, exit_only, kis, notify, operating_mode, order_guard, pipeline, sell, translate  # noqa: E402
 from src.schemas import AnalystOpinion, Decision, GateResult, PortfolioState, Position, RiskGateConfig, SellAction  # noqa: E402
 
 KST = ZoneInfo("Asia/Seoul")
@@ -121,6 +121,8 @@ class FakeBroker:
 def _wired(broker: FakeBroker):
     """운영 코드는 그대로, HTTP·토큰·대기·알림만 바꿔 끼운다. 끝나면 전부 되돌린다."""
     saved = {
+        (operating_mode, "EXIT_ONLY"): operating_mode.EXIT_ONLY,
+        (app_notifications, "enqueue_alert"): app_notifications.enqueue_alert,
         (order_guard, "STATE_PATH"): order_guard.STATE_PATH,
         (kis, "get_access_token"): kis.get_access_token,
         (kis.requests, "get"): kis.requests.get,
@@ -147,6 +149,8 @@ def _wired(broker: FakeBroker):
         kis.get_access_token = lambda: "drill-token"
         kis.requests.get = broker.get
         kis.requests.post = broker.post
+        operating_mode.EXIT_ONLY = False  # Only after all broker HTTP has been replaced by FakeBroker.
+        app_notifications.enqueue_alert = lambda alert: True
         kis._throttle = lambda: None
         kis.FILL_POLL_TIMEOUT_S = 0.0
         kis.FILL_POLL_INTERVAL_S = 0.0
@@ -357,6 +361,30 @@ def s_gate_position_limit() -> Outcome:
     return Outcome("게이트: 종목당 한도(추가매수)", "8% + 8% = 16% > 15%", ok, f"거부 {rejected}")
 
 
+def s_exit_only_liquidation() -> Outcome:
+    broker = FakeBroker()
+    with _wired(broker) as (tmp, _):
+        operating_mode.EXIT_ONLY = True
+        started = datetime(2026, 11, 9, 16, 15, tzinfo=KST)
+        observed = datetime(2026, 11, 10, 9, 1, tzinfo=KST)
+        portfolio = PortfolioState(positions=[Position(ticker=TICKER, sector="test", weight=.5,
+            quantity=5, entry_price=12500, peak_price=12500, entry_day=date(2026, 11, 2),
+            exit_plan=sell.DEFAULT_EXIT_PLAN)], cash_weight=.5)
+        account = dict(total=100000, securities=50000, observed_at=started.isoformat(),
+            holdings=[dict(pdno=TICKER, prdt_name="drill", hldg_qty=5, prpr=10000)])
+        path = tmp / "exit_only.json"
+        exit_only.initialize(portfolio.model_dump_json().encode(), account, at=started, path=path)
+        asyncio.run(exit_only.monitor(at=observed, path=path))
+        requests_after_sale = len(broker.gets)
+        asyncio.run(exit_only.monitor(at=observed + timedelta(minutes=1), path=path))
+        state = exit_only.load(path)
+        ok = (not broker.posts and broker.gets == [kis.CURRENT_PRICE_PATH]
+              and len(broker.gets) == requests_after_sale and not state.portfolio.positions
+              and len(state.sales) == 1 and state.sales[0].shares_sold == 5)
+        return Outcome("기존 보유분 가상 청산", "새 주문·계좌 조회 없이 가격만 보고 기록, 전량 후 조회 중단",
+                       ok, f"HTTP GET {len(broker.gets)}회(시세만), POST {len(broker.posts)}회, 가상 매도 {len(state.sales)}건")
+
+
 SCENARIOS = [
     s_buy_normal,
     s_buy_response_lost_no_fill,
@@ -370,6 +398,7 @@ SCENARIOS = [
     s_secondary_quote_active_stop_loss,
     s_gate_total_exposure,
     s_gate_position_limit,
+    s_exit_only_liquidation,
 ]
 
 

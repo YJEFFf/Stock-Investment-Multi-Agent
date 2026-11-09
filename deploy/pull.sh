@@ -40,6 +40,8 @@ PY
 # 한계: 이 검사는 리뷰를 **강제**하지 못한다(누구나 해시를 넣을 수 있다). 하는 일은 "무엇을
 # 리뷰했는가"를 명시하게 하고, 검사한 그 커밋만 배포되게 하는 것이다.
 TRADING_PATHS=(
+  src/operating_mode.py src/exit_only.py scripts/monitor_exit_only.py scripts/monitor_exit_only.sh
+  scripts/run_daily.py
   src/sell.py src/pipeline.py src/kis.py src/collectors.py src/schemas.py src/portfolio_store.py
   src/notify.py src/judgment.py src/translate.py src/llm.py src/analysts.py
   src/app_notifications.py
