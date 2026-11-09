@@ -81,7 +81,7 @@ function operationCard() {
 }
 function navChart() {
   const rows = state.data.nav_history;
-  if (rows.length < 2) return empty('첫 기록을 담았어요', `${rows.length ? shortDay(rows[0].day) + '부터 ' : ''}실제 계좌 기록이 쌓이면 변화 그래프가 나타나요.`);
+  if (rows.length < 2) return empty('첫 기록을 담았어요', `${rows.length ? shortDay(rows[0].day) + '부터 ' : ''}평가 기록이 쌓이면 변화 그래프가 나타나요.`);
   const values = rows.map(r => Number(r.total)), min = Math.min(...values), max = Math.max(...values), span = max - min || max * .01 || 1;
   const points = values.map((v,i) => `${(i / (values.length - 1) * 300 + 8).toFixed(2)},${(110 - (v - min) / span * 90).toFixed(2)}`).join(' ');
   const last = points.split(' ').pop().split(',');
