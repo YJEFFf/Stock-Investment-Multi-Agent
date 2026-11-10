@@ -610,7 +610,7 @@ def test_failed_quote_and_stale_sector_cache_refresh_are_recorded(monkeypatch):
     assert REAL_NAVER_QUOTES(['005930']) == {}
     monkeypatch.setattr(collectors, '_read_sector_cache', lambda: ({'005930': '반도체'}, AT - timedelta(days=90)))
     monkeypatch.setattr(collectors, '_fetch_sector_map_live', lambda: None)
-    assert collectors.fetch_kospi200_sector_map() == {'005930': '반도체'}
+    assert collectors.fetch_kospi200_sector_map() is None
     assert set(repair.read_workflow()['requests']) == {'quotes', 'sector_groups'}
 
 

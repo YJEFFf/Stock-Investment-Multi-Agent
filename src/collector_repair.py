@@ -18,7 +18,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, StrictBool
 
 from src import codex_plan, collector_health as health, collector_routes as routes, notify, run_history
-from src.market_calendar import is_krx_trading_day
+from src.market_calendar import is_krx_trading_day, session_clock
 from src.portfolio_store import portfolio_lock
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -217,8 +217,8 @@ def workflow_finished(stage, *, healthy):
         at = now()
         state = read_workflow()
         day = state["days"].setdefault(at.date().isoformat(), {})
-        in_stage = ((stage == "premarket" and time(7) <= at.time() < time(9))
-                    or (stage == "afterclose" and at.time() >= time(16)))
+        in_stage = ((stage == "premarket" and session_clock(at.date(), 7, 0) <= at.time() < session_clock(at.date(), 9, 0))
+                    or (stage == "afterclose" and at.time() >= session_clock(at.date(), 16, 0)))
         if not healthy:
             day["failed"] = True
         elif in_stage and is_krx_trading_day(at.date()):
@@ -238,24 +238,24 @@ def shadow_ready(state, at):
 
 def repair_window(at=None):
     at = at or now()
-    return not is_krx_trading_day(at.date()) or at.time() < time(6, 40) or at.time() >= time(16, 10)
+    return not is_krx_trading_day(at.date()) or at.time() < time(6, 40) or at.time() >= session_clock(at.date(), 16, 10)
 
 
 def next_repair_time(at=None):
     at = at or now()
-    return at if repair_window(at) else at.replace(hour=16, minute=10, second=0, microsecond=0)
+    return at if repair_window(at) else datetime.combine(at.date(), session_clock(at.date(), 16, 10), health.KST)
 
 
 def attempt_window(at=None):
     at = at or now()
-    slot = "closed_day" if not is_krx_trading_day(at.date()) else ("after_close" if at.time() >= time(16, 10) else "before_open")
+    slot = "closed_day" if not is_krx_trading_day(at.date()) else ("after_close" if at.time() >= session_clock(at.date(), 16, 10) else "before_open")
     return f"{at.date().isoformat()}:{slot}"
 
 
 def current_analysis_blocks(at):
     # A completed morning run is not a reason to postpone after-close repairs.
     # Never clear its history or invoke it again; active runs are excluded by lock.
-    return (is_krx_trading_day(at.date()) and at.time() < time(16, 10)
+    return (is_krx_trading_day(at.date()) and at.time() < session_clock(at.date(), 16, 10)
             and run_history.already_analyzed(at.date().isoformat(), ROOT / "logs/pipeline.jsonl"))
 
 
@@ -273,7 +273,7 @@ def require_publish_window(*, rollback=False):
     at = now()
     # Reserve ten minutes for deployment, read-only checks and a rollback.
     cutoff = time(6, 48) if rollback else time(6, 40)
-    if is_krx_trading_day(at.date()) and cutoff <= at.time() < time(16, 10):
+    if is_krx_trading_day(at.date()) and cutoff <= at.time() < session_clock(at.date(), 16, 10):
         raise RuntimeError("deployment time reserve exhausted")
     if current_analysis_blocks(at):
         raise RuntimeError("analysis already started")
@@ -558,7 +558,8 @@ def repair_disposition(state, at, *, enabled):
 
 
 def scheduled_full(at):
-    return is_krx_trading_day(at.date()) and (at.hour, at.minute) in {(5, 55), (16, 10), (16, 20)}
+    return is_krx_trading_day(at.date()) and at.time().replace(second=0, microsecond=0) in {
+        time(5, 55), session_clock(at.date(), 16, 10), session_clock(at.date(), 16, 20)}
 
 
 def check(*, allow_repair=False, full=False, monitoring=False):
@@ -617,7 +618,7 @@ def check(*, allow_repair=False, full=False, monitoring=False):
         if all_ok and full and time(5, 55) <= at.time() < time(6, 50):
             observation["premarket"] = result["manifest"]
         if (all_ok and full and observation.get("premarket") == result["manifest"] and not observation.get("failed")
-                and is_krx_trading_day(at.date()) and at.time() >= time(16, 10)):
+                and is_krx_trading_day(at.date()) and at.time() >= session_clock(at.date(), 16, 10)):
             if at.date().isoformat() not in state["shadow_days"]:
                 state["shadow_days"].append(at.date().isoformat())
         state["last_check"] = at.isoformat()

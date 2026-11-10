@@ -42,7 +42,8 @@ DECISION_DEADLINE = time(8, 55)  # 09:01 execute_open보다 6분 먼저 실패 �
 
 
 def _seconds_until_deadline(now: datetime) -> float:
-    deadline = datetime.combine(now.date(), DECISION_DEADLINE, tzinfo=KST)
+    from src.market_calendar import session_clock
+    deadline = datetime.combine(now.date(), session_clock(now.date(), 8, 55), tzinfo=KST)
     return (deadline - now).total_seconds()
 
 

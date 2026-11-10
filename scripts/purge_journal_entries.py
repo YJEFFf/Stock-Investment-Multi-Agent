@@ -40,12 +40,8 @@ CRON_WRITE_WINDOW = (time(6, 50), time(15, 55))
 
 
 def _market_hours_now() -> bool:
-    from src.market_calendar import is_krx_trading_day
-
-    now = datetime.now(KST)
-    if not is_krx_trading_day(now.date()):
-        return False
-    return CRON_WRITE_WINDOW[0] <= now.time() < CRON_WRITE_WINDOW[1]
+    from src.market_calendar import deployment_blocked
+    return deployment_blocked(datetime.now(KST))
 
 
 def _matches(row: dict, ticker: str, day: str) -> bool:
@@ -67,12 +63,18 @@ def purge_journals(ticker: str, day: str, *, apply: bool) -> int:
             continue
         backup = path.with_suffix(path.suffix + f".bak-{datetime.now(KST):%Y%m%d-%H%M%S}-purge")
         shutil.copy2(path, backup)
-        path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in keep))
+        from src.order_guard import _atomic_bytes
+        _atomic_bytes(path, "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in keep).encode())
         logger.info("journal_rewritten path=%s backup=%s", path, backup)
     return removed_total
 
 
 def purge_notion(ticker: str, day: str, *, apply: bool) -> int:
+    with portfolio_lock(SYNC_STATE_PATH.with_suffix(".lock")):
+        return _purge_notion(ticker, day, apply=apply)
+
+
+def _purge_notion(ticker: str, day: str, *, apply: bool) -> int:
     """노션 페이지를 아카이브하고 동기화 상태에서 키를 지운다.
 
     상태에서만 지우고 페이지를 두면 노션에 고아 행이 남고, 페이지만 지우고 상태를
@@ -92,6 +94,7 @@ def purge_notion(ticker: str, day: str, *, apply: bool) -> int:
         return len(targets)
 
     archived = 0
+    archived_keys = set()
     for key, meta in sorted(targets.items()):
         page_id = meta.get("page_id")
         if not page_id:
@@ -100,13 +103,15 @@ def purge_notion(ticker: str, day: str, *, apply: bool) -> int:
             logger.error("notion_archive_failed key=%s page_id=%s", key, page_id)
             continue
         archived += 1
+        archived_keys.add(key)
         logger.info("notion_archived key=%s page_id=%s", key, page_id)
 
     backup = SYNC_STATE_PATH.with_suffix(f".json.bak-{datetime.now(KST):%Y%m%d-%H%M%S}-purge")
     shutil.copy2(SYNC_STATE_PATH, backup)
-    state["entries"] = {k: v for k, v in entries.items() if k not in targets}
-    state["synced_keys"] = [k for k in state.get("synced_keys", []) if k not in targets]
-    SYNC_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+    state["entries"] = {k: v for k, v in entries.items() if k not in archived_keys}
+    state["synced_keys"] = [k for k in state.get("synced_keys", []) if k not in archived_keys]
+    from src.order_guard import _atomic_bytes
+    _atomic_bytes(SYNC_STATE_PATH, json.dumps(state, ensure_ascii=False, indent=2).encode())
     logger.info("sync_state_rewritten backup=%s archived=%d", backup, archived)
     return archived
 
@@ -125,8 +130,10 @@ def main() -> int:
         )
         return 2
 
-    rows = purge_journals(args.ticker, args.day, apply=args.apply)
-    pages = purge_notion(args.ticker, args.day, apply=args.apply)
+    from src.portfolio_store import portfolio_lock
+    with portfolio_lock():
+        rows = purge_journals(args.ticker, args.day, apply=args.apply)
+        pages = purge_notion(args.ticker, args.day, apply=args.apply)
     verb = "제거함" if args.apply else "제거 예정 (드라이런)"
     logger.info("purge_done ticker=%s day=%s 로그행=%d 노션=%d %s", args.ticker, args.day, rows, pages, verb)
     return 0

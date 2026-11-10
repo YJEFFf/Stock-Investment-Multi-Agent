@@ -588,3 +588,9 @@ def test_provider_rejection_discards_partial_pending_and_does_not_retry(monkeypa
     assert db.codex_plan.CALL_SESSION.get() is None
     asyncio.run(db.main())
     assert len(calls) == 1
+
+
+@pytest.fixture(autouse=True)
+def initialized_ledger():
+    from src import portfolio_store
+    portfolio_store.save_portfolio(PortfolioState())

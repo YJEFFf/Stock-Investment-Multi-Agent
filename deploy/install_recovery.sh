@@ -6,9 +6,9 @@ cd "$HOME/sima"
 .venv/bin/python - <<'PY'
 from datetime import datetime,time
 from zoneinfo import ZoneInfo
-from src.market_calendar import is_krx_trading_day
+from src.market_calendar import deployment_blocked
 now=datetime.now(ZoneInfo('Asia/Seoul'))
-assert not (is_krx_trading_day(now.date()) and time(6,50)<=now.time()<time(16,10)), 'Deployment window closed'
+assert not (deployment_blocked(now)), 'Deployment window closed'
 PY
 # Copy only the public host, never app credentials, into the supervisor config.
 sudo python3 - <<'PY_HOST'

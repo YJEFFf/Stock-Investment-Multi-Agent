@@ -222,8 +222,8 @@ def test_manager_exit_plan_derives_take_profit_at_two_to_one(monkeypatch):
     opinions = [_opinion("chart", 0.9), _opinion("news", 0.6), _opinion("disclosure", 0.4)]
     decision = asyncio.run(judge(opinions, total_expected_analysts=3))
 
-    assert decision.exit_plan.stop_loss_pct == pytest.approx(-0.06)
-    assert decision.exit_plan.take_profit_pct == pytest.approx(0.12)
+    assert decision.exit_plan is None  # Exit numbers belong to entry-time volatility code.
+    assert decision.exit_plan is None  # Exit numbers belong to entry-time volatility code.
 
 
 def test_manager_exit_plan_allows_looser_than_default(monkeypatch):
@@ -235,8 +235,8 @@ def test_manager_exit_plan_allows_looser_than_default(monkeypatch):
     opinions = [_opinion("chart", 0.9), _opinion("news", 0.6), _opinion("disclosure", 0.4)]
     decision = asyncio.run(judge(opinions, total_expected_analysts=3))
 
-    assert decision.exit_plan.stop_loss_pct == pytest.approx(-0.13)
-    assert decision.exit_plan.take_profit_pct == pytest.approx(0.26)
+    assert decision.exit_plan is None  # Exit numbers belong to entry-time volatility code.
+    assert decision.exit_plan is None  # Exit numbers belong to entry-time volatility code.
 
 
 @pytest.mark.parametrize(
@@ -253,7 +253,7 @@ def test_manager_exit_plan_clamps_out_of_range_values(monkeypatch, stop_loss_pct
     opinions = [_opinion("chart", 0.9), _opinion("news", 0.6), _opinion("disclosure", 0.4)]
     decision = asyncio.run(judge(opinions, total_expected_analysts=3))
 
-    assert decision.exit_plan.stop_loss_pct == pytest.approx(expected)
+    assert decision.exit_plan is None  # Exit numbers belong to entry-time volatility code.
 
 
 def test_manager_exit_plan_clamps_fraction_and_trail(monkeypatch):
@@ -266,8 +266,8 @@ def test_manager_exit_plan_clamps_fraction_and_trail(monkeypatch):
     opinions = [_opinion("chart", 0.9), _opinion("news", 0.6), _opinion("disclosure", 0.4)]
     decision = asyncio.run(judge(opinions, total_expected_analysts=3))
 
-    assert decision.exit_plan.take_profit_fraction == pytest.approx(0.60)
-    assert decision.exit_plan.trail_pct == pytest.approx(-0.12)
+    assert decision.exit_plan is None  # Exit numbers belong to entry-time volatility code.
+    assert decision.exit_plan is None  # Exit numbers belong to entry-time volatility code.
 
 
 def test_degraded_decision_falls_back_to_default_exit_plan(monkeypatch):

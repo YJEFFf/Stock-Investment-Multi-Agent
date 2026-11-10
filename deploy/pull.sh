@@ -23,10 +23,10 @@ uv run python - <<'PY'
 import sys
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
-from src.market_calendar import is_krx_trading_day
+from src.market_calendar import deployment_blocked
 
 now = datetime.now(ZoneInfo("Asia/Seoul"))
-if is_krx_trading_day(now.date()) and time(6, 50) <= now.time() < time(16, 10):
+if deployment_blocked(now):
     print(f"거부: 거래일 장중({now:%H:%M})에는 배포하지 않는다. 16:10 이후에 다시 실행할 것.", file=sys.stderr)
     sys.exit(2)
 PY
@@ -39,30 +39,7 @@ PY
 #   SIMA_REVIEWED=$(git rev-parse --short origin/main) ~/sima/deploy/pull.sh
 # 한계: 이 검사는 리뷰를 **강제**하지 못한다(누구나 해시를 넣을 수 있다). 하는 일은 "무엇을
 # 리뷰했는가"를 명시하게 하고, 검사한 그 커밋만 배포되게 하는 것이다.
-TRADING_PATHS=(
-  src/operating_mode.py src/exit_only.py scripts/monitor_exit_only.py scripts/monitor_exit_only.sh
-  scripts/run_daily.py
-  src/sell.py src/pipeline.py src/kis.py src/collectors.py src/schemas.py src/portfolio_store.py
-  src/notify.py src/judgment.py src/translate.py src/llm.py src/analysts.py
-  src/app_notifications.py
-  src/thesis_shadow.py src/thesis_sources.py src/thesis_evaluation.py
-  prompts/entry_thesis.md prompts/holding_thesis.md scripts/thesis_shadow.py scripts/thesis_shadow.sh
-  src/codex_plan.py scripts/recover_operations.py scripts/check_codex_plan.sh scripts/decide_buys.sh
-  deploy/recover_services.py deploy/install_recovery.sh deploy/sima-recovery.service
-  deploy/sima-recovery.timer deploy/sima-operations.service deploy/sima-logrotate deploy/sima-journald.conf
-  src/order_guard.py src/order_recovery.py
-  scripts/reconcile_portfolio.py scripts/reconcile_check.sh
-  src/run_history.py
-  src/collector_routes.py src/collector_health.py src/collector_repair.py
-  config/collector_routes.json prompts/collector_repair.md prompts/collector_repair_review.md
-  scripts/collector_preflight.py scripts/collector_preflight.sh
-  scripts/execute_open.py scripts/check_stop_loss.py scripts/decide_buys.py scripts/decide_llm_sell.py
-  scripts/check_codex_plan.py
-  scripts/repair_20261005.py
-  scripts/check_stop_loss.sh scripts/execute_open.sh scripts/decide_buys.sh scripts/decide_llm_sell.sh
-  scripts/check_codex_plan.sh
-  deploy/crontab
-)
+TRADING_PATHS=(src/ prompts/ scripts/ deploy/ config/ conftest.py)
 git fetch --quiet origin
 TARGET=$(git rev-parse origin/main)
 CHANGED=$(git diff --name-only HEAD "$TARGET" -- "${TRADING_PATHS[@]}")
@@ -121,9 +98,9 @@ uv run python - <<'PY'
 import sys
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
-from src.market_calendar import is_krx_trading_day
+from src.market_calendar import deployment_blocked
 now = datetime.now(ZoneInfo("Asia/Seoul"))
-if is_krx_trading_day(now.date()) and time(6, 50) <= now.time() < time(16, 10):
+if deployment_blocked(now):
     sys.exit("거부: 검증 중 배포 금지 시간에 진입했다.")
 PY
 git merge --ff-only --quiet "$TARGET"

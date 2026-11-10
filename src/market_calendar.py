@@ -14,7 +14,12 @@ KRX 실시간 시세로 "오늘 거래일인지" 역산하는 방법도 검토�
 2026-08-09). 매년 초 다음 해 일정으로 갱신할 것.
 """
 
-from datetime import date
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+KST = ZoneInfo("Asia/Seoul")
+SUPPORTED_YEARS = frozenset({2026})
 
 KRX_HOLIDAYS_2026: frozenset[date] = frozenset(
     {
@@ -26,6 +31,8 @@ KRX_HOLIDAYS_2026: frozenset[date] = frozenset(
         date(2026, 5, 1),  # 근로자의 날
         date(2026, 5, 5),  # 어린이날
         date(2026, 5, 25),  # 부처님오신날 대체공휴일 (5/24가 일요일)
+        date(2026, 6, 3),  # 전국동시지방선거 (KRX 2026-05-20 공지)
+        date(2026, 7, 17),  # 제헌절 (동일 KRX 공지)
         date(2026, 8, 17),  # 광복절 대체공휴일 (8/15가 토요일)
         date(2026, 9, 24),  # 추석 연휴
         date(2026, 9, 25),  # 추석
@@ -46,3 +53,70 @@ def is_krx_trading_day(day: date) -> bool:
             f"KRX_HOLIDAYS_{day.year}가 없다 — 새해 일정으로 market_calendar.py를 갱신할 것"
         )
     return day not in KRX_HOLIDAYS_2026
+
+
+@dataclass(frozen=True)
+class MarketSession:
+    open: datetime
+    close: datetime
+
+    @property
+    def valuation(self):
+        return self.close + timedelta(minutes=5)
+
+
+def market_session(day: date) -> MarketSession | None:
+    """Unknown calendars raise; callers must not assume an ordinary session."""
+    if day.year not in SUPPORTED_YEARS:
+        raise ValueError(f"KRX calendar unavailable for {day.year}")
+    if not is_krx_trading_day(day):
+        return None
+    # KRX first session / CSAT special sessions. Sources in audit fix report.
+    opening = time(10) if day in {date(2026, 1, 2), date(2026, 11, 19)} else time(9)
+    closing = time(16, 30) if day == date(2026, 11, 19) else time(15, 30)
+    return MarketSession(datetime.combine(day, opening, KST), datetime.combine(day, closing, KST))
+
+
+def previous_session_day(day: date) -> date:
+    day -= timedelta(days=1)
+    while market_session(day) is None:
+        day -= timedelta(days=1)
+    return day
+
+
+def session_clock(day: date, hour: int, minute: int = 0) -> time:
+    """Map a regular-session schedule to this day's announced session.
+
+    Morning jobs retain their offset from open; afternoon jobs from close.
+    Holidays retain wall time, while unknown calendars fail closed.
+    """
+    session = market_session(day)
+    if session is None:
+        return time(hour, minute)
+    anchor = session.open if hour < 12 else session.close
+    normal = 9 * 60 if hour < 12 else 15 * 60 + 30
+    return (anchor + timedelta(minutes=hour * 60 + minute - normal)).time()
+
+
+def deployment_blocked(at: datetime) -> bool:
+    at = at.astimezone(KST)
+    try:
+        session = market_session(at.date())
+    except ValueError:
+        # Allow calendar repair overnight, without assuming an unknown trading day.
+        return at.weekday() < 5 and time(6, 50) <= at.time() < time(18)
+    return bool(session and time(6, 50) <= at.time()
+                and at < session.close + timedelta(minutes=40))
+
+
+def monitor_due(at: datetime) -> datetime | None:
+    """Last minute that should have completed, including the final valuation.
+
+    Remains due overnight/weekends, so a missed close cannot vanish from the UI.
+    """
+    at = at.astimezone(KST)
+    session = market_session(at.date())
+    if session and at >= session.open:
+        due = session.valuation if at >= session.valuation else min(at, session.close)
+        return due.replace(second=0, microsecond=0)
+    return market_session(previous_session_day(at.date())).valuation

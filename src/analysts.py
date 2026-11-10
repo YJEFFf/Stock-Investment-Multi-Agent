@@ -124,6 +124,7 @@ async def chart_analyst(context: MarketContext) -> AnalystOpinion | None:
 
 
 class _NewsAnalysisResponse(BaseModel):
+    sufficient: bool = True
     score: float = Field(ge=-1.0, le=1.0)
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str
@@ -132,23 +133,25 @@ class _NewsAnalysisResponse(BaseModel):
 _NEWS_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
+        "sufficient": {"type": "boolean"},
         "score": {"type": "number"},
         "confidence": {"type": "number"},
         "reasoning": {"type": "string"},
     },
-    "required": ["score", "confidence", "reasoning"],
+    "required": ["sufficient", "score", "confidence", "reasoning"],
     "additionalProperties": False,
 }
 
 
-def _format_news_items(items: list[NewsItem]) -> str:
+def _format_news_items(items: list[NewsItem], as_of: datetime | None = None) -> str:
     if not items:
         return "(없음)"
     lines = []
     for item in items:
         press = item.press or "출처 미상"
         when = item.published_at.isoformat() if item.published_at else "시간 미상"
-        lines.append(f"- [{press}, {when}] {item.title}")
+        age = f", age_days={(as_of - item.published_at).total_seconds() / 86400:.2f}" if as_of and item.published_at else ", age_unknown"
+        lines.append(f"- [{press}, {when}{age}] {item.title}")
     return "\n".join(lines)
 
 
@@ -157,8 +160,8 @@ def _format_news_prompt(template: str, context: NewsContext) -> str:
         ticker=context.ticker,
         sector=context.sector,
         as_of=context.as_of.isoformat(),
-        company_news=_format_news_items(context.company_news),
-        sector_news=_format_news_items(context.sector_news),
+        company_news=_format_news_items(context.company_news, context.as_of),
+        sector_news=_format_news_items(context.sector_news, context.as_of),
     )
 
 
@@ -183,6 +186,9 @@ async def news_analyst(context: NewsContext) -> AnalystOpinion | None:
         json_schema=_NEWS_RESPONSE_SCHEMA,
         label="news",
     )
+
+    if not result.sufficient:
+        return None
 
     return AnalystOpinion(
         agent="news",

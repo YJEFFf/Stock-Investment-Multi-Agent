@@ -67,6 +67,8 @@ async def main() -> None:
     # 여기서 락을 기다리게 만들지 않은 이유는 위와 같다 — 장애 때 프로세스가 쌓인다.
     try:
         with portfolio_lock(blocking=False):
+            from src import order_guard
+            order_guard.recover_commits()
             portfolio = load_portfolio()
             if portfolio.positions:
                 portfolio = await pipeline.evaluate_holdings(portfolio, day, sell.execute_sell_order)

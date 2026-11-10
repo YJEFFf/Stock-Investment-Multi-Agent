@@ -7,6 +7,22 @@ import pytest
 
 from src import kis
 
+
+@pytest.fixture
+def persisted_order_portfolio(monkeypatch):
+    """Execution unit fixtures supply their initial ledger explicitly at begin().
+
+    Persistence/recovery fault tests do not use this fixture; they control disk
+    state themselves. This only prepares the input ledger for arithmetic tests.
+    """
+    from src import order_guard, portfolio_store
+    original = order_guard.begin
+    def begin(*args, **kwargs):
+        if kwargs.get("portfolio") is not None:
+            portfolio_store.save_portfolio(kwargs["portfolio"])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(order_guard, "begin", begin)
+
 REPO_ROOT = Path(__file__).resolve().parent
 OPERATIONAL_LOGS = REPO_ROOT / "logs"
 PRODUCTION_REPO = Path("/home/ubuntu/sima")
@@ -22,10 +38,10 @@ def pytest_sessionstart(session):
     """
     if REPO_ROOT != PRODUCTION_REPO:
         return
-    from src.market_calendar import is_krx_trading_day
+    from src.market_calendar import deployment_blocked
 
     now = datetime.now(ZoneInfo("Asia/Seoul"))
-    if is_krx_trading_day(now.date()) and CRON_WINDOW[0] <= now.time() < CRON_WINDOW[1]:
+    if deployment_blocked(now):
         pytest.exit(f"운영 EC2 거래일 장중({now:%H:%M})에는 테스트를 돌리지 않는다. 16:10 이후에.", returncode=3)
 
 

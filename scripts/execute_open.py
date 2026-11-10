@@ -158,6 +158,9 @@ async def _execute_pending_buys(portfolio, today_kst):
     for item in payload["decisions"]:
         decision = Decision.model_validate(item["decision"])
         gate_result = GateResult.model_validate(item["gate_result"])
+        if gate_result.approved:
+            from src.schemas import RiskGateConfig
+            gate_result = pipeline.check_gate(decision, portfolio, RiskGateConfig(), item["trade_weight"])
         portfolio = await pipeline.execute_buy_order(
             decision, gate_result, portfolio, item["sector"], item["trade_weight"]
         )
@@ -193,6 +196,8 @@ async def main() -> None:
     day = datetime.now(KST)
 
     with portfolio_lock():
+        from src import order_guard
+        order_guard.recover_commits()
         portfolio = load_portfolio()
         logger.info(
             "execute_open_start day=%s cash_weight=%.3f positions=%d",

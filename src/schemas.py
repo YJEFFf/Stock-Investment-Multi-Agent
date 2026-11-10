@@ -91,6 +91,12 @@ class UnconfirmedOrder(BaseModel):
     order_no: str | None = None
     ready_to_commit: bool = False
     expected_position: dict | None = None
+    pending_commit: dict | None = None
+    accounted_quantity: int = Field(default=0, ge=0)
+    accounted_amount: float = Field(default=0, ge=0, allow_inf_nan=False)
+    accounted_fee: float | None = Field(default=0, ge=0, allow_inf_nan=False)
+    initial_portfolio: dict | None = None
+    settlement_context: dict | None = None
 
 
 class OHLCVBar(BaseModel):
@@ -222,11 +228,13 @@ class FillRecord(BaseModel):
     """
 
     quantity: int = Field(gt=0)
-    amount: float = Field(gt=0)  # 실제 체결 총액(원)
+    amount: float = Field(gt=0, allow_inf_nan=False)  # 실제 체결 총액(원)
     complete: bool = True  # 주문 수량만큼 다 잡혔는가. False면 체결이 더 있었는데
     # 조회가 못 따라잡은 것이라 quantity·amount가 실제보다 **작다** (kis.fill_after_order).
     # 이 값으로 판단하는 쪽은 수량을 상태 차이에서 다시 뽑아야 한다.
-    fee: float | None = None  # 이 주문의 위탁수수료(원). 브로커가 주는 값이라 조회 실패나
+    fee: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    order_total_fee: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    # 이 주문의 위탁수수료(원). 브로커가 주는 값이라 조회 실패나
     # 옛 경로에서는 None으로 남는다 — 0.0으로 채우면 "수수료가 없었다"와 "모른다"가
     # 같은 모양이 된다(AnalystOpinion=None과 같은 패턴). 거래세는 여기 안 들어간다:
     # 브로커 응답의 추정제비용(prsm_tlex_smtl)은 매수·매도 양쪽 같은 요율이라
@@ -351,6 +359,8 @@ class ExitOnlyQuote(BaseModel):
     price: float = Field(gt=0, allow_inf_nan=False)
     observed_at: datetime
     source: Literal["kis", "naver", "transition_snapshot"]
+    provider_at: datetime | None = None
+    range_source: Literal["daily", "minute", "snapshot", "unknown"] = "unknown"
 
 
 class ExitOnlySale(BaseModel):
@@ -370,6 +380,8 @@ class ExitOnlySale(BaseModel):
     net_pnl_amount: float = Field(allow_inf_nan=False)
     from_day_range: bool
     quote_source: Literal["kis", "naver"]
+    quote_range_source: Literal["daily", "minute", "snapshot", "unknown"] = "unknown"
+    quote_provider_at: datetime | None = None
 
 
 class ExitOnlyState(BaseModel):
@@ -389,6 +401,8 @@ class ExitOnlyState(BaseModel):
     fee_rate: float = Field(ge=0, allow_inf_nan=False)
     tax_rate: float = Field(ge=0, allow_inf_nan=False)
     quotes: dict[str, ExitOnlyQuote]
+    share_basis: dict[str, dict] = Field(default_factory=dict)
+    basis_warnings: list[str] = Field(default_factory=list)
     sales: list[ExitOnlySale] = Field(default_factory=list)
     outbox: list[AppAlert] = Field(default_factory=list)
     nav_history: list[dict] = Field(default_factory=list)

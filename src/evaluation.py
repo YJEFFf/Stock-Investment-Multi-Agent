@@ -32,7 +32,7 @@ from src.schemas import OHLCVBar
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PRICE_HISTORY_DIR = Path("logs/price_history")
+DEFAULT_PRICE_HISTORY_DIR = Path("logs/price_history_adjusted_v1")
 DEFAULT_IC_SUMMARY_PATH = Path("logs/ic_summary.json")
 
 INDEX_KEY = "KOSPI200"
@@ -108,7 +108,18 @@ def load_decision_entries(log_path: Path) -> list[dict]:
 
 
 def entries_since(entries: list[dict], since: str | None) -> list[dict]:
-    return entries if since is None else [e for e in entries if e["day"] >= since]
+    if since is None:
+        return entries
+    def eligible(entry):
+        if since == SEGMENTS["post_chart_prompt_7a9654"]:
+            versions = [evidence for opinion in entry.get("opinions", []) if opinion.get("agent") == "chart"
+                        for evidence in opinion.get("evidence", []) if evidence.startswith("prompt:chart@")]
+            versions += [opinion["prompt"] for opinion in entry.get("opinions", [])
+                         if opinion.get("agent") == "chart" and opinion.get("prompt")]
+            if versions:
+                return any(v.endswith("7a9654") for v in versions)
+        return entry["day"] >= since
+    return [e for e in entries if eligible(e)]
 
 
 class PriceHistory:
@@ -125,18 +136,37 @@ class PriceHistory:
         if not path.exists():
             return {}
         bars = [OHLCVBar(**row) for row in json.loads(path.read_text())]
+        from src.data_quality import validate_bars
+        if bars:
+            validate_bars(bars)
         return {b.date: b for b in bars}
 
     def merge(self, key: str, bars: list[OHLCVBar]) -> int:
         """새로 추가된 날짜 수를 돌려준다."""
         existing = self.load(key)
-        before = len(existing)
+        from src.data_quality import validate_bars
+        validate_bars(bars)
+        added = len({b.date for b in bars} - existing.keys())
+        overlaps = [b for b in bars if b.date in existing]
+        # A split/revision can restate every price in the returned 100-day window.
+        # Preserve the former epoch, but never join its older raw basis to it.
+        revised = any(any(getattr(b, k) != getattr(existing[b.date], k)
+                          for k in ("open", "high", "low", "close")) for b in overlaps)
+        if existing and (revised or not overlaps):
+            import hashlib
+            from src.order_guard import _atomic_bytes
+            raw = self._path(key).read_bytes()
+            archive = self.directory / "epochs" / f"{key}-{hashlib.sha256(raw).hexdigest()}.json"
+            _atomic_bytes(archive, raw)
+            existing = {}
+            logger.warning("price_history_new_basis key=%s old_epoch=%s", key, archive.name)
         for bar in bars:
             existing[bar.date] = bar
         self.directory.mkdir(parents=True, exist_ok=True)
         ordered = [existing[d].model_dump(mode="json") for d in sorted(existing)]
-        self._path(key).write_text(json.dumps(ordered, ensure_ascii=False))
-        return len(existing) - before
+        from src.order_guard import _atomic_bytes
+        _atomic_bytes(self._path(key), json.dumps(ordered, ensure_ascii=False).encode())
+        return added
 
     def refresh(self, keys: list[str], fetch_fn) -> dict[str, int]:
         """키마다 fetch_fn(key)로 일봉을 받아 합친다. 실패한 키는 건너뛰고 기록한다."""
@@ -159,14 +189,25 @@ def forward_excess_return(
 ) -> float | None:
     """판단일 D 시가 진입 → D+k 거래일 종가 청산 수익률에서 같은 창의 지수 수익률을 뺀 값.
 
-    D가 그 종목의 거래일이 아니면(거래정지 등) 그 이후 첫 거래일을 D로 본다. D+k
-    거래일이 아직 오지 않았거나 지수에 같은 날짜가 없으면 None — 0으로 채우지 않는다.
+    중앙 KRX 달력의 D부터 D+k까지 종목·지수 양쪽 날짜가 모두 있어야 한다.
+    누락되면 None으로 두며 진입일이나 기간을 뒤로 옮기지 않는다.
     """
-    dates = _trading_dates(stock)
-    start = next((i for i, d in enumerate(dates) if d >= day), None)
-    if start is None or start + k >= len(dates):
+    from datetime import timedelta
+    from src.market_calendar import market_session
+    dates = [day]
+    try:
+        if market_session(day) is None or k < 0:
+            return None
+        while len(dates) <= k:
+            cursor = dates[-1] + timedelta(days=1)
+            while market_session(cursor) is None:
+                cursor += timedelta(days=1)
+            dates.append(cursor)
+    except ValueError:
         return None
-    entry_date, exit_date = dates[start], dates[start + k]
+    entry_date, exit_date = dates[0], dates[-1]
+    if any(d not in stock or d not in index for d in dates):
+        return None
     entry_price = stock[entry_date].open
     exit_price = stock[exit_date].close
     if entry_price <= 0:
@@ -182,12 +223,19 @@ def trailing_return(stock: dict[date, OHLCVBar], day: date, lookback: int = MOME
     """판단일 D **직전** 거래일 종가 대비, 그보다 lookback 거래일 전 종가의 수익률.
 
     판단이 07:00에 전일 데이터로 내려지므로 D 당일은 포함하지 않는다."""
-    dates = _trading_dates(stock)
-    start = next((i for i, d in enumerate(dates) if d >= day), None)
-    if start is None or start - 1 - lookback < 0:
+    from src.market_calendar import previous_session_day
+    try:
+        recent_day = previous_session_day(day)
+        past_day = recent_day
+        dates = [recent_day]
+        for _ in range(lookback):
+            past_day = previous_session_day(past_day)
+            dates.append(past_day)
+    except ValueError:
         return None
-    recent = stock[dates[start - 1]].close
-    past = stock[dates[start - 1 - lookback]].close
+    if any(d not in stock for d in dates):
+        return None
+    recent, past = stock[recent_day].close, stock[past_day].close
     if past <= 0:
         return None
     return recent / past - 1

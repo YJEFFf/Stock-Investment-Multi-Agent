@@ -5,12 +5,12 @@ import logging
 import math
 import os
 import uuid
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from src import app_notifications, collectors, kis, notify, sell
-from src.market_calendar import is_krx_trading_day
+from src.market_calendar import market_session, monitor_due, previous_session_day
 from src.portfolio_store import portfolio_lock, PortfolioLockBusy
 from src.schemas import AppAlert, ExitOnlyQuote, ExitOnlySale, ExitOnlyState, PortfolioState
 
@@ -39,6 +39,16 @@ def load(path: Path | None = None) -> ExitOnlyState:
     state = ExitOnlyState.model_validate_json((path or STATE_PATH).read_text())
     original = {p.ticker: p for p in state.source_portfolio.positions}
     current = state.portfolio.positions
+    if set(original) - state.names.keys():
+        raise ValueError("missing original holding name")
+    if any(t not in original for t in [*state.missing_quotes, *state.basis_warnings, *state.share_basis]):
+        raise ValueError("unknown quote/basis ticker")
+    for basis in state.share_basis.values():
+        if (set(basis) != {"listed_shares", "par_value", "day"}
+                or type(basis["listed_shares"]) is not int or basis["listed_shares"] <= 0
+                or (basis["par_value"] is not None and (not math.isfinite(basis["par_value"]) or basis["par_value"] <= 0))):
+            raise ValueError("invalid share basis")
+        datetime.strptime(basis["day"], "%Y-%m-%d")
     if len(original) != len(state.source_portfolio.positions) or len({p.ticker for p in current}) != len(current):
         raise ValueError("duplicate simulation holdings")
     quantities = {t: p.quantity for t, p in original.items()}
@@ -67,6 +77,9 @@ def load(path: Path | None = None) -> ExitOnlyState:
         if (p.ticker not in state.names or p.ticker not in state.quotes
                 or state.quotes[p.ticker].observed_at.tzinfo is None):
             raise ValueError("missing simulation quote or name")
+        q = state.quotes[p.ticker]
+        if q.provider_at is not None and (q.provider_at.tzinfo is None or q.provider_at > q.observed_at):
+            raise ValueError("invalid provider timestamp")
     if bool(state.completed_at) != (not current):
         raise ValueError("inconsistent simulation completion")
     return state
@@ -123,7 +136,8 @@ def apply_quotes(state: ExitOnlyState, quotes: dict, *, at: datetime) -> None:
     at = at.astimezone(KST)
     if at < state.updated_at:
         raise ValueError("simulation clock moved backwards")
-    trading = is_krx_trading_day(at.date()) and time(9) <= at.time() <= time(15, 30, 59)
+    session = market_session(at.date())
+    trading = bool(session and session.open <= at < session.close + timedelta(minutes=1))
     state.last_checked_at = at
     state.missing_quotes = []
     positions = []
@@ -134,11 +148,12 @@ def apply_quotes(state: ExitOnlyState, quotes: dict, *, at: datetime) -> None:
             positions.append(position)
             continue
         quote, source = entry
-        if not valid_quote(quote) or (trading and not quote.traded_today):
+        if not valid_quote(quote, at=at) or not comparable_basis(state, position.ticker, quote, at):
             state.missing_quotes.append(position.ticker)
             positions.append(position)
             continue
-        state.quotes[position.ticker] = ExitOnlyQuote(price=quote.price, observed_at=at, source=source)
+        state.quotes[position.ticker] = ExitOnlyQuote(price=quote.price, observed_at=at, source=source,
+                                                     provider_at=quote.provider_at, range_source=quote.range_source)
         if not trading:
             positions.append(position)
             continue
@@ -146,7 +161,8 @@ def apply_quotes(state: ExitOnlyState, quotes: dict, *, at: datetime) -> None:
         # Keep the imported peak, but only use new observed prices on that one day.
         if at.date() == state.started_at.astimezone(KST).date():
             quote = kis.Quote(price=quote.price, day_high=quote.price, day_low=quote.price,
-                              open_price=quote.open_price, prev_close=quote.prev_close)
+                              open_price=quote.open_price, prev_close=quote.prev_close,
+                              provider_at=quote.provider_at, range_source="snapshot")
         position = sell.update_peak_price(position, quote.price, day_high=quote.day_high, today=at.date())
         action, from_range = sell.evaluate_with_day_range(position, quote, today=at.date())
         if action is None:
@@ -168,6 +184,7 @@ def apply_quotes(state: ExitOnlyState, quotes: dict, *, at: datetime) -> None:
             entry_price=position.entry_price, exit_price=quote.price, sell_amount=amount,
             fee_amount=fee, tax_amount=tax, net_pnl_amount=net,
             from_day_range=from_range, quote_source=source,
+            quote_range_source=quote.range_source, quote_provider_at=quote.provider_at,
         )
         state.sales.append(event)
         state.cash += amount - fee - tax
@@ -202,10 +219,56 @@ def flush_outbox(state: ExitOnlyState, path: Path) -> None:
         save(state, path)
 
 
-def valid_quote(quote: kis.Quote) -> bool:
+def comparable_basis(state: ExitOnlyState, ticker: str, quote: kis.Quote, at: datetime) -> bool:
+    """Hold on share-capital changes; never reinterpret a frozen entry or quantity.
+
+    KIS listed shares supply a basis checkpoint. Secondary quotes can use it only
+    on the same session. A detected change remains latched for explicit review.
+    """
+    if ticker in state.basis_warnings:
+        return False
+    old = state.share_basis.get(ticker)
+    if quote.listed_shares:
+        basis = {"listed_shares": quote.listed_shares, "par_value": quote.par_value,
+                 "day": at.date().isoformat()}
+        if old and (old["listed_shares"] != basis["listed_shares"]
+                    or old.get("par_value") != basis["par_value"]):
+            state.basis_warnings.append(ticker)
+            return False
+        previous = state.quotes[ticker]
+        prior_day = previous_session_day(at.date())
+        if old is None and not (previous.provider_at and previous.provider_at.date() == prior_day
+                               and previous.provider_at >= market_session(prior_day).close
+                               and quote.prev_close and math.isclose(previous.price, quote.prev_close, abs_tol=.01)):
+            state.basis_warnings.append(ticker)
+            return False
+        if previous.provider_at and previous.provider_at.date() == prior_day:
+            previous_session = market_session(previous.provider_at.date())
+            if (previous_session and previous.provider_at >= previous_session.close
+                    and quote.prev_close and not math.isclose(previous.price, quote.prev_close, abs_tol=.01)):
+                state.basis_warnings.append(ticker)
+                return False
+        state.share_basis[ticker] = basis
+        return True
+    return bool(old and old["day"] == at.date().isoformat())
+
+
+def valid_quote(quote: kis.Quote, *, at: datetime | None = None) -> bool:
     try:
-        return (all(math.isfinite(v) for v in (quote.price, quote.day_high, quote.day_low))
-                and quote.price > 0 and quote.day_high >= quote.price >= quote.day_low > 0)
+        valid = (all(math.isfinite(v) for v in (quote.price, quote.day_high, quote.day_low))
+                 and quote.price > 0 and quote.day_high >= quote.price >= quote.day_low > 0)
+        if not valid or at is None:
+            return valid
+        session = market_session(at.astimezone(KST).date())
+        stamped = quote.provider_at
+        if not session or stamped is None or stamped.tzinfo is None:
+            return False
+        # Minute bars are labelled at the beginning of the minute. Illiquid or
+        # unverified prices remain unknown; receipt time is never a trade time.
+        target = min(at, session.close)
+        return (session.open <= stamped <= target
+                and (target - stamped).total_seconds() <= 120
+                and (quote.market_status != "CLOSE" or at >= session.close))
     except (TypeError, ValueError):
         return False  # None high/low is normal before that stock's first opening trade.
 
@@ -218,22 +281,29 @@ async def monitor(*, at: datetime | None = None, path: Path | None = None) -> No
         with portfolio_lock(path.with_suffix(".lock"), blocking=False):
             state = load(path)
             flush_outbox(state, path)
-            if not state.portfolio.positions or not is_krx_trading_day(at.date()):
+            if not state.portfolio.positions:
                 return
+            session = market_session(at.date())
             # Include a closing valuation, but never simulate an after-hours sale.
-            if not time(9) <= at.time() < time(15, 36):
+            if not session or not (session.open <= at < session.close + timedelta(minutes=1)
+                                   or session.valuation <= at < session.valuation + timedelta(minutes=1)):
                 return
-            results = await asyncio.gather(*(
-                asyncio.to_thread(kis.fetch_quote, p.ticker, policy=kis.FAST_FAIL_POLICY)
-                for p in state.portfolio.positions), return_exceptions=True)
+            tasks = [asyncio.create_task(asyncio.to_thread(kis.fetch_quote, p.ticker,
+                     policy=kis.FAST_FAIL_POLICY, verify_time=True)) for p in state.portfolio.positions]
+            done, pending = await asyncio.wait(tasks, timeout=35)
+            for task in pending:
+                task.cancel()
+            results = [t.result() if t in done and not t.cancelled() and t.exception() is None else None
+                       for t in tasks]
             quotes = {p.ticker: (q, "kis") for p, q in zip(state.portfolio.positions, results)
-                      if isinstance(q, kis.Quote) and valid_quote(q)}
+                      if isinstance(q, kis.Quote) and valid_quote(q, at=at if supplied_time else datetime.now(KST))}
             missing = [p.ticker for p in state.portfolio.positions if p.ticker not in quotes]
             if missing:
                 try:
                     fallback = await asyncio.wait_for(asyncio.to_thread(collectors.fetch_naver_quotes, missing), 5)
                     quotes.update({t: (q, "naver") for t, q in fallback.items()
-                                   if t in missing and isinstance(q, kis.Quote) and valid_quote(q)})
+                                   if t in missing and isinstance(q, kis.Quote)
+                                   and valid_quote(q, at=at if supplied_time else datetime.now(KST))})
                 except Exception:
                     logger.exception("exit_only_secondary_quote_failed")
             at = at if supplied_time else datetime.now(KST)

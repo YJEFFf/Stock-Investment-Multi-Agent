@@ -87,7 +87,8 @@ def _prompt_version(template: str) -> str:
 
 
 def _format_opinions(opinions: list[AnalystOpinion]) -> str:
-    return "\n".join(f"- {o.agent}: score={o.score:.3f}, confidence={o.confidence:.3f}" for o in opinions)
+    import json
+    return json.dumps([o.model_dump(mode="json") for o in opinions], ensure_ascii=False)
 
 
 class _DebateResponse(BaseModel):
@@ -174,26 +175,16 @@ class _ManagerResponse(BaseModel):
     reasoning: str
     # 아래 셋은 퍼센트 "크기"(양수)로 받는다 — 부호는 코드가 붙인다. 모델이 음수
     # 부호를 흘리는 실수를 아예 못 하게 하려는 것.
-    stop_loss_pct: float
-    take_profit_fraction: float
-    trail_pct: float
+    stop_loss_pct: float = 8.0
+    take_profit_fraction: float = 1 / 3
+    trail_pct: float = 6.0
 
 
 _MANAGER_RESPONSE_SCHEMA = {
     "type": "object",
-    "properties": {
-        "action": {"type": "string", "enum": ["BUY", "HOLD"]},
-        "reasoning": {"type": "string"},
-        # number에 minimum/maximum을 넣으면 API가 400을 낸다("For 'number' type,
-        # properties maximum, minimum are not supported", 2026-08-15 실호출로 확인).
-        # 범위는 프롬프트 문구로 알려주고, 실제 강제는 _exit_plan_from의 클램핑이
-        # 한다 — 어차피 구조화 출력이 범위를 지킨다고 믿으면 안 되는 자리였다.
-        "stop_loss_pct": {"type": "number"},
-        "take_profit_fraction": {"type": "number"},
-        "trail_pct": {"type": "number"},
-    },
-    "required": ["action", "reasoning", "stop_loss_pct", "take_profit_fraction", "trail_pct"],
-    "additionalProperties": False,
+    "properties": {"action": {"type": "string", "enum": ["BUY", "HOLD"]},
+                   "reasoning": {"type": "string"}},
+    "required": ["action", "reasoning"], "additionalProperties": False,
 }
 
 
@@ -256,7 +247,7 @@ async def portfolio_manager(
     # 일부 빠진 상태에서 나온 판단은 게이트에서 기준을 높인다는 기존 원칙(AGENTS.md
     # 기술 스택)과 같은 방향이다 — 절반만 보고 있는 모델에게 손절선을 넓힐 재량까지
     # 주지는 않는다.
-    exit_plan = None if degraded else _exit_plan_from(result)
+    exit_plan = None  # Entry-time volatility code alone determines the frozen ExitPlan.
 
     return Decision(
         ticker=ticker,

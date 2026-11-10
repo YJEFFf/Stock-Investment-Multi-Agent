@@ -1,6 +1,8 @@
 from datetime import date
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("persisted_order_portfolio")
 from pydantic import ValidationError
 
 from src import kis, sell
@@ -233,10 +235,11 @@ def test_execute_sell_order_falls_back_to_simulated_without_tracked_quantity(mon
 
     updated, _fill = asyncio.run(sell.execute_sell_order(portfolio, action, current_price=90.0))
 
-    assert updated.positions == []  # execute_sell()과 동일한 결과
+    assert updated == portfolio  # Unknown broker shares cannot be simulated away.
 
 
 def test_execute_sell_order_places_real_order_and_updates_quantity(monkeypatch):
+    _confirmed_fill(monkeypatch, 139.5)
     import asyncio
 
     from src.schemas import SellAction
@@ -262,6 +265,7 @@ def test_execute_sell_order_places_real_order_and_updates_quantity(monkeypatch):
 
 
 def test_execute_sell_order_full_exit_sells_all_shares(monkeypatch):
+    _confirmed_fill(monkeypatch, 90.0)
     import asyncio
 
     from src.schemas import SellAction
@@ -282,6 +286,7 @@ def test_execute_sell_order_full_exit_sells_all_shares(monkeypatch):
 
 
 def test_execute_sell_order_liquidates_dust_when_fraction_rounds_to_zero(monkeypatch):
+    _confirmed_fill(monkeypatch, 120.0)
     """부분 익절이 0주로 내림되면 남은 걸 전량 판다.
 
     예전엔 여기서 그냥 돌아갔는데, 그러면 이 포지션은 영원히 청산되지 않는다 —
@@ -313,6 +318,7 @@ def test_execute_sell_order_liquidates_dust_when_fraction_rounds_to_zero(monkeyp
 
 
 def test_execute_sell_order_liquidates_single_share_position(monkeypatch):
+    _confirmed_fill(monkeypatch, 120.0)
     """자투리의 종점 — 1주 남은 포지션에 부분 익절이 걸려도 닫힌다."""
     import asyncio
 
@@ -434,6 +440,7 @@ def test_exit_plan_rejects_out_of_range_values():
 
 
 def test_execute_sell_order_reduces_weight_by_actual_shares_sold(monkeypatch):
+    _confirmed_fill(monkeypatch, 120.0)
     """4주 중 1/3 익절이면 실제로 나가는 건 1주(25%)다. 비중도 25%만 줄어야 매매일지의
     '줄인 비중'이 실제와 맞는다 — 요청값 33.3%로 깎으면 장부가 실제보다 작아진다."""
     import asyncio
@@ -452,6 +459,7 @@ def test_execute_sell_order_reduces_weight_by_actual_shares_sold(monkeypatch):
 
 
 def test_execute_sell_order_survives_float_rounding_on_three_shares(monkeypatch):
+    _confirmed_fill(monkeypatch, 120.0)
     """3주 중 1주: int(3 * (1/3))은 부동소수 오차로 0이 된다. 주식수는 재계산이 아니라
     실제 체결 수량으로 덮어써야 한다."""
     import asyncio
@@ -540,7 +548,7 @@ def test_execute_sell_order_returns_no_fill_when_totals_unavailable(monkeypatch,
         _updated, fill = asyncio.run(sell.execute_sell_order(portfolio, action, current_price=90.0))
 
     assert fill is None
-    assert "fill_unverified" in caplog.text
+    assert "fill_baseline_unavailable" in caplog.text
 
 
 def test_execute_sell_simulated_never_reports_a_fill():
@@ -843,3 +851,9 @@ def test_entry_day_high_does_not_raise_the_peak():
     updated = sell.update_peak_price(position, 281000.0, day_high=297000.0, today=TODAY)
 
     assert updated.peak_price == 281000.0
+
+
+def _confirmed_fill(monkeypatch, price):
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda *a, **kw: (0, 0.0, None))
+    monkeypatch.setattr(kis, "fill_after_order", lambda ticker, day, side, before, quantity:
+                        FillRecord(quantity=quantity, amount=quantity * price))

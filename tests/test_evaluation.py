@@ -19,7 +19,7 @@ def _series(start: date, rows: list[tuple[float, float]]) -> dict[date, OHLCVBar
     out: dict[date, OHLCVBar] = {}
     d = start
     for o, c in rows:
-        while d.weekday() >= 5:
+        while not __import__("src.market_calendar", fromlist=["is_krx_trading_day"]).is_krx_trading_day(d):
             d += timedelta(days=1)
         out[d] = OHLCVBar(date=d, open=o, high=max(o, c), low=min(o, c), close=c, volume=1000)
         d += timedelta(days=1)
@@ -118,7 +118,7 @@ def test_a_halted_decision_day_enters_on_the_next_trading_day():
     stock = _series(MON + timedelta(days=1), [(200, 210), (211, 220)])
     index = _series(MON, [(1000, 1000), (1000, 1000), (1000, 1000)])
 
-    assert evaluation.forward_excess_return(stock, index, MON, 1) == pytest.approx(220 / 200 - 1)
+    assert evaluation.forward_excess_return(stock, index, MON, 1) is None
 
 
 # --- trailing_return ---
@@ -219,7 +219,7 @@ def test_price_history_accumulates_beyond_the_brokers_100_day_window(tmp_path):
     선행수익률을 못 구한다."""
     history = evaluation.PriceHistory(tmp_path)
     old = list(_series(MON, [(100, 100)] * 3).values())
-    new = list(_series(MON + timedelta(days=2), [(200, 200)] * 3).values())
+    new = list(_series(MON + timedelta(days=2), [(100, 100), (200, 200), (200, 200)]).values())
 
     assert history.merge("A", old) == 3
     added = history.merge("A", new)
@@ -227,7 +227,8 @@ def test_price_history_accumulates_beyond_the_brokers_100_day_window(tmp_path):
     bars = history.load("A")
     assert added == 2  # 겹친 하루는 새로 센 게 아니다
     assert len(bars) == 5
-    assert bars[sorted(bars)[2]].close == 200  # 같은 날짜는 새 값으로 덮는다
+    assert bars[sorted(bars)[2]].close == 100  # 겹치는 날은 같은 주가 기준
+    assert bars[sorted(bars)[3]].close == 200
 
 
 def test_price_history_refresh_skips_failed_fetches(tmp_path):

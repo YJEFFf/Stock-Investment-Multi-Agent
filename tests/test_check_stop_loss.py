@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import scripts.check_stop_loss as csl
 from src import kis, portfolio_store
-from src.schemas import PortfolioState, Position
+from src.schemas import FillRecord, PortfolioState, Position
 
 
 def test_noop_when_not_trading_day(monkeypatch, tmp_path):
@@ -50,7 +50,7 @@ def test_deterministic_only_no_llm_and_persists_result(monkeypatch, tmp_path):
 
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 89.0)  # -11%, 손절 트리거
 
-    position = Position(ticker="005930", sector="반도체", weight=0.10, entry_price=100.0, peak_price=100.0)
+    position = Position(ticker="005930", sector="반도체", weight=0.10, entry_price=100.0, peak_price=100.0, quantity=10)
     portfolio_store.save_portfolio(PortfolioState(cash_weight=0.90, positions=[position]))
 
     def fail_analyst_builder(*a, **k):
@@ -58,6 +58,9 @@ def test_deterministic_only_no_llm_and_persists_result(monkeypatch, tmp_path):
 
     monkeypatch.setattr(csl.pipeline, "make_combined_analyst_fn", fail_analyst_builder)
 
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda *a, **k: (0, 0.0, 0.0))
+    monkeypatch.setattr(kis, "place_market_sell_order", lambda *a: "s1")
+    monkeypatch.setattr(kis, "fill_after_order", lambda *a, **k: FillRecord(quantity=10, amount=890, complete=True))
     asyncio.run(csl.main())
 
     saved = portfolio_store.load_portfolio()

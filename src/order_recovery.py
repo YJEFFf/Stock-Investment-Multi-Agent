@@ -11,7 +11,7 @@ import json
 import logging
 import math
 import os
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -217,6 +217,14 @@ def recover_pending_buy(now: datetime, *, ticker: str | None = None, extended: b
 
 def recover_pending_order(now: datetime) -> bool:
     """미확인 주문을 순환 대조한다. 한 회차 한 종목, 주문 재전송 없음."""
+    try:
+        with portfolio_store.portfolio_lock(blocking=False):
+            order_guard.recover_commits()
+    except portfolio_store.PortfolioLockBusy:
+        return False
+    candidates = sorted(t for t, o in order_guard.load_orders().items() if o.settlement_context is not None)
+    if candidates:
+        return recover_observed_fill(now, candidates[int(now.timestamp() // 60) % len(candidates)])
     _flush_recovery_alerts()
     if os.getenv("SIMA_EXTENDED_ORDER_RECOVERY", "0") != "1":
         return recover_pending_buy(now)
@@ -232,16 +240,142 @@ def recover_pending_order(now: datetime) -> bool:
     return _recover_sell(now, ticker)
 
 
+def recover_observed_fill(now, ticker, *, policy=None):
+    """New orders: complete only when original totals AND full holdings reconcile.
+
+    Partial/cancelled/ambiguous orders stay blocked. This never submits an order or
+    recalculates its frozen exit plan. The remaining confirmed leg is journalled.
+    """
+    from src.schemas import PortfolioState, Position, FillRecord, SellAction
+    from src import pipeline, sell
+    import asyncio
+    policy = policy or QUERY_POLICY
+    order = order_guard.load_orders().get(ticker)
+    if (order is None or not order.order_no or order.initial_portfolio is None
+            or order.settlement_context is None or order.fills_before is None):
+        return False
+    context = order.settlement_context
+    day = order.created_at.astimezone(KST).date()
+    if day > now.astimezone(KST).date():
+        return False
+    totals = kis.fetch_daily_fill_totals(ticker, day, order.side, policy=policy)
+    cumulative = kis.fill_between(order.fills_before, totals)
+    if cumulative is None or cumulative.quantity != order.quantity:
+        return False
+    quantity = cumulative.quantity - order.accounted_quantity
+    amount = cumulative.amount - order.accounted_amount
+    if quantity <= 0 or amount <= 0:
+        return False
+    fee = cumulative.fee - order.accounted_fee if cumulative.fee is not None and order.accounted_fee is not None else None
+    if fee is not None and fee < 0:
+        return False
+    opposite = kis.fetch_daily_fill_totals(ticker, day, "sell" if order.side == "buy" else "buy",
+                                          policy=policy)
+    if opposite is None or opposite[:2] != (0, 0.0):
+        return False
+    holdings = kis.fetch_holdings(policy=policy, require_complete=True)
+    if holdings is None:
+        return False
+    baseline = PortfolioState.model_validate(order.initial_portfolio)
+    initial = next((p for p in baseline.positions if p.ticker == ticker), None)
+    original_quantity = initial.quantity if initial else 0
+    if original_quantity is None:
+        return False
+    expected_quantity = original_quantity + order.quantity * (1 if order.side == "buy" else -1)
+    held = holdings.get(ticker)
+    if (held[0] if held else 0) != expected_quantity:
+        return False
+    if order.side == "buy":
+        expected_price = ((initial.entry_price * original_quantity if initial else 0) + cumulative.amount) / expected_quantity
+        if not held or abs(held[1] - expected_price) > .001:
+            return False
+    elif held and (not initial or abs(held[1] - initial.entry_price) > .001):
+        return False
+    try:
+        with portfolio_store.portfolio_lock(blocking=False):
+            if order_guard.load_orders().get(ticker) != order:
+                return False
+            current = portfolio_store.load_portfolio()
+            position = next((p for p in current.positions if p.ticker == ticker), None)
+            observed = position.model_dump(mode="json", exclude={"peak_price", "peak_reset_day"}) if position else None
+            if observed != order.expected_position:
+                return False
+            # Previously committed legs must still exist unchanged.
+            for entry in context.get("last_entries", []):
+                rows = [json.loads(line) for line in Path(entry["path"]).read_text().splitlines() if line.strip()]
+                if [r for r in rows if r.get("event_id") == entry["row"]["event_id"]] != [entry["row"]]:
+                    return False
+            fill = FillRecord(quantity=quantity, amount=amount, fee=fee, order_total_fee=cumulative.fee)
+            if order.side == "buy":
+                weight = context["trade_weight"] * quantity / order.quantity
+                if position:
+                    updated_position = position.model_copy(update={
+                        "quantity": position.quantity + quantity,
+                        "entry_price": (position.entry_price * position.quantity + amount) / (position.quantity + quantity),
+                        "weight": position.weight + weight,
+                        "peak_price": max(position.peak_price or fill.price, fill.price),
+                    })
+                else:
+                    updated_position = Position(ticker=ticker, sector=context["sector"], weight=weight,
+                        quantity=quantity, entry_day=context["day"], entry_price=fill.price, peak_price=fill.price,
+                        exit_plan=context["exit_plan"])
+                updated = PortfolioState(positions=[p for p in current.positions if p.ticker != ticker] + [updated_position],
+                                         cash_weight=current.cash_weight - weight)
+                row = {"event": "buy", "day": context["day"], "ticker": ticker,
+                       "sector": context["sector"], "quantity": quantity, "entry_price": fill.price,
+                       "entry_price_source": "fill", "fee_amount": fee, "order_no": order.order_no,
+                       "order_total_fee": cumulative.fee,
+                       "decision": context["decision"], "recovery": True,
+                       "exit_plan": updated_position.exit_plan.model_dump(mode="json") if updated_position.exit_plan else None,
+                       "exit_plan_source": context["exit_plan_source"]}
+                order_guard.commit_effect(ticker, current, updated, [(context["log_path"], row)],
+                                          complete=True, quantity=quantity, amount=amount, fee=fee)
+            else:
+                if position is None or quantity > position.quantity:
+                    return False
+                action = SellAction.model_validate(context["action"])
+                action = action.model_copy(update={"sell_fraction": quantity / position.quantity, "reasoning": None})
+                updated = sell.execute_sell(current, action, fill.price, today=day)
+                if order.accounted_quantity and action.reason == "take_profit_trail":
+                    for p in updated.positions:
+                        if p.ticker == ticker:
+                            p.take_profit_stage = position.take_profit_stage
+                            p.peak_price, p.peak_reset_day = position.peak_price, position.peak_reset_day
+                for p in updated.positions:
+                    if p.ticker == ticker:
+                        p.quantity = position.quantity - quantity
+                async def verified(*args):
+                    return updated, fill
+                # All legs belong to the original trigger, not a newly evaluated
+                # trailing decision after the first partial fill advanced stage.
+                event_position = position.model_copy(update={"take_profit_stage": initial.take_profit_stage})
+                journal = Path(context["last_entries"][0]["path"]) if context.get("last_entries") else JOURNAL_PATH
+                asyncio.run(pipeline.finalize_sell(current, action, event_position, fill.price,
+                    now.astimezone(KST), verified,
+                    pipeline.DEFAULT_SELL_LOG_PATH, journal))
+            return True
+    except portfolio_store.PortfolioLockBusy:
+        return False
+
+
 def recover_after_close(now: datetime) -> list[str]:
     """장후 대조 전 한 번씩 조회한다. 장중 2초 예산과 주문 경로는 그대로다."""
     now = now.astimezone(KST)
-    if now.time() < time(15, 40):
+    from src.market_calendar import market_session
+    session = market_session(now.date())
+    if session and now < session.close + timedelta(minutes=10):
         raise RuntimeError("extended reconciliation is only allowed after 15:40 KST")
+    with portfolio_store.portfolio_lock():
+        order_guard.recover_commits()
     _flush_recovery_alerts()
     if os.getenv("SIMA_EXTENDED_ORDER_RECOVERY", "0") != "1":
         return []
     recovered = []
     for ticker, order in list(order_guard.load_orders().items()):
+        if order.settlement_context is not None:
+            if recover_observed_fill(now, ticker, policy=CLOSE_QUERY_POLICY):
+                recovered.append(ticker)
+            continue
         if order.ready_to_commit or order.created_at.astimezone(KST).date() > now.date():
             continue
         success = (recover_pending_buy(now, ticker=ticker, extended=True, policy=CLOSE_QUERY_POLICY)

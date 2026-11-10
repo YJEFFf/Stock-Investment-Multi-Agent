@@ -8,10 +8,6 @@
 # (docs/CHANGELOG.md 2026-08-20 항목).
 
 # 2026-11-09 사용자 결정: 기존 보유분만 가상 매도 기록. 신규 분석·증권사 주문 없음.
-# 09:00–15:30 매분 — 남은 보유종목 시세 조회 → 고정 ExitPlan 판정 → 별도 장부·앱 알림.
-# 휴장일·전량 청산 이후에는 시세 API를 호출하지 않는다. 실행 중복은 장부 잠금으로 차단.
-* 9-14 * * 1-5  /bin/bash /home/ubuntu/sima/scripts/monitor_exit_only.sh
-0-30 15 * * 1-5 /bin/bash /home/ubuntu/sima/scripts/monitor_exit_only.sh
-
-# 15:35 — 종가 평가만 갱신. 장외 가상 매도는 하지 않는다.
-35 15 * * 1-5   /bin/bash /home/ubuntu/sima/scripts/monitor_exit_only.sh
+# 매분 실행하되 실제 조회는 날짜별 정규장과 종가 평가 시각에만 한다.
+# 수능일 10:00–16:30/16:35도 같은 중앙 달력을 사용한다.
+* 9-16 * * 1-5 /bin/bash /home/ubuntu/sima/scripts/monitor_exit_only.sh

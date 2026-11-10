@@ -35,7 +35,7 @@ def test_headroom_exercises_the_position_limit_on_the_largest_holding():
 def test_headroom_reports_a_broken_gate_when_nothing_rejects():
     loose = RiskGateConfig(position_limit=1.0, total_exposure_limit=100.0)
     h = pipeline.gate_headroom(PortfolioState(cash_weight=1.0), config=loose)
-    assert h["rejected_by"] is None and h["new_buys_until_reject"] == pipeline.GATE_HEADROOM_MAX_PROBES
+    assert h["rejected_by"] == "invalid_gate_config" and h["new_buys_until_reject"] == 0
 
 
 def test_headroom_never_touches_the_decision_log():

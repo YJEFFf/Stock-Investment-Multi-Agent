@@ -22,6 +22,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import scripts.run_daily as rd
+from src import pipeline, judgment, sell, portfolio_store
+from src.schemas import RiskGateConfig
 from src import analysts, collectors, kis
 from src.schemas import DisclosureItem, NewsItem, OHLCVBar, PortfolioState, Position
 
@@ -37,7 +39,7 @@ def _flat_bars(n: int = 60, close: float = 70000.0) -> list[OHLCVBar]:
     for i in range(n):
         volume = 5000 if i == n - 1 else 1000
         bars.append(
-            OHLCVBar(date=date(2026, 1, 1) + timedelta(days=i), open=close, high=close, low=close, close=close, volume=volume)
+            OHLCVBar(date=datetime.now(collectors.ZoneInfo("Asia/Seoul")).date() - timedelta(days=n - i), open=close, high=close, low=close, close=close, volume=volume)
         )
     return bars
 
@@ -111,7 +113,7 @@ def test_full_daily_workflow_sell_then_buy_end_to_end(monkeypatch, tmp_path):
             NewsItem(
                 title="테스트 뉴스",
                 press="테스트",
-                published_at=datetime(2026, 1, 10, tzinfo=timezone.utc),
+                published_at=datetime.now(timezone.utc) - timedelta(hours=1),
                 url="https://example.test/news",
             )
         ],
@@ -174,7 +176,18 @@ def test_full_daily_workflow_sell_then_buy_end_to_end(monkeypatch, tmp_path):
     monkeypatch.delenv("NOTION_TRADE_JOURNAL_DB_ID", raising=False)
     monkeypatch.delenv("NOTION_DAILY_REPORT_DB_ID", raising=False)
 
-    asyncio.run(rd.main())
+    async def workflow():
+        day = datetime.now(collectors.ZoneInfo("Asia/Seoul"))
+        with portfolio_store.portfolio_lock():
+            portfolio = portfolio_store.load_portfolio()
+            portfolio = await pipeline.evaluate_holdings(portfolio, day, sell.execute_sell_order)
+            portfolio_store.save_portfolio(portfolio)
+            analyst = pipeline.make_combined_analyst_fn([
+                pipeline.make_chart_analyst_fn(), pipeline.make_news_analyst_fn(), pipeline.make_disclosure_analyst_fn()])
+            portfolio, _ = await pipeline.run_daily(day, portfolio, RiskGateConfig(), analyst,
+                judgment.judge, pipeline.execute_buy_order, total_expected_analysts=3)
+            portfolio_store.save_portfolio(portfolio)
+    asyncio.run(workflow())
 
     # --- 결과 검증: 최종 포트폴리오 ---
     final_portfolio = rd._load_portfolio()

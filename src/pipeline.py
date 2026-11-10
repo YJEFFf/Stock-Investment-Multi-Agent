@@ -218,6 +218,17 @@ def check_gate(
     if decision.degraded:
         return GateResult(approved=False, rejected_by="degraded_analysis")
 
+    from src.data_quality import validate_portfolio
+    import math
+    if not all(math.isfinite(v) and 0 < v <= 1 for v in (config.position_limit, config.total_exposure_limit)):
+        return GateResult(approved=False, rejected_by="invalid_gate_config")
+    try:
+        validate_portfolio(portfolio)
+        if not math.isfinite(trade_weight) or not 0 < trade_weight <= 1:
+            raise ValueError("invalid trade weight")
+    except ValueError:
+        return GateResult(approved=False, rejected_by="invalid_portfolio")
+
     existing = next((p for p in portfolio.positions if p.ticker == decision.ticker), None)
     existing_weight = existing.weight if existing else 0.0
     if existing_weight + trade_weight > config.position_limit:
@@ -301,6 +312,13 @@ async def execute_buy_order(
     # 돌면 그날 기록이 통째로 하루 전으로 밀린다 — _kst_today docstring의 832fb8b와
     # 같은 버그다. 같은 함수가 원장 조회에는 이미 _kst_today()를 쓰고 있었다.
     today = _kst_today()
+    decision_id = order_guard.buy_decision_id(decision, today)
+    if order_guard.decision_consumed(decision_id):
+        _log_buy_skip(log_path, today, ticker, "decision_already_submitted")
+        return portfolio
+    if any(p.quantity is None or p.entry_price is None for p in portfolio.positions):
+        _log_buy_skip(log_path, today, ticker, "portfolio_quantity_unavailable")
+        return portfolio
 
     # 30거래일을 받는다(같은 API 호출, KIS가 100일을 주고 뒤에서 자른다). 갭 체크는 여전히
     # 마지막 봉만 쓰고, 나머지는 출구 규칙의 20일 변동성(sell.volatility_exit_plan) 계산용이다.
@@ -375,7 +393,16 @@ async def execute_buy_order(
         _log_buy_skip(log_path, today, ticker, "unconfirmed_previous_order")
         return portfolio
     fills_before = await asyncio.to_thread(kis.fetch_daily_fill_totals, ticker, _kst_today(), "buy")
-    order_guard.begin(ticker, "buy", quantity, fills_before)
+    if fills_before is None:
+        _log_buy_skip(log_path, today, ticker, "fill_baseline_unavailable")
+        return portfolio
+    order_guard.begin(ticker, "buy", quantity, fills_before, portfolio=portfolio, context={
+        "decision_id": decision_id,
+        "sector": sector, "trade_weight": trade_weight, "day": today.isoformat(),
+        "exit_plan": volatility_plan.model_dump(mode="json") if volatility_plan else None,
+        "decision": decision.model_dump(mode="json"), "log_path": str(log_path.resolve()),
+        "gap_pct": gap_pct, "exit_plan_source": exit_plan_source, "exit_plan_sigma_20d_pct": sigma_20d_pct,
+    })
 
     try:
         order_no = await asyncio.to_thread(kis.place_market_buy_order, ticker, quantity)
@@ -408,53 +435,28 @@ async def execute_buy_order(
     fill = await asyncio.to_thread(
         kis.fill_after_order, ticker, _kst_today(), "buy", fills_before, quantity
     )
-    if order_no is None and fill is None:
+    if fill is not None and fill.quantity > quantity:
+        logger.error("execute_buy_order_ambiguous_excess_fill ticker=%s", ticker)
+        return portfolio
+    if fill is not None:
+        fill = fill.model_copy(update={"complete": fill.quantity == quantity})
+    if fill is None:
         # 원장 조회 실패/지연은 미접수 증거가 아니다. 이후 회차도 재전송을 차단한다.
-        logger.error("execute_buy_order_failed ticker=%s reason=order_response_lost", ticker)
+        logger.error("execute_buy_order_failed ticker=%s reason=fill_unverified", ticker)
         _log_buy_skip(log_path, today, ticker, "order_response_lost")
         notify.send_telegram_alert(notify.format_error_alert(
             "매수 주문 확인 필요 — 해당 종목 추가 주문 차단", f"ticker={ticker}; 원장·보유 수량 대조 필요"
         ))
         return portfolio
 
-    if order_no is None and fill is not None and not fill.complete:
+    if fill is not None and not fill.complete:
         # 응답 유실 뒤 일부 체결만 보이면 확인된 수량은 장부에 남긴다. 나머지는
         # 미체결/조회 지연 중 무엇인지 모르므로 마커는 해제하지 않는다.
         trade_weight *= fill.quantity / quantity
         quantity = fill.quantity
 
-    fill_price = fill.price if fill is not None else None
-    # 체결 조회가 주문 수량을 다 따라잡았는지로 갈라 적는다. 부분 체결이어도 평균가는
-    # 실제 체결의 일부라 호가보다 훨씬 낫지만, 여러 단가로 나뉜 주문의 앞부분만 본
-    # 값이라 오차가 포지션 수명 내내 진입가에 남는다 — 그 사실을 라벨에 남기지 않으면
-    # 나중에 매매일지만 보고는 어떤 진입가가 전체 평균이고 어떤 게 앞부분 몇 %짜리인지
-    # 구분할 수 없다. 2026-08-28 300720이 488주 중 95주(19.5%)만 잡힌 채 "fill"로
-    # 기록됐고, 실제 전량 평균과 -0.04% 어긋난 걸 마감 후 reconcile로야 알았다.
-    # 매도 경로(finalize_sell)는 처음부터 이렇게 갈라 적고 있었다.
-    entry_price_source = "fill" if fill is None or fill.complete else "fill_partial"
-    if fill_price is None:
-        # 전후 집계 차를 못 구한 경우(조회 실패 등) — 그날 매수 집계 평균으로 물러선다.
-        # 같은 날 추가매수가 있으면 섞이지만, 호가보다는 훨씬 낫다.
-        fill_price = await asyncio.to_thread(kis.fetch_fill_price, ticker, _kst_today())
-        entry_price_source = "daily_avg"
-    if fill_price is None:
-        # 체결 직후라 일별체결 집계에 아직 안 잡혔을 수 있다 — 잔고의 매입평균가가
-        # 2차 출처다. 방금 산 종목이라 보유분 평균가 = 이 주문의 체결가다.
-        fill_price = await asyncio.to_thread(kis.fetch_position_avg_price, ticker)
-        entry_price_source = "position_avg"
-    if fill_price is None:
-        # 체결가를 끝내 못 구했다. 그래도 주문은 이미 나갔으므로 포지션을 리스크
-        # 관리 대상에서 빼지는 않는다(entry_price=None이면 매도 평가 자체가 스킵된다).
-        # 대신 호가 근사치임을 로그와 매매일지에 남겨 나중에 구분할 수 있게 한다.
-        fill_price = current_price
-        entry_price_source = "quote_fallback"
-        logger.error(
-            "execute_buy_order_entry_price_unverified ticker=%s reason=fill_and_balance_both_unavailable "
-            "using_quote=%.2f",
-            ticker,
-            current_price,
-        )
-    entry_price = fill_price
+    entry_price_source = "fill" if fill.complete else "fill_partial"
+    entry_price = fill.price
 
     positions = [p.model_copy() for p in portfolio.positions]
     existing = next((p for p in positions if p.ticker == ticker), None)
@@ -501,9 +503,7 @@ async def execute_buy_order(
             )
         )
 
-    _append_log(
-        log_path,
-        {
+    buy_row = {
             "event": "buy",
             "day": today.isoformat(),
             "ticker": ticker,
@@ -522,6 +522,7 @@ async def execute_buy_order(
             # 이 값을 포지션에 안 들고 있어서다 — 여기 남겨두면 나중에 일지끼리
             # 맞춰 실제 값으로 되짚을 수 있다. None이면 조회를 못 한 것이지 0원이 아니다.
             "fee_amount": fill.fee if fill is not None else None,
+            "order_total_fee": fill.order_total_fee if fill is not None else None,
             "order_no": order_no,
             "gap_pct": round(gap_pct, 4),
             # 이 포지션에 박힌 출구 규칙(2026-09-14부터 코드가 변동성으로 정한다). None이면
@@ -537,23 +538,15 @@ async def execute_buy_order(
             # 매니저가 낸 출구 규칙 — 포지션엔 안 쓰고 비교용으로만 남긴다.
             "manager_exit_plan": decision.exit_plan.model_dump(mode="json") if decision.exit_plan else None,
             "decision": decision.model_dump(mode="json"),
-        },
-    )
+        }
+    updated = PortfolioState(positions=positions, cash_weight=portfolio.cash_weight - trade_weight)
+    order_guard.commit_effect(ticker, portfolio, updated, [(log_path, buy_row)],
+                              complete=fill.complete, quantity=quantity, amount=fill.amount, fee=fill.fee)
     # decision.reason은 영어 그대로 로그에 남고(위 _append_log), 텔레그램에 보일
     # 때만 번역한다(src/translate.py, 사용자 요청 2026-08-13).
     reason_ko = await translate.to_korean(decision.reason, label="translate_buy_reason")
     notify.send_telegram_alert(notify.format_buy_alert(display_name(ticker), entry_price, quantity, reason_ko))
 
-    updated = PortfolioState(
-        positions=positions,
-        cash_weight=portfolio.cash_weight - trade_weight,
-    )
-    if fill is not None and fill.complete:
-        order_guard.mark_settled(ticker, updated)
-    else:
-        notify.send_telegram_alert(notify.format_error_alert(
-            "매수 체결 확인 미완료 — 원장 대조까지 추가 주문 차단", f"ticker={ticker}"
-        ))
     return updated
 
 
@@ -680,8 +673,13 @@ def make_news_analyst_fn(news_limit: int = 10) -> AnalystFn:
                             latest=max((n.published_at for n in company_news or [] if n.published_at), default=None))
         run_history.observe(ticker, "sector_news", sector_news, required=False,
                             latest=max((n.published_at for n in sector_news or [] if n.published_at), default=None))
-        if company_news is None and sector_news is None:
+        if company_news is None:
             return []
+
+        # Freeze this run's information cutoff. Later sequential collections cannot
+        # introduce information that postdates the decision's declared as_of.
+        company_news = [n for n in company_news if n.published_at is None or n.published_at <= day]
+        sector_news = [n for n in sector_news or [] if n.published_at is None or n.published_at <= day]
 
         context = NewsContext(
             ticker=ticker,
@@ -871,6 +869,10 @@ async def build_universe_with_sectors() -> list[tuple[str, str]] | None:
         sector_map = {}
 
     run_history.observe("", "sector_map", sector_map or None, required=False)
+    for code, _name in universe:
+        if not sector_map.get(code, "").strip():
+            run_history.observe(code, "sector_classification", None, required=False)
+            logger.warning("sector_classification_unavailable ticker=%s", code)
 
     return [(code, sector_map.get(code, "")) for code, _name in universe]
 
@@ -1142,8 +1144,10 @@ def _log_quote_freshness_at_open(quote_by_ticker: dict[str, kis.Quote]) -> None:
 
     개장 창 밖에서는 아무것도 안 남긴다 — 매분 390회씩 찍으면 로그가 이걸로 덮인다.
     """
-    start, end = QUOTE_FRESHNESS_WINDOW
-    if not (start <= datetime.now(KST).time() < end):
+    from src.market_calendar import session_clock
+    at = datetime.now(KST)
+    start, end = (session_clock(at.date(), t.hour, t.minute) for t in QUOTE_FRESHNESS_WINDOW)
+    if not (start <= at.time() < end):
         return
 
     for ticker, quote in quote_by_ticker.items():
@@ -1204,9 +1208,12 @@ def _apply_secondary_quotes(
 
 async def _check_secondary_quote_agreement(quote_by_ticker: dict[str, kis.Quote]) -> None:
     """섀도 기간 09:02·15:20에 KIS와 네이버 현재가를 같은 순간에 대조한다."""
-    now = datetime.now(KST).time()
+    from src.market_calendar import session_clock
+    at = datetime.now(KST)
+    now = at.time()
     phase = next(
-        (name for name, start, end in SECONDARY_QUOTE_AGREEMENT_WINDOWS if start <= now < end),
+        (name for name, start, end in SECONDARY_QUOTE_AGREEMENT_WINDOWS
+         if session_clock(at.date(), start.hour, start.minute) <= now < session_clock(at.date(), end.hour, end.minute)),
         None,
     )
     if not quote_by_ticker or phase is None:
@@ -1496,7 +1503,7 @@ def _trade_costs(
         return empty
 
     if fill is not None and fill.fee is not None and fill.quantity:
-        if fill.complete:
+        if fill.quantity == shares_sold:
             fee, fee_source = fill.fee, "fill"
         else:
             # 관측된 수량 몫의 수수료만 잡혔다 — 실제 매도 수량으로 비례 확대한다.
@@ -1536,6 +1543,7 @@ async def finalize_sell(
     이 함수를 공유한다 — "액션이 이미 정해졌을 때 어떻게 집행하고 남기는가"는
     판단이 언제 내려졌는지와 무관하게 항상 같아야 한다.
     """
+    before_portfolio = portfolio
     portfolio, fill = await sell_execute_fn(portfolio, action, current_price)
     after = next((p for p in portfolio.positions if p.ticker == action.ticker), None)
     if fill is None and after is not None and after.quantity == position.quantity and after.weight == position.weight:
@@ -1610,9 +1618,7 @@ async def finalize_sell(
     holding_days = (day.date() - position.entry_day).days if position.entry_day else None
     sell_amount = _sell_amount(fill, shares_sold, current_price)
     costs = _trade_costs(fill, shares_sold, sell_amount, position.entry_price)
-    _append_log(
-        trade_journal_log_path,
-        {
+    sell_row = {
             "event": "sell",
             "day": day.date().isoformat(),
             "ticker": position.ticker,
@@ -1652,18 +1658,24 @@ async def finalize_sell(
             # 평균 단가에 실제 매도 수량을 곱해 되세운다.
             "sell_amount": sell_amount,
             "sell_amount_source": (
-                "fill" if fill_covers_order else ("estimated" if fill is not None else "quote_fallback")
+                "fill" if fill_covers_order else ("fill_partial" if fill is not None else "quote_fallback")
             ),
             # 위 realized_pnl_pct는 체결 단가만 쓴 **가격 수익률**이다. 아래는 실제로
             # 계좌에서 빠져나간 비용까지 뺀 값 — 둘 다 남긴다(_trade_costs docstring).
             # fee_source가 "fill"일 때만 수수료가 브로커 조회값이고, 세금과 매수
             # 수수료는 언제나 계산값이다.
             **costs,
+            "order_total_fee": fill.order_total_fee if fill is not None else None,
             # 이 포지션에 실제로 적용된 출구 규칙 — LLM이 정한 값인지 고정 기본값인지
             # 나중에 성과를 갈라볼 때 필요하다.
             "exit_plan": position.exit_plan.model_dump(mode="json") if position.exit_plan else None,
-        },
-    )
+        }
+    if fill is not None and order_guard.is_blocked(action.ticker):
+        order_guard.commit_effect(action.ticker, before_portfolio, portfolio,
+                                  [(trade_journal_log_path, sell_row)],
+                                  complete=fill.complete, quantity=shares_sold, amount=fill.amount, fee=fill.fee)
+    else:
+        _append_log(trade_journal_log_path, sell_row)
     # action.reasoning(LLM 재량매도일 때만 있음)도 로그엔 영어 원문 그대로 남고
     # (위 _append_log), 텔레그램에 보일 때만 번역한다.
     reasoning_ko = await translate.to_korean(action.reasoning, label="translate_sell_reasoning")
@@ -1885,10 +1897,12 @@ def summarize_blind_minutes(cron_log_path: Path, day: date, *, had_positions: bo
                     zero_since = None
     if not seen and not had_positions:
         return None
-    end = time(*zero_since) if zero_since else SAFETY_WINDOW[1]
+    from src.market_calendar import session_clock
+    start = session_clock(day, 9)
+    end = time(*zero_since) if zero_since else session_clock(day, 15, 30)
 
     expected: list[tuple[int, int]] = []
-    h, mi = SAFETY_WINDOW[0].hour, SAFETY_WINDOW[0].minute
+    h, mi = start.hour, start.minute
     while time(h, mi) <= end:
         expected.append((h, mi))
         h, mi = (h, mi + 1) if mi < 59 else (h + 1, 0)

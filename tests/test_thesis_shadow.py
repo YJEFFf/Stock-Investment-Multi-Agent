@@ -299,4 +299,5 @@ def test_original_context_and_reasoning_are_preserved_without_changing_live_prom
     opinion = asyncio.run(analysts.news_analyst(context))
     assert opinion.reasoning == "원래 수주 근거" and opinion.source_context == context
     legacy = opinion.model_copy(update={"reasoning": None, "source_context": None})
-    assert judgment._format_opinions([opinion]) == judgment._format_opinions([legacy])
+    assert judgment._format_opinions([opinion]) != judgment._format_opinions([legacy])
+    assert "원래 수주 근거" in judgment._format_opinions([opinion])

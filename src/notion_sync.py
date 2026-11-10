@@ -102,6 +102,9 @@ def _notion_request(
         except requests.RequestException as exc:
             last_error = exc
             logger.warning("notion_request_failed method=%s path=%s attempt=%d error=%s", method, path, attempt, exc)
+            if method != "GET" and not path.endswith("/query"):
+                # The server may already have committed the mutation.
+                return None
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
             continue
 
@@ -337,11 +340,7 @@ def refresh_intro_page(page_id: str) -> bool:
     """이미 만들어진 소개 페이지의 내용을 최신 _intro_page_blocks()로 통째로
     교체한다 — AGENTS.md/docs/PLAN.md가 바뀌었을 때 다시 실행해서 노션도
     맞춘다. 기존 블록을 전부 지우고 새로 채우는 방식(부분 diff가 아니다)."""
-    for block in _list_block_children(page_id):
-        _notion_request("DELETE", f"/blocks/{block['id']}")
-
-    result = _notion_request("PATCH", f"/blocks/{page_id}/children", {"children": _intro_page_blocks()})
-    return result is not None
+    return _replace_children(page_id, _intro_page_blocks())
 
 
 def create_trade_journal_database(parent_page_id: str) -> str | None:
@@ -706,6 +705,8 @@ def _entry_key(entry: dict, occurrence: int = 0) -> str:
     등장은 기존 키 형식을 그대로 써서 이미 동기화된 state 파일과 계속 맞물리게
     하고, 두 번째부터만 접미사를 붙인다."""
     base = f"{entry['event']}:{entry['ticker']}:{entry['day']}"
+    if entry.get("event_id"):
+        return f"{base}:id:{entry['event_id']}"
     return base if occurrence == 0 else f"{base}:{occurrence}"
 
 
@@ -732,14 +733,16 @@ def _load_sync_state(state_path: Path) -> dict[str, dict]:
 
 def _save_sync_state(state_path: Path, state: dict[str, dict]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(
+    from src.order_guard import _atomic_bytes
+    _atomic_bytes(state_path,
         json.dumps(
             # synced_keys도 계속 쓴다 — 이 버전으로 못 돌아가는 상황(롤백)에서도
             # 이미 올린 행을 중복 생성하지 않게 한다.
-            {"synced_keys": sorted(state), "entries": {k: v for k, v in sorted(state.items()) if v}},
+            {"synced_keys": sorted(k for k, v in state.items() if not v.get("creation_pending")),
+             "entries": {k: v for k, v in sorted(state.items()) if v}},
             ensure_ascii=False,
             indent=2,
-        )
+        ).encode()
     )
 
 
@@ -770,6 +773,7 @@ def _fetch_page_ids_by_match(database_id: str) -> dict[tuple, str]:
     """
     by_match: dict[tuple, str] = {}
     cursor = None
+    seen_cursors = set()
     while True:
         body = {"page_size": 100}
         if cursor:
@@ -777,7 +781,7 @@ def _fetch_page_ids_by_match(database_id: str) -> dict[tuple, str]:
         page = _notion_request("POST", f"/databases/{database_id}/query", body)
         if page is None:
             logger.warning("notion_page_index_query_failed")
-            return by_match
+            return {}
         for p in page.get("results", []):
             props = p["properties"]
             kind = (props.get("구분", {}).get("select") or {}).get("name")
@@ -787,10 +791,14 @@ def _fetch_page_ids_by_match(database_id: str) -> dict[tuple, str]:
             ticker = "".join(x["plain_text"] for x in props.get("티커", {}).get("rich_text", []))
             day = (props.get("날짜", {}).get("date") or {}).get("start")
             price = props.get("가격", {}).get("number") if event == "sell" else None
-            by_match[(ticker, day, event, round(price or 0, 2))] = p["id"]
+            key = (ticker, day, event, round(price or 0, 2))
+            by_match[key] = None if key in by_match else p["id"]
         if not page.get("has_more"):
             break
         cursor = page.get("next_cursor")
+        if not cursor or cursor in seen_cursors:
+            return {}
+        seen_cursors.add(cursor)
 
     return by_match
 
@@ -802,17 +810,57 @@ def _replace_children(page_id: str, children: list[dict]) -> bool:
     덧붙이기만 하면 옛 문장과 새 문장이 나란히 남아 어느 쪽이 맞는지 알 수 없다.
     이 페이지들은 전부 기계가 쓴 것이라 사람이 손으로 덧붙인 내용을 지울 걱정은 없다.
     """
-    existing = _notion_request("GET", f"/blocks/{page_id}/children?page_size=100", None)
+    def fetch_all():
+        blocks, cursor, seen = [], None, set()
+        while True:
+            suffix = "&start_cursor=" + cursor if cursor else ""
+            page = _notion_request("GET", f"/blocks/{page_id}/children?page_size=100{suffix}", None)
+            if page is None or not isinstance(page.get("results"), list):
+                return None
+            blocks.extend(page["results"])
+            if not page.get("has_more"):
+                return blocks
+            cursor = page.get("next_cursor")
+            if not cursor or cursor in seen:
+                return None
+            seen.add(cursor)
+
+    def matches(actual, expected):
+        if isinstance(expected, dict):
+            return isinstance(actual, dict) and all(k in actual and matches(actual[k], v) for k, v in expected.items())
+        if isinstance(expected, list):
+            return isinstance(actual, list) and len(actual) == len(expected) and all(matches(a, e) for a, e in zip(actual, expected))
+        return actual == expected
+
+    existing = fetch_all()
     if existing is None:
         return False
-    for block in existing.get("results", []):
-        _notion_request("DELETE", f"/blocks/{block['id']}", None)
-    if children:
-        return _notion_request("PATCH", f"/blocks/{page_id}/children", {"children": children}) is not None
+    # Append before archiving. On response loss, read back and recognize the exact
+    # suffix instead of blindly appending another copy or erasing the old body.
+    if children and not (len(existing) >= len(children) and all(matches(a, e) for a, e in zip(existing[-len(children):], children))):
+        _notion_request("PATCH", f"/blocks/{page_id}/children", {"children": children})
+        existing = fetch_all()
+        if existing is None or len(existing) < len(children) or not all(matches(a, e) for a, e in zip(existing[-len(children):], children)):
+            return False
+    obsolete = existing[:-len(children)] if children else existing
+    for block in obsolete:
+        if _notion_request("DELETE", f"/blocks/{block['id']}", None) is None:
+            return False
     return True
 
 
 async def sync_trade_journal(
+    trade_journal_log_path: Path,
+    database_id: str,
+    state_path: Path | None = None,
+) -> dict:
+    from src.portfolio_store import portfolio_lock
+    state_path = state_path or DEFAULT_SYNC_STATE_PATH
+    with portfolio_lock(state_path.with_suffix(".lock")):
+        return await _sync_trade_journal_locked(trade_journal_log_path, database_id, state_path)
+
+
+async def _sync_trade_journal_locked(
     trade_journal_log_path: Path,
     database_id: str,
     state_path: Path | None = None,
@@ -856,6 +904,12 @@ async def sync_trade_journal(
     for key, entry in entries.items():
         record = state.get(key)
         fingerprint = _entry_fingerprint(entry)
+        if record is not None and record.get("creation_pending"):
+            # A lost create response is never permission to create a second page.
+            # Preserve the pending marker for explicit remote reconciliation.
+            logger.error("notion_create_unconfirmed key=%s; remote reconciliation required", key)
+            failed += 1
+            continue
 
         # 지문이 없는 옛 키는 "그때 올린 내용이 지금과 같다"고 보고 지문만 채운다.
         # 노션을 뒤져 실제로 대조할 수도 있지만, 아무것도 안 바뀐 날에도 매번 전체를
@@ -880,6 +934,8 @@ async def sync_trade_journal(
             children = await _sell_row_children(entry)
 
         if record is None:
+            state[key] = {"creation_pending": True, "fingerprint": fingerprint}
+            _save_sync_state(state_path, state)
             result = _notion_request(
                 "POST",
                 "/pages",
@@ -890,6 +946,7 @@ async def sync_trade_journal(
                 failed += 1
                 continue
             state[key] = {"page_id": result["id"], "fingerprint": fingerprint}
+            _save_sync_state(state_path, state)
             synced += 1
             continue
 
@@ -912,6 +969,7 @@ async def sync_trade_journal(
             failed += 1
             continue
         state[key] = {"page_id": page_id, "fingerprint": fingerprint}
+        _save_sync_state(state_path, state)
         updated += 1
         logger.info("notion_sync_row_updated key=%s", key)
 
@@ -1171,10 +1229,26 @@ def _load_synced_days(state_path: Path) -> set[str]:
 
 def _save_synced_days(state_path: Path, days: set[str]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps({"synced_days": sorted(days)}, ensure_ascii=False, indent=2))
+    from src.order_guard import _atomic_bytes
+    previous = json.loads(state_path.read_text()) if state_path.exists() else {}
+    previous["synced_days"] = sorted(days)
+    _atomic_bytes(state_path, json.dumps(previous, ensure_ascii=False, indent=2).encode())
 
 
 async def sync_daily_report(
+    day: str, portfolio: PortfolioState, database_id: str,
+    pipeline_log_path: Path | None = None, trade_journal_log_path: Path | None = None,
+    state_path: Path | None = None, account: kis.AccountSnapshot | None = None,
+    codex_capacity_path: Path | None = None,
+) -> bool:
+    from src.portfolio_store import portfolio_lock
+    state_path = state_path or DEFAULT_DAILY_REPORT_STATE_PATH
+    with portfolio_lock(state_path.with_suffix(".lock")):
+        return await _sync_daily_report_locked(day, portfolio, database_id, pipeline_log_path,
+            trade_journal_log_path, state_path, account, codex_capacity_path)
+
+
+async def _sync_daily_report_locked(
     day: str,
     portfolio: PortfolioState,
     database_id: str,
@@ -1205,6 +1279,10 @@ async def sync_daily_report(
     state_path = state_path or DEFAULT_DAILY_REPORT_STATE_PATH
     codex_capacity_path = codex_capacity_path or DEFAULT_CODEX_CAPACITY_STATE_PATH
     synced_days = _load_synced_days(state_path)
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    if day in state.get("creation_pending", []):
+        logger.error("notion_daily_report_unconfirmed day=%s; remote reconciliation required", day)
+        return False
     if day in synced_days:
         logger.info("notion_daily_report_skipped day=%s reason=already_synced", day)
         return False
@@ -1234,12 +1312,17 @@ async def sync_daily_report(
             day, decisions_today, buys, sells, skips, portfolio, account, codex_capacity
         ),
     }
+    from src.order_guard import _atomic_bytes
+    state.setdefault("creation_pending", []).append(day)
+    _atomic_bytes(state_path, json.dumps(state).encode())
     result = _notion_request("POST", "/pages", body)
     if result is None:
         logger.warning("notion_daily_report_failed day=%s", day)
         return False
 
     synced_days.add(day)
+    state["creation_pending"].remove(day)
+    _atomic_bytes(state_path, json.dumps(state).encode())
     _save_synced_days(state_path, synced_days)
     logger.info("notion_daily_report_synced day=%s", day)
     return True

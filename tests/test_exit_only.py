@@ -21,9 +21,9 @@ def mode(monkeypatch):
     monkeypatch.setattr(operating_mode, "EXIT_ONLY", True)
 
 
-def quote(price=100, high=None, low=None):
+def quote(price=100, high=None, low=None, at=NEXT):
     return kis.Quote(price=price, day_high=high or price, day_low=low or price,
-                     open_price=100, prev_close=100)
+                     open_price=100, prev_close=100, provider_at=at, listed_shares=1000, par_value=500)
 
 
 def initialized(path, *, quantity=9, start=START, stage=0):
@@ -34,7 +34,10 @@ def initialized(path, *, quantity=9, start=START, stage=0):
     raw = portfolio.model_dump_json().encode()
     account = dict(total=2000, cash=50, securities=100 * quantity, observed_at=start.isoformat(),
                    holdings=[dict(pdno="005930", prdt_name="삼성전자", hldg_qty=quantity, prpr=100)])
-    return exit_only.initialize(raw, account, at=start, path=path), raw, account
+    state = exit_only.initialize(raw, account, at=start, path=path)
+    state.share_basis = {"005930": {"listed_shares": 1000, "par_value": 500, "day": NEXT.date().isoformat()}}
+    exit_only.save(state, path)
+    return state, raw, account
 
 
 def test_transition_freezes_positions_and_includes_unsettled_cash(tmp_path):
@@ -95,14 +98,14 @@ def test_stop_and_range_use_observed_price_never_invent_threshold_fill(tmp_path)
 def test_transition_does_not_replay_prior_intraday_stop(tmp_path):
     at = START.replace(hour=13)
     state, _, _ = initialized(tmp_path / "ledger.json", start=at)
-    exit_only.apply_quotes(state, {"005930": (quote(100, high=140, low=80), "kis")}, at=at + timedelta(minutes=1))
+    exit_only.apply_quotes(state, {"005930": (quote(100, high=140, low=80, at=at + timedelta(minutes=1)), "kis")}, at=at + timedelta(minutes=1))
     assert state.portfolio.positions[0].peak_price == 100
     assert not state.sales
 
 
 def test_closing_price_updates_nav_but_never_executes(tmp_path):
     state, _, _ = initialized(tmp_path / "ledger.json")
-    exit_only.apply_quotes(state, {"005930": (quote(70), "kis")}, at=NEXT.replace(hour=15, minute=35))
+    exit_only.apply_quotes(state, {"005930": (quote(70, at=NEXT.replace(hour=15, minute=30)), "kis")}, at=NEXT.replace(hour=15, minute=35))
     assert not state.sales
     assert state.nav_history[-1]["total"] == 1730
 
@@ -172,6 +175,7 @@ def test_one_preopen_quote_does_not_abort_other_holdings(tmp_path, monkeypatch):
     second = state.portfolio.positions[0].model_copy(deep=True, update={"ticker": "000660"})
     state.portfolio.positions.append(second)
     state.source_portfolio.positions.append(second.model_copy(deep=True))
+    state.share_basis[second.ticker] = dict(state.share_basis["005930"])
     state.names[second.ticker] = "SK하이닉스"
     state.quotes[second.ticker] = state.quotes["005930"].model_copy()
     state.cash = state.initial_cash = 200

@@ -41,7 +41,8 @@ def test_parses_krx_fields_in_one_request(monkeypatch):
     quotes = _REAL_FETCH_NAVER(["282330", "007660"], today=TODAY)
 
     assert len(calls) == 1 and calls[0].endswith("/282330,007660")
-    assert quotes["282330"] == kis.Quote(price=145000, day_high=147600, day_low=137900, open_price=145000, prev_close=146000)
+    assert (quotes["282330"].price, quotes["282330"].day_high, quotes["282330"].day_low, quotes["282330"].prev_close) == (145000, 147600, 137900, 146000)
+    assert quotes["282330"].provider_at is not None
     assert quotes["007660"].day_low == 108200  # integratedPriceInfo의 1원이 아니라 KRX 저가
 
 

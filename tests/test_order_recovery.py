@@ -106,7 +106,7 @@ def test_ambiguous_evidence_never_unblocks(waiting,monkeypatch,problem):
                 orders=order_guard.load_orders();orders['009240'].quantity=184;order_guard._save(orders)
             elif problem=='changed_journal':recovery.JOURNAL_PATH.write_text(recovery.JOURNAL_PATH.read_text()+'{}\n')
             else:
-                state=store.load_portfolio();state.positions[0].weight=.09;store.save_portfolio(state)
+                state=store.load_portfolio();state.positions[0].weight=.09;state.cash_weight=.91;store.save_portfolio(state)
             return {'009240':(183,40789.344)}
         monkeypatch.setattr(kis,'fetch_holdings',race)
     assert not recovery.recover_pending_buy(NOW)
@@ -290,7 +290,7 @@ def test_sell_ambiguity_never_releases(waiting_sell, monkeypatch, problem):
         monkeypatch.setattr(kis,'fetch_daily_fill_totals',fills)
     elif problem=='holding':monkeypatch.setattr(kis,'fetch_holdings',lambda **kw:{'009240':(1,40600.)})
     elif problem=='local_holding':
-        store.save_portfolio(PortfolioState(positions=[Position(ticker='009240',sector='',weight=.01,quantity=1)]))
+        store.save_portfolio(PortfolioState(positions=[Position(ticker='009240',sector='',weight=.01,quantity=1)], cash_weight=.99))
     elif problem=='missing_prior':rows=rows[1:]
     elif problem=='later_trade':rows.append(dict(event='buy',ticker='009240',day='2026-10-13',quantity=1))
     elif problem=='duplicate':rows.append(rows[-1])
@@ -506,8 +506,8 @@ def test_partial_sell_ambiguous_evidence_stays_blocked(waiting_partial_sell, mon
     elif problem == 'entry_price': p.entry_price += 1
     elif problem == 'exit_plan': p.exit_plan.trail_pct = -.04
     elif problem == 'stage': p.take_profit_stage += 1
-    elif problem == 'weight': p.weight += .001
-    elif problem == 'missing_position': state.positions = []
+    elif problem == 'weight': p.weight += .001; state.cash_weight -= .001
+    elif problem == 'missing_position': state.positions = []; state.cash_weight = 1
     elif problem == 'unaccepted':
         orders=order_guard.load_orders(); orders['009240'].order_no=None; order_guard._save(orders)
     elif problem == 'bad_chain': rows[0]['quantity'] = 73

@@ -7,7 +7,7 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from src.market_calendar import is_krx_trading_day
+from src.market_calendar import is_krx_trading_day, session_clock
 from src.schemas import MobileSnapshot
 
 KST = ZoneInfo("Asia/Seoul")
@@ -150,7 +150,7 @@ def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float 
             stock_cost = securities - stock_pnl
             account["securities_pnl"] = stock_pnl
             account["securities_return_pct"] = stock_pnl / stock_cost * 100 if stock_cost > 0 else None
-    if nav_by_day and list(sorted(nav_by_day.items()))[-1][1].get("status") != "ok":
+    if not operating_mode.EXIT_ONLY and nav_by_day and list(sorted(nav_by_day.items()))[-1][1].get("status") != "ok":
         data.warnings.append("최근 계좌 조회가 실패했습니다. 마지막으로 확인한 금액을 표시합니다.")
 
     runs = {r["day"]: r for r in data.rows("daily_runs.jsonl") if isinstance(r.get("day"), str) and r["day"] <= today}
@@ -158,8 +158,8 @@ def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float 
     try:
         market_open_day = is_krx_trading_day(now.date())
         days = trading_days(monitoring_day, 20)
-        expected_nav_day = trading_days(now.date() if now.time() >= time(15, 40) else now.date() - timedelta(days=1), 1)[0]
-        if daily_latest and daily_latest["day"] < expected_nav_day:
+        expected_nav_day = trading_days(now.date() if now.time() >= session_clock(now.date(), 15, 40) else now.date() - timedelta(days=1), 1)[0]
+        if not operating_mode.EXIT_ONLY and daily_latest and daily_latest["day"] < expected_nav_day:
             data.warnings.append(f"일별 계좌 기록이 {daily_latest['day']} 이후 갱신되지 않았습니다.")
         next_day = now.date() + timedelta(days=1)
         while not is_krx_trading_day(next_day):
@@ -172,15 +172,17 @@ def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float 
     state, label = "waiting", "분석 시작 대기"
     if market_open_day is False:
         state, label = "holiday", "오늘은 휴장일"
+    elif market_open_day is None:
+        state, label = "failed", "거래 달력 확인 필요"
     elif run:
         state = run.get("status", "unknown")
         labels = {"completed": "정상 관망" if not run.get("pending") else "매수 판단 완료",
                   "degraded": "일부 분석 실패", "failed": "분석 실패", "skipped": "분석 미실행",
                   "started": "분석 준비 중", "collecting": "자료 수집 중", "analysis_started": "분석 중"}
         label = labels.get(state, "실행 상태 확인 필요")
-        if state in {"started", "collecting", "analysis_started"} and now.time() >= time(8, 55):
+        if state in {"started", "collecting", "analysis_started"} and now.time() >= session_clock(now.date(), 8, 55):
             state, label = "unconfirmed", "분석 종료 기록 없음"
-    elif now.time() >= time(8, 55):
+    elif now.time() >= session_clock(now.date(), 8, 55):
         state, label = "missing", "오늘 분석 기록 없음"
     capacity = data.json("codex_plan_capacity.json") or {}
     if not isinstance(capacity, dict):
@@ -254,7 +256,6 @@ def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float 
 def exit_only_snapshot(result: MobileSnapshot, root: Path, now: datetime, initial_capital: float) -> MobileSnapshot:
     from src import exit_only
     result.account, result.holdings = None, []
-    result.warnings = []
     result.operation.update(mode="exit_only", status="exit_only", label="기존 보유분 가상 매도 추적",
                             reason="신규 매수 판단 중단", run={}, capacity={}, unconfirmed_orders=0)
     result.measurements["paused"] = True
@@ -304,7 +305,19 @@ def exit_only_snapshot(result: MobileSnapshot, root: Path, now: datetime, initia
     result.trades = result.trades[:250]
     if state.missing_quotes:
         result.warnings.append("시세 미확인: " + ", ".join(state.names[t] for t in state.missing_quotes) + ". 해당 종목은 마지막 가격을 표시합니다.")
-    if (state.portfolio.positions and is_krx_trading_day(now.date()) and time(9, 2) <= now.time() < time(15, 36)
-            and (state.last_checked_at is None or (now - state.last_checked_at).total_seconds() > 120)):
-        result.warnings.append("가상 매도 감시가 2분 넘게 갱신되지 않았습니다. 표시된 가격 확인 시각을 확인하세요.")
+    if state.basis_warnings:
+        result.warnings.append("주식 수·가격 기준 변경 확인 필요: " + ", ".join(state.names[t] for t in state.basis_warnings)
+                               + ". 해당 종목의 가상 매도를 중단하고 기존 수량·매도 기준을 보존했습니다.")
+    if state.portfolio.positions:
+        from src.market_calendar import monitor_due
+        try:
+            due = monitor_due(now)
+            if (due >= state.started_at and (state.last_checked_at is None
+                    or (due - state.last_checked_at).total_seconds() > 120)):
+                result.warnings.append("가상 매도 감시의 예정 확인 시각을 2분 넘게 놓쳤습니다. 마지막 가격 확인 시각을 확인하세요.")
+        except ValueError:
+            result.warnings.append("거래 달력이 등록되지 않아 시세 감시를 중단했습니다. 달력 갱신이 필요합니다.")
+        from src.market_calendar import SUPPORTED_YEARS
+        if now.month == 12 and now.year + 1 not in SUPPORTED_YEARS:
+            result.warnings.append("다음 연도 거래 달력 확인이 필요합니다. 미등록 연도에는 감시가 중단됩니다.")
     return result

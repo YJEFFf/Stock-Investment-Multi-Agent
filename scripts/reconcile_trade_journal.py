@@ -59,12 +59,27 @@ def _broker_average(ticker: str, day: date, quantity: int) -> tuple[float | None
 
 
 def main() -> int:
+    from datetime import datetime
+    from src import operating_mode
+    from src.market_calendar import KST, deployment_blocked
+    from src.portfolio_store import portfolio_lock
+    if operating_mode.EXIT_ONLY:
+        logger.error("exit_only: preserved broker journal cannot be reconciled")
+        return 2
+    if APPLY and deployment_blocked(datetime.now(KST)):
+        return 2
+    with portfolio_lock():
+        return _reconcile_locked()
+
+
+def _reconcile_locked() -> int:
     path = DEFAULT_TRADE_JOURNAL_LOG_PATH
     if not path.exists():
         print(f"{path} 가 없습니다.")
         return 1
 
-    entries = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    original = path.read_bytes()
+    entries = [json.loads(line) for line in original.splitlines() if line.strip()]
 
     # 같은 (종목, 날짜)에 매수 행이 둘 이상이면 일별 집계로는 나눌 수 없다.
     buy_groups = Counter((e["ticker"], e["day"]) for e in entries if e.get("event") == "buy")
@@ -127,9 +142,14 @@ def main() -> int:
         print("(드라이런입니다. 실제로 교정하려면 --apply)")
         return 0
 
-    backup = path.with_name(f"{path.name}.bak-{_kst_today().strftime('%Y%m%d')}-entryfix")
-    backup.write_text(path.read_text())
-    path.write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries))
+    import time
+    from src.order_guard import _atomic_bytes
+    if path.read_bytes() != original:
+        raise ValueError("journal changed during reconciliation")
+    backup = path.with_name(f"{path.name}.bak-{time.time_ns()}-entryfix")
+    with backup.open("xb") as handle:
+        handle.write(original)
+    _atomic_bytes(path, "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries).encode())
     print(f"교정 완료 — {corrected}개 행을 고쳤습니다. 백업: {backup}")
     print("노션은 다음 동기화(09:01 / 15:35)에서 지문이 바뀐 행만 갱신됩니다.")
     return 0

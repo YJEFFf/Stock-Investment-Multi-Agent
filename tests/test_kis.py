@@ -287,7 +287,7 @@ _BALANCE_ROW = {
 def test_fetch_account_snapshot_reads_all_three_amounts_from_broker(monkeypatch):
     """예수금·유가증권 평가금액을 비중으로 역산하지 않고 응답에서 그대로 읽는다."""
     monkeypatch.setattr(
-        kis, "_kis_get", lambda path, tr_id, params, policy=None: {"output2": [_BALANCE_ROW]}
+        kis, "_kis_get", lambda path, tr_id, params, policy=None: {"output1": [{"pdno": "005930", "hldg_qty": "1", "pchs_avg_pric": "50316160", "prpr": "50316160", "evlu_amt": "50316160"}], "output2": [_BALANCE_ROW]}
     )
 
     snapshot = kis.fetch_account_snapshot()
@@ -309,7 +309,7 @@ def test_fetch_account_snapshot_returns_none_when_a_field_is_missing(monkeypatch
 
 def test_fetch_account_balance_success(monkeypatch):
     monkeypatch.setattr(
-        kis, "_kis_get", lambda path, tr_id, params, policy=None: {"output2": [_BALANCE_ROW]}
+        kis, "_kis_get", lambda path, tr_id, params, policy=None: {"output1": [{"pdno": "005930", "hldg_qty": "1", "pchs_avg_pric": "50316160", "prpr": "50316160", "evlu_amt": "50316160"}], "output2": [_BALANCE_ROW]}
     )
 
     assert kis.fetch_account_balance() == 100624343.0
@@ -651,7 +651,8 @@ def test_fetch_quote_survives_missing_range_fields(monkeypatch, real_fetch_quote
 
     quote = kis.fetch_quote("192820")
 
-    assert quote == kis.Quote(price=283000.0, day_high=None, day_low=None)
+    assert quote.price == 283000.0 and quote.day_high is None and quote.day_low is None
+    assert quote.received_at is not None
 
 
 def test_fetch_quote_returns_none_when_request_fails(monkeypatch, real_fetch_quote):

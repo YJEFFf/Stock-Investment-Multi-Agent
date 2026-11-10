@@ -15,6 +15,7 @@ from pathlib import Path
 
 from src.schemas import PortfolioState
 from src import order_guard
+from src.data_quality import validate_portfolio
 
 PORTFOLIO_STATE_PATH = Path("logs/portfolio_state.json")
 PORTFOLIO_LOCK_PATH = Path("logs/portfolio_state.lock")
@@ -27,9 +28,9 @@ def load_portfolio(path: Path | None = None) -> PortfolioState:
     # 이미 정의된 함수의 기본값엔 반영되지 않는다. 본문에서 매번 전역을 찾게 하면
     # (late binding) 몽키패치가 실제로 먹는다.
     path = path or PORTFOLIO_STATE_PATH
-    if path.exists():
-        return PortfolioState.model_validate_json(path.read_text())
-    return PortfolioState()
+    if path == PORTFOLIO_STATE_PATH and any(o.pending_commit for o in order_guard.load_orders().values()):
+        raise ValueError("unfinished local order commit; recover under portfolio_lock first")
+    return validate_portfolio(PortfolioState.model_validate_json(path.read_text()))
 
 
 def save_portfolio(portfolio: PortfolioState, path: Path | None = None) -> None:
@@ -38,6 +39,7 @@ def save_portfolio(portfolio: PortfolioState, path: Path | None = None) -> None:
     프로세스가 절반만 쓰인 JSON을 읽을 수 있다. os.replace는 같은 파일시스템
     안에서 원자적이라 그 틈이 없다."""
     path = path or PORTFOLIO_STATE_PATH
+    validate_portfolio(portfolio)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with tmp_path.open("w") as f:

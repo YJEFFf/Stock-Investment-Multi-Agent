@@ -98,7 +98,12 @@ def test_compute_indicators_all_halted_omits_support_resistance():
 def test_fetch_market_context_success(monkeypatch):
     """fetch_market_context는 이제 KIS API(kis.fetch_daily_ohlcv)에서 일봉을 받는다
     — 네이버는 종목 리스트/지수 시계열에만 남아있다."""
-    bars = _bars(3)
+    bars = collectors._parse_bars(FAKE_XML)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 5, 16, tzinfo=__import__("zoneinfo").ZoneInfo("Asia/Seoul"))
+    monkeypatch.setattr(collectors, "datetime", Clock)
     monkeypatch.setattr(collectors.kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: bars)
 
     context = collectors.fetch_market_context("005930", lookback_days=3)
@@ -118,6 +123,11 @@ def test_fetch_market_context_returns_none_when_kis_fetch_fails(monkeypatch):
 
 
 def test_fetch_kospi200_index_bars_success(monkeypatch):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 5, 16, tzinfo=tz)
+    monkeypatch.setattr(collectors, "datetime", Clock)
     class FakeResponse:
         text = FAKE_XML
 
@@ -316,7 +326,7 @@ def test_fetch_kospi200_sector_map_refetches_when_cache_stale(monkeypatch):
     assert sector_map == {"066570": "전자제품", "009150": "전자제품", "051910": "화학"}
 
 
-def test_fetch_kospi200_sector_map_falls_back_to_stale_cache_on_refresh_failure(monkeypatch):
+def test_fetch_kospi200_sector_map_rejects_expired_cache_on_refresh_failure(monkeypatch):
     from datetime import datetime, timedelta, timezone
 
     monkeypatch.setattr(collectors.time, "sleep", lambda *_: None)
@@ -333,7 +343,7 @@ def test_fetch_kospi200_sector_map_falls_back_to_stale_cache_on_refresh_failure(
 
     sector_map = collectors.fetch_kospi200_sector_map()
 
-    assert sector_map == {"005930": "반도체"}  # 갱신 실패 -> 오래된 캐시라도 사용
+    assert sector_map is None  # 만료된 분류를 정상 입력으로 사용하지 않는다
 
 
 def test_fetch_kospi200_sector_map_returns_none_when_no_cache_and_fetch_fails(monkeypatch):

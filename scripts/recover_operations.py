@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src import codex_plan, notify, pipeline, run_history
-from src.market_calendar import is_krx_trading_day
+from src.market_calendar import is_krx_trading_day, session_clock
 from src.portfolio_store import portfolio_lock, PortfolioLockBusy
 from scripts import decide_buys
 
@@ -26,7 +26,7 @@ def save(state):
 
 
 def eligible(at, rows, already):
-    if not is_krx_trading_day(at.date()) or not time(7, 5) <= at.time() < time(8):
+    if not is_krx_trading_day(at.date()) or not session_clock(at.date(), 7, 5) <= at.time() < session_clock(at.date(), 8, 0):
         return False
     if already or any(r.analysis_started for r in rows):
         return False
@@ -51,6 +51,21 @@ def main():
                     save(state)
         from src import operating_mode
         if operating_mode.EXIT_ONLY:
+            from src import exit_only
+            from src.market_calendar import monitor_due
+            at = datetime.now(codex_plan.KST)
+            try:
+                ledger = exit_only.load()
+                due = monitor_due(at) if ledger.portfolio.positions else None
+                delayed = due and due >= ledger.started_at and (ledger.last_checked_at is None
+                           or (due - ledger.last_checked_at).total_seconds() > 120)
+                if delayed:
+                    notify.alert_once_per_day("exit_only_watchdog", notify.format_error_alert(
+                        "가상 매도 감시 갱신 지연", "예정 확인 시각이 지났습니다. cron 로그와 마지막 시세 확인 시각을 확인하세요."),
+                        today=at.date())
+            except (OSError, ValueError):
+                notify.alert_once_per_day("exit_only_watchdog_invalid", notify.format_error_alert(
+                    "가상 매도 감시 확인 불가", "장부 또는 거래 달력을 읽지 못했습니다."), today=at.date())
             return
         at = datetime.now(codex_plan.KST)
         # Use exactly the analysis lock. A live run is never finalized or replaced.
@@ -90,7 +105,7 @@ def main():
                     f'{day}: 2회 복구 소진, exit={code}; 신규 매수 판단 차단 유지'))
             return
         capacity = codex_plan.load_capacity_status(day)
-        if not capacity.buy_judgment_allowed or datetime.now(codex_plan.KST).time() >= time(8):
+        if not capacity.buy_judgment_allowed or datetime.now(codex_plan.KST).time() >= session_clock(at.date(), 8, 0):
             return
         asyncio.run(decide_buys.main(recovery=True))
 

@@ -17,7 +17,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from src import codex_plan, run_history, thesis_sources
-from src.market_calendar import is_krx_trading_day
+from src.market_calendar import is_krx_trading_day, session_clock
 from src.schemas import (
     Decision, EntryThesisRecord, EntryThesisResponse, HoldingThesisRecord,
     HoldingThesisResponse, PortfolioState, ThesisCitation,
@@ -184,7 +184,7 @@ def _summary(root, phase, now, results):
 
 async def capture_entries(pending_path, *, root=None, clock=now_kst):
     root, now = root or STATE_DIR, clock().astimezone(KST)
-    if not is_krx_trading_day(now.date()) or not time(7) <= now.time() < CAPTURE_DEADLINE:
+    if not is_krx_trading_day(now.date()) or not session_clock(now.date(), 7) <= now.time() < session_clock(now.date(), 8, 55):
         return {"status": "outside_capture_window"}
     if not pending_path.exists():
         return {"status": "no_pending"}
@@ -193,7 +193,7 @@ async def capture_entries(pending_path, *, root=None, clock=now_kst):
         return {"status": "no_current_approved_decisions"}
     template = (PROMPTS / "entry_thesis.md").read_text()
     version = "prompt:entry_thesis@" + hashlib.sha256(template.encode()).hexdigest()[:6]
-    deadline = datetime.combine(now.date(), CAPTURE_DEADLINE, KST)
+    deadline = datetime.combine(now.date(), session_clock(now.date(), 8, 55), KST)
     results = []
     token = codex_plan.CALL_SESSION.set(codex_plan.CallSession())
     try:
@@ -245,7 +245,7 @@ def _entry_for(position, journal, root):
     thesis = EntryThesisRecord.model_validate_json(path.read_text())
     if (thesis.status != "documented" or not thesis.claims or thesis.completed_at is None
             or thesis.completed_at.astimezone(KST).date() != position.entry_day
-            or thesis.completed_at.astimezone(KST).time() >= CAPTURE_DEADLINE
+            or thesis.completed_at.astimezone(KST).time() >= session_clock(thesis.completed_at.astimezone(KST).date(), 8, 55)
             or thesis.ticker != position.ticker or thesis.day != position.entry_day):
         raise ValueError("entry_thesis_unavailable")
     buys = [r for r in journal if r.get("event") == "buy" and r.get("ticker") == position.ticker
@@ -263,7 +263,7 @@ def _entry_for(position, journal, root):
 async def review_holdings(portfolio_path, journal_path, *, fee_rate, tax_rate, root=None, clock=now_kst,
                           unconfirmed_path=None):
     root, now = root or STATE_DIR, clock().astimezone(KST)
-    if not is_krx_trading_day(now.date()) or not time(16, 10) <= now.time() < REVIEW_DEADLINE:
+    if not is_krx_trading_day(now.date()) or not session_clock(now.date(), 16, 10) <= now.time() < REVIEW_DEADLINE:
         return {"status": "outside_review_window"}
     portfolio = PortfolioState.model_validate_json(portfolio_path.read_text())
     journal = [json.loads(line) for line in journal_path.read_text().splitlines() if line.strip()]

@@ -82,10 +82,10 @@ def main() -> int:
     # 복구 이후에는 데이터 출처·모델이 같은 완주 표본을 따로 본다. 장애일의 부분
     # 판단을 60개 정상 거래일에 넣지 않으며, 예전 구간의 IC도 그대로 남긴다.
     completed = {r.run_id: r for r in run_history.load_runs()
-                 if r.status == "completed" and r.cohort == run_history.COHORT}
+                 if r.status == "completed" and r.cohort == run_history.COHORT and not any(s.status == "failed" for s in r.sources)}
     recovered = [e for e in entries if e.get("run_id") in completed and e.get("cohort") == run_history.COHORT]
     segments[run_history.COHORT] = {
-        "since": "2026-10-06", "label": "수집 복구 후 동일 조건의 정상 실행",
+        "since": "2026-11-11", "label": "수집 복구 후 동일 조건의 정상 실행",
         "normal_days": len({r.day for r in completed.values()}),
         "decisions": len(recovered), "horizons": {},
     }

@@ -386,32 +386,30 @@ def test_create_intro_page_writes_full_content_not_just_a_link(monkeypatch):
     assert "코드가 직전 20일 변동성" in texts
 
 
-def test_refresh_intro_page_deletes_old_blocks_then_appends_new(monkeypatch):
+def test_refresh_intro_page_verifies_new_blocks_before_deleting_old(monkeypatch):
     calls = []
-
+    rows = [{"id": "block-1"}, {"id": "block-2"}]
     def fake_request(method, path, body=None):
         calls.append((method, path))
         if method == "GET":
-            return {"results": [{"id": "block-1"}, {"id": "block-2"}]}
+            return {"results": list(rows)}
+        if method == "PATCH":
+            rows.extend(dict(block, id=f"new-{i}") for i, block in enumerate(body["children"]))
         return {"id": "ok"}
-
     monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
-
     assert notion_sync.refresh_intro_page("intro-page-1") is True
-
-    deleted = [path for method, path in calls if method == "DELETE"]
-    assert deleted == ["/blocks/block-1", "/blocks/block-2"]
-    assert calls[-1][0] == "PATCH"
+    assert [path for method, path in calls if method == "DELETE"] == ["/blocks/block-1", "/blocks/block-2"]
+    assert next(i for i, c in enumerate(calls) if c[0] == "PATCH") < next(i for i, c in enumerate(calls) if c[0] == "DELETE")
 
 
 def test_refresh_intro_page_handles_no_existing_blocks(monkeypatch):
+    rows = []
     def fake_request(method, path, body=None):
         if method == "GET":
-            return {"results": []}
+            return {"results": list(rows)}
+        rows.extend(dict(block, id=f"new-{i}") for i, block in enumerate(body["children"]))
         return {"id": "ok"}
-
     monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
-
     assert notion_sync.refresh_intro_page("intro-page-1") is True
 
 
@@ -909,13 +907,18 @@ def test_corrected_entry_updates_the_existing_page_instead_of_duplicating(monkey
     _write_jsonl(log_path, [entry])
 
     requests_made = []
+    blocks = []
 
     def fake_request(method, path, body=None):
         requests_made.append((method, path))
         if method == "POST" and path == "/pages":
             return {"id": "page-1"}
         if method == "GET":
-            return {"results": []}
+            return {"results": list(blocks)}
+        if method == "PATCH" and path.endswith("/children"):
+            blocks.extend({**b, "id": f"new-{i}"} for i, b in enumerate(body["children"]))
+        if method == "DELETE":
+            blocks[:] = [b for b in blocks if path != "/blocks/" + b["id"]]
         return {"ok": True}
 
     monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
@@ -973,6 +976,7 @@ def test_legacy_row_is_found_in_notion_when_it_actually_needs_updating(monkeypat
     )
 
     requests_made = []
+    blocks = []
 
     def fake_request(method, path, body=None):
         requests_made.append((method, path))
@@ -992,7 +996,11 @@ def test_legacy_row_is_found_in_notion_when_it_actually_needs_updating(monkeypat
                 "has_more": False,
             }
         if method == "GET":
-            return {"results": []}
+            return {"results": list(blocks)}
+        if method == "PATCH" and path.endswith("/children"):
+            blocks.extend({**b, "id": f"new-{i}"} for i, b in enumerate(body["children"]))
+        if method == "DELETE":
+            blocks[:] = [b for b in blocks if path != "/blocks/" + b["id"]]
         return {"ok": True}
 
     monkeypatch.setattr(notion_sync, "_notion_request", fake_request)
@@ -1015,10 +1023,13 @@ def test_update_replaces_the_body_instead_of_appending_to_it(monkeypatch, tmp_pa
     )
 
     deleted = []
+    blocks = [{"id": "old-block-1"}, {"id": "old-block-2"}]
 
     def fake_request(method, path, body=None):
         if method == "GET":
-            return {"results": [{"id": "old-block-1"}, {"id": "old-block-2"}]}
+            return {"results": list(blocks)}
+        if method == "PATCH" and path.endswith("/children"):
+            blocks.extend({**b, "id": f"new-{i}"} for i, b in enumerate(body["children"]))
         if method == "DELETE":
             deleted.append(path)
         return {"ok": True}

@@ -385,7 +385,7 @@ async def execute_sell_order(
         logger.warning(
             "execute_sell_order_simulated_only ticker=%s reason=no_real_quantity_tracked", action.ticker
         )
-        return execute_sell(portfolio, action, current_price), None
+        return portfolio, None
 
     shares_to_sell = (
         position.quantity if action.sell_fraction >= 1.0 else int(position.quantity * action.sell_fraction)
@@ -411,7 +411,13 @@ async def execute_sell_order(
         logger.error("execute_sell_order_blocked ticker=%s reason=unconfirmed_previous_order", action.ticker)
         return portfolio, None
     before = await asyncio.to_thread(kis.fetch_daily_fill_totals, action.ticker, today, "sell")
-    order_guard.begin(action.ticker, "sell", shares_to_sell, before)
+    if before is None:
+        logger.error("execute_sell_order_skipped ticker=%s reason=fill_baseline_unavailable", action.ticker)
+        return portfolio, None
+    order_guard.begin(action.ticker, "sell", shares_to_sell, before, portfolio=portfolio, context={
+        "action": action.model_dump(mode="json"), "day": today.isoformat(),
+        "current_price": current_price,
+    })
 
     try:
         order_no = await asyncio.to_thread(kis.place_market_sell_order, action.ticker, shares_to_sell)
@@ -438,15 +444,20 @@ async def execute_sell_order(
     fill = await asyncio.to_thread(
         kis.fill_after_order, action.ticker, today, "sell", before, shares_to_sell
     )
-    if order_no is None and fill is None:
+    if fill is not None and fill.quantity > shares_to_sell:
+        logger.error("execute_sell_order_ambiguous_excess_fill ticker=%s", action.ticker)
+        return portfolio, None
+    if fill is not None:
+        fill = fill.model_copy(update={"complete": fill.quantity == shares_to_sell})
+    if fill is None:
         # 조회 실패/지연을 미접수로 단정하지 않는다. 표시를 남겨 다음 분 재주문도 막는다.
-        logger.error("execute_sell_order_failed ticker=%s reason=order_response_lost", action.ticker)
+        logger.error("execute_sell_order_failed ticker=%s reason=fill_unverified", action.ticker)
         notify.send_telegram_alert(notify.format_error_alert(
             "매도 주문 확인 필요 — 해당 종목 추가 주문 차단", f"ticker={action.ticker}; 원장·보유 수량 대조 필요"
         ))
         return portfolio, None
 
-    if order_no is None and fill is not None and not fill.complete:
+    if fill is not None and not fill.complete:
         shares_to_sell = fill.quantity
 
     if fill is None:
@@ -481,7 +492,7 @@ async def execute_sell_order(
         cash_weight=updated_portfolio.cash_weight,
     )
     if fill is not None and fill.complete:
-        order_guard.mark_settled(action.ticker, updated)
+        pass  # finalize_sell commits the portfolio and trade journal together.
     else:
         notify.send_telegram_alert(notify.format_error_alert(
             "매도 체결 확인 미완료 — 원장 대조까지 추가 주문 차단", f"ticker={action.ticker}"

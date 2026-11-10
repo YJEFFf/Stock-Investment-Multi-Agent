@@ -64,6 +64,7 @@ TOKEN_PATH = "/oauth2/tokenP"
 DAILY_CHART_PATH = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
 DAILY_CHART_TR_ID = "FHKST03010100"
 CURRENT_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
+MINUTE_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
 CURRENT_PRICE_TR_ID = "FHKST01010100"
 ORDER_CASH_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
 ORDER_BUY_TR_ID = "VTTC0802U"  # 모의투자 현금 매수 주문
@@ -281,7 +282,7 @@ def _kis_request(
     확인해야 한다.
     """
     from src import operating_mode
-    if operating_mode.EXIT_ONLY and (method != "GET" or path != CURRENT_PRICE_PATH):
+    if operating_mode.EXIT_ONLY and (method != "GET" or path not in {CURRENT_PRICE_PATH, MINUTE_PRICE_PATH}):
         operating_mode.require_broker_mode()
     token = get_access_token()
     if token is None:
@@ -378,7 +379,8 @@ def _parse_daily_chart(data: dict) -> list[OHLCVBar]:
             )
         )
     bars.sort(key=lambda b: b.date)
-    return bars
+    from src.data_quality import validate_bars
+    return validate_bars(bars)
 
 
 def fetch_daily_ohlcv(
@@ -402,14 +404,18 @@ def fetch_daily_ohlcv(
         "FID_INPUT_DATE_1": begin_date.strftime("%Y%m%d"),
         "FID_INPUT_DATE_2": end_date.strftime("%Y%m%d"),
         "FID_PERIOD_DIV_CODE": "D",
-        "FID_ORG_ADJ_PRC": "1",
+        "FID_ORG_ADJ_PRC": "0",
     }
 
     data = _kis_get(DAILY_CHART_PATH, DAILY_CHART_TR_ID, params, policy=policy)
     if data is None:
         return None
 
-    bars = _parse_daily_chart(data)
+    try:
+        bars = _parse_daily_chart(data)
+    except (ValueError, KeyError, TypeError):
+        logger.exception("kis_daily_chart_invalid ticker=%s", ticker)
+        return None
     if not bars:
         return None
     return bars[-lookback_days:]
@@ -437,6 +443,13 @@ class Quote:
     day_low: float | None = None
     open_price: float | None = None
     prev_close: float | None = None
+    # Provider minute-bar label, not proof of an actual last trade at this second.
+    provider_at: datetime | None = None
+    received_at: datetime | None = None
+    market_status: str | None = None
+    listed_shares: int | None = None
+    par_value: float | None = None
+    range_source: str = "daily"
 
     @property
     def traded_today(self) -> bool:
@@ -455,8 +468,35 @@ class Quote:
         return self.day_high is not None or self.day_low is not None
 
 
-def fetch_quote(ticker: str, *, policy: RetryPolicy = DEFAULT_POLICY) -> Quote | None:
-    """현재가와 당일 고가/저가를 한 번에. 추가 호출이 아니라 같은 응답의 다른 필드다."""
+def fetch_closing_quote(ticker: str, day: date, *, policy: RetryPolicy = DEFAULT_POLICY) -> Quote | None:
+    """Timestamped KRX closing-minute bar for explicit metadata migration only.
+
+    The current-price endpoint can already reflect after-hours trading. Do not
+    combine it with a historical closing timestamp or manufacture that timestamp.
+    """
+    from src.market_calendar import market_session, KST
+    session = market_session(day)
+    if session is None:
+        return None
+    data = _kis_get(MINUTE_PRICE_PATH, "FHKST03010200", {
+        "FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker,
+        "FID_INPUT_HOUR_1": session.close.strftime("%H%M%S"),
+        "FID_PW_DATA_INCU_YN": "Y", "FID_ETC_CLS_CODE": "",
+    }, policy=policy)
+    try:
+        row = data["output2"][0]
+        stamp = datetime.strptime(row["stck_bsop_date"] + row["stck_cntg_hour"], "%Y%m%d%H%M%S").replace(tzinfo=KST)
+        price, high, low = (float(row[k]) for k in ("stck_prpr", "stck_hgpr", "stck_lwpr"))
+        if stamp != session.close or not all(math.isfinite(v) for v in (price, high, low)) or not 0 < low <= price <= high:
+            return None
+        return Quote(price=price, day_high=high, day_low=low, provider_at=stamp,
+                     received_at=datetime.now(timezone.utc), market_status="CLOSE", range_source="minute")
+    except (TypeError, KeyError, IndexError, ValueError):
+        return None
+
+
+def fetch_quote(ticker: str, *, policy: RetryPolicy = DEFAULT_POLICY, verify_time: bool = False) -> Quote | None:
+    """현재가·당일 범위. verify_time=True는 분봉과 별도 대조하며 불일치는 판단 불가다."""
     data = _kis_get(CURRENT_PRICE_PATH, CURRENT_PRICE_TR_ID, {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}, policy=policy)
     if data is None:
         return None
@@ -474,7 +514,7 @@ def fetch_quote(ticker: str, *, policy: RetryPolicy = DEFAULT_POLICY) -> Quote |
         except (TypeError, ValueError):
             return None
         # 장 시작 전에는 0으로 온다 — 0을 저가로 믿으면 모든 손절이 발동한다.
-        return value if value > 0 else None
+        return value if math.isfinite(value) and value > 0 else None
 
     try:
         price = float(price_str)
@@ -492,12 +532,61 @@ def fetch_quote(ticker: str, *, policy: RetryPolicy = DEFAULT_POLICY) -> Quote |
     if prev_close is not None and prev_close <= 0:
         prev_close = None
 
+    provider_at = None
+    range_source = "daily"
+    day_high, day_low = _optional("stck_hgpr"), _optional("stck_lwpr")
+    received_at = datetime.now(timezone.utc)
+    if verify_time:
+        from src.market_calendar import KST
+        now = received_at.astimezone(KST)
+        minutes = _kis_get(MINUTE_PRICE_PATH, "FHKST03010200", {
+            "FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker,
+            "FID_INPUT_HOUR_1": now.strftime("%H%M%S"),
+            "FID_PW_DATA_INCU_YN": "N", "FID_ETC_CLS_CODE": "",
+        }, policy=policy)
+        try:
+            row = minutes["output2"][0]
+            provider_at = datetime.strptime(row["stck_bsop_date"] + row["stck_cntg_hour"],
+                                            "%Y%m%d%H%M%S").replace(tzinfo=KST)
+            summary = minutes["output1"]
+            minute_price, minute_high, minute_low = (float(row[k]) for k in ("stck_prpr", "stck_hgpr", "stck_lwpr"))
+            reference = float(summary["stck_prdy_clpr"])
+            # Corporate-action reference changes are not ordinary intraday price
+            # changes. Never replace a conflicting basis with another source.
+            if (prev_close != reference
+                    or float(summary["stck_prpr"]) - float(summary["prdy_vrss"]) != reference):
+                return None
+            volume = float(summary["acml_vol"])
+            if not math.isfinite(volume) or volume <= 0:
+                return None
+            if (not all(math.isfinite(v) for v in (minute_price, minute_high, minute_low, reference))
+                    or not 0 < minute_low <= minute_price <= minute_high or reference <= 0):
+                return None
+            # Normal trading changes the snapshots between these rate-limited
+            # requests. Use the timestamped minute itself in that case; only a
+            # matching complete snapshot may supply the wider daily range.
+            try:
+                same_snapshot = (price == minute_price and prev_close == reference
+                    and all(float(output[k]) == float(summary[k]) for k in ("acml_vol", "acml_tr_pbmn"))
+                    and 0 < day_low <= minute_low <= minute_high <= day_high)
+            except (TypeError, KeyError, ValueError):
+                same_snapshot = False
+            if not same_snapshot:
+                day_high, day_low = minute_high, minute_low
+                range_source = "minute"
+            price, prev_close = minute_price, reference
+        except (TypeError, KeyError, IndexError, ValueError):
+            return None
+        received_at = datetime.now(timezone.utc)
     return Quote(
         price=price,
-        day_high=_optional("stck_hgpr"),
-        day_low=_optional("stck_lwpr"),
+        day_high=day_high,
+        day_low=day_low,
         open_price=_optional("stck_oprc"),
         prev_close=prev_close,
+        provider_at=provider_at, received_at=received_at,
+        listed_shares=int(_optional("lstn_stcn") or 0) or None,
+        par_value=_optional("stck_fcam"), range_source=range_source,
     )
 
 
@@ -564,19 +653,33 @@ def fetch_account_snapshot(*, policy: RetryPolicy = DEFAULT_POLICY) -> AccountSn
     data = _kis_get(BALANCE_PATH, BALANCE_TR_ID, _balance_params(), policy=policy)
     if data is None:
         return None
+    if not isinstance(data.get("output1"), list) or str(data.get("ctx_area_nk100") or "").strip():
+        return None
 
     rows = data.get("output2") or []
     if not rows:
         return None
     row = rows[0]
     try:
-        return AccountSnapshot(
+        if any(int(h["hldg_qty"]) < 0 for h in data["output1"]):
+            return None
+        snapshot = AccountSnapshot(
             total=float(row["tot_evlu_amt"]),
             cash=float(row["dnca_tot_amt"]),
             securities=float(row["scts_evlu_amt"]),
             holdings=[{k: h[k] for k in ("pdno", "prdt_name", "hldg_qty", "pchs_avg_pric", "prpr", "evlu_amt", "evlu_pfls_amt", "evlu_pfls_rt") if k in h}
                       for h in data.get("output1", []) if int(h.get("hldg_qty") or 0) > 0],
         )
+        if (not all(math.isfinite(v) and v >= 0 for v in (snapshot.total, snapshot.cash, snapshot.securities))
+                or len({h["pdno"] for h in snapshot.holdings}) != len(snapshot.holdings)
+                or not math.isclose(sum(float(h["evlu_amt"]) for h in snapshot.holdings),
+                                    snapshot.securities, abs_tol=1, rel_tol=0)):
+            return None
+        for h in snapshot.holdings:
+            if (not all(math.isfinite(float(h[k])) and float(h[k]) > 0 for k in ("prpr", "pchs_avg_pric"))
+                    or not math.isclose(int(h["hldg_qty"]) * float(h["prpr"]), float(h["evlu_amt"]), abs_tol=1, rel_tol=0)):
+                return None
+        return snapshot
     except (KeyError, TypeError, ValueError):
         logger.warning("kis_account_snapshot_unparseable row_keys=%s", sorted(row))
         return None
@@ -726,8 +829,12 @@ def fetch_daily_fill_totals(
         # 이것도 누적값이라 수량·금액과 똑같이 주문 전후 차로 재야 이 주문 몫이 나온다.
         # 없으면 0.0으로 둔다: 아직 아무 비용도 안 붙은 상태(전 값)와 같은 의미라
         # 차를 내면 어차피 0이 되고, 진짜 "모른다"는 fill_between이 None으로 표현한다.
-        fee = float(output2.get("prsm_tlex_smtl") or 0.0)
-        return int(qty_str), float(amount_str), fee
+        raw_fee = output2.get("prsm_tlex_smtl")
+        fee = None if raw_fee in (None, "") else float(raw_fee)
+        qty, amount = int(qty_str), float(amount_str)
+        if qty < 0 or not math.isfinite(amount) or amount < 0 or (fee is not None and (not math.isfinite(fee) or fee < 0)):
+            return None
+        return qty, amount, fee
     except ValueError:
         logger.warning("kis_fill_totals_unparseable ticker=%s qty=%r amt=%r", ticker, qty_str, amount_str)
         return None
@@ -757,10 +864,12 @@ def fill_between(
         return None
     qty = after[0] - before[0]
     amount = after[1] - before[1]
-    if qty <= 0 or amount <= 0:
+    if qty <= 0 or amount <= 0 or not math.isfinite(amount):
         return None
     before_fee, after_fee = _fee_of(before), _fee_of(after)
-    fee = None if before_fee is None or after_fee is None else max(after_fee - before_fee, 0.0)
+    fee = None if before_fee is None or after_fee is None else after_fee - before_fee
+    if fee is not None and (not math.isfinite(fee) or fee < 0):
+        return None
     return FillRecord(quantity=qty, amount=amount, fee=fee)
 
 
@@ -804,6 +913,9 @@ def fill_after_order(
         after = fetch_daily_fill_totals(ticker, order_date, side)
         fill = fill_between(before, after)
         if fill is not None:
+            if fill.quantity > expected_quantity:
+                logger.error("kis_fill_exceeds_requested_quantity ticker=%s", ticker)
+                return None
             best = fill
             if fill.quantity >= expected_quantity:
                 return fill
@@ -826,7 +938,7 @@ def fill_after_order(
     return best.model_copy(update={"complete": False})
 
 
-def fetch_holdings(*, policy: RetryPolicy = DEFAULT_POLICY, require_complete: bool = False) -> dict[str, tuple[int, float]] | None:
+def fetch_holdings(*, policy: RetryPolicy = DEFAULT_POLICY, require_complete: bool = True) -> dict[str, tuple[int, float]] | None:
     """브로커가 보고하는 보유 종목 전체: {종목코드: (보유수량, 매입평균가)}.
 
     **브로커가 사실의 출처다.** 자체 상태 파일(logs/portfolio_state.json)의 값과

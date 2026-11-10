@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from src import collector_routes as routes, collectors
-from src.market_calendar import is_krx_trading_day
+from src.market_calendar import is_krx_trading_day, session_clock
 
 KST = ZoneInfo("Asia/Seoul")
 CANARIES = ("005930", "000660")
@@ -42,7 +42,7 @@ def expected_session(now):
     day = now.astimezone(KST).date()
     # KRX close (15:30) is independent from the deployment freeze (16:10).
     # 16:00 IC collection must accept today's completed index bar.
-    if now.astimezone(KST).time() < time(15, 30) or not is_krx_trading_day(day):
+    if now.astimezone(KST).time() < session_clock(day, 15, 30) or not is_krx_trading_day(day):
         day -= timedelta(days=1)
     while not is_krx_trading_day(day):
         day -= timedelta(days=1)
@@ -92,7 +92,7 @@ def index_data(text, now, *, monitoring=False):
     bars = collectors._parse_bars(text)
     # During the session Naver includes a changing current-day bar. Only the
     # monitoring probe may remove it; actual premarket input remains strict.
-    if monitoring and is_krx_trading_day(now.date()) and time(9) <= now.time() < time(15, 30):
+    if monitoring and is_krx_trading_day(now.date()) and session_clock(now.date(), 9, 0) <= now.time() < session_clock(now.astimezone(KST).date(), 15, 30):
         bars = [b for b in bars if b.date != now.date()]
     if len(bars) < 60 or len({b.date for b in bars}) != len(bars):
         raise ProbeError("semantic", "incomplete or duplicate index dates")
@@ -194,7 +194,7 @@ def quotes_data(text, now, *, monitoring=False):
         traded = str(row.get("localTradedAt", ""))[:10]
         if price is None or not math.isfinite(price) or traded < expected_session(now).isoformat() or traded > now.date().isoformat():
             raise ProbeError("stale", "invalid quote price/date")
-        if monitoring and is_krx_trading_day(now.date()) and time(9, 5) <= now.time() < time(15, 30):
+        if monitoring and is_krx_trading_day(now.date()) and session_clock(now.date(), 9, 5) <= now.time() < session_clock(now.astimezone(KST).date(), 15, 30):
             stamp = datetime.fromisoformat(row["localTradedAt"])
             if stamp.tzinfo is None:
                 stamp = stamp.replace(tzinfo=KST)

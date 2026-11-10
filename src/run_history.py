@@ -17,7 +17,7 @@ NAV_LOG_PATH = Path("logs/account_nav.jsonl")
 IC_HISTORY_PATH = Path("logs/ic_history.jsonl")
 CURRENT: ContextVar[DailyRunRecord | None] = ContextVar("daily_run", default=None)
 KST = ZoneInfo("Asia/Seoul")
-COHORT = "kis_master_naver_json_20261005"
+COHORT = "validated_inputs_adjusted_prices_20261111"
 
 
 def append(path: Path, row: dict) -> None:
@@ -48,7 +48,7 @@ def git_commit() -> str:
 
 def new_run(now: datetime, provider: str, model: str) -> DailyRunRecord:
     return DailyRunRecord(run_id=uuid4().hex, day=now.date().isoformat(), started_at=now,
-                          git_commit=git_commit(), provider=provider, model=model)
+                          git_commit=git_commit(), provider=provider, model=model, cohort=COHORT)
 
 
 def write(record: DailyRunRecord) -> None:
@@ -116,7 +116,9 @@ def trading_days(as_of: date, n_days: int) -> list[str]:
 def coverage(as_of: date, n_days: int = 20) -> dict:
     days = trading_days(as_of, n_days)
     latest = {r.day: r for r in load_runs() if r.day in days}
-    counts = {s: sum(r.status == s for r in latest.values())
+    def quality_status(row):
+        return "degraded" if row.status == "completed" and any(s.status == "failed" for s in row.sources) else row.status
+    counts = {s: sum(quality_status(r) == s for r in latest.values())
               for s in ("completed", "degraded", "failed", "skipped", "started", "collecting", "analysis_started")}
     return {"from": days[0], "through": days[-1], "total_days": n_days,
             "normal_days": counts.pop("completed"), "missing_days": n_days - len(latest), **counts}

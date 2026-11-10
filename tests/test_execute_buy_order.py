@@ -4,6 +4,8 @@ from datetime import date
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("persisted_order_portfolio")
+
 from src import kis, pipeline
 from src.schemas import Decision, ExitPlan, GateResult, PortfolioState, Position
 
@@ -28,7 +30,7 @@ def _no_real_notify_or_name_lookup(monkeypatch):
     # execute_buy_order가 주문 전후로 누적 체결 집계를 조회한다 — 막지 않으면 테스트가
     # 실제 KIS를 때리고 타임아웃까지 기다린다. 체결 브래킷을 실제로 검증하는
     # 테스트는 _wire_buy_with_prices로 이 목을 다시 덮어쓴다.
-    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: None)
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: (0, 0.0, 0.0))
 
 
 def _decision(action="BUY") -> Decision:
@@ -162,6 +164,7 @@ def test_skips_when_order_rejected(monkeypatch, tmp_path):
 
 
 def test_opens_new_position_with_fill_price(monkeypatch, tmp_path):
+    _confirmed_fill(monkeypatch, lambda: 231200.0)
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(230000.0))
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 231000.0)  # 갭 ~0.4%, 문턱 이내
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
@@ -222,7 +225,7 @@ def test_falls_back_to_current_price_when_fill_price_unavailable(monkeypatch, tm
         )
     )
 
-    assert result.positions[0].entry_price == 101.0  # current_price로 근사
+    assert result == portfolio  # Unobserved quantity is never inferred from a quote.
 
 
 def test_adds_to_existing_position_falls_back_to_weight_when_shares_unknown(monkeypatch, tmp_path):
@@ -253,17 +256,11 @@ def test_adds_to_existing_position_falls_back_to_weight_when_shares_unknown(monk
         )
     )
 
-    assert len(result.positions) == 1
-    pos = result.positions[0]
-    assert pos.weight == pytest.approx(0.16)
-    # 기존 포지션에 수량이 없었으므로(existing.quantity is None) 비중 폴백을 탄다.
-    # 비중 가중: (100*0.08 + 200*0.08) / 0.16 = 150
-    assert pos.entry_price == pytest.approx(150.0)
-    assert pos.peak_price == 200.0  # 새 체결가가 기존 고점보다 높음
-    assert pos.entry_day == date(2026, 1, 5)  # 추가매수해도 최초 진입일 유지
+    assert result == portfolio
 
 
 def test_adds_to_existing_position_averages_by_shares(monkeypatch, tmp_path):
+    _confirmed_fill(monkeypatch, lambda: 2000.0)
     """평균 원가는 주식수 가중이다 — 비중 가중은 단가를 제곱으로 넣는 셈이라 틀린다.
 
     `weight`는 매수 시점 원가 기준 비중이라 `weight ∝ 수량 x 단가`다. 그걸로 단가를
@@ -285,7 +282,7 @@ def test_adds_to_existing_position_averages_by_shares(monkeypatch, tmp_path):
         ticker=TICKER, sector="반도체", weight=0.02, entry_day=date(2026, 1, 5),
         entry_price=1000.0, peak_price=1200.0, quantity=100,
     )
-    portfolio = PortfolioState(positions=[existing], cash_weight=0.9)
+    portfolio = PortfolioState(positions=[existing], cash_weight=0.98)
 
     result = asyncio.run(
         pipeline.execute_buy_order(
@@ -327,12 +324,13 @@ def _volatile_bars(daily_move=0.02, n=30):
 
 
 def _wire_successful_buy(monkeypatch, bars=None):
+    _confirmed_fill(monkeypatch, lambda: bars[-1].close if bars else 101.0)
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: bars or _prev_bars(100.0))
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: (bars[-1].close if bars else 101.0))
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
     monkeypatch.setattr(kis, "place_market_buy_order", lambda ticker, qty: "order-1")
     monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, day: (bars[-1].close if bars else 101.0))
-    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: None)
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: (0, 0.0, 0.0))
 
 
 def _buy(decision, portfolio, log_path):
@@ -457,7 +455,7 @@ def _run_buy(tmp_path):
             PortfolioState(positions=[], cash_weight=1.0), "반도체", 0.08, log_path=log_path,
         )
     )
-    return portfolio, json.loads(log_path.read_text().strip())
+    return portfolio, json.loads(log_path.read_text().strip()) if log_path.exists() else {}
 
 
 def test_entry_price_prefers_this_orders_own_fill(monkeypatch, tmp_path):
@@ -504,8 +502,8 @@ def test_entry_price_falls_back_to_daily_average_when_bracket_unavailable(monkey
 
     portfolio, entry = _run_buy(tmp_path)
 
-    assert portfolio.positions[0].entry_price == 112.0
-    assert entry["entry_price_source"] == "daily_avg"
+    assert not portfolio.positions
+    assert entry["event"] == "buy_skipped"
 
 
 def test_entry_price_falls_back_to_broker_position_average(monkeypatch, tmp_path):
@@ -515,8 +513,8 @@ def test_entry_price_falls_back_to_broker_position_average(monkeypatch, tmp_path
 
     portfolio, entry = _run_buy(tmp_path)
 
-    assert portfolio.positions[0].entry_price == 112.0
-    assert entry["entry_price_source"] == "position_avg"
+    assert not portfolio.positions
+    assert entry["event"] == "buy_skipped"
 
 
 def test_entry_price_last_resort_is_quote_and_is_flagged(monkeypatch, tmp_path, caplog):
@@ -527,9 +525,9 @@ def test_entry_price_last_resort_is_quote_and_is_flagged(monkeypatch, tmp_path, 
     with caplog.at_level("ERROR"):
         portfolio, entry = _run_buy(tmp_path)
 
-    assert portfolio.positions[0].entry_price == 101.0  # 호가
-    assert entry["entry_price_source"] == "quote_fallback"
-    assert "entry_price_unverified" in caplog.text
+    assert not portfolio.positions
+    assert entry["event"] == "buy_skipped"
+    assert entry["reason"] == "fill_baseline_unavailable"
 
 
 def test_later_sources_are_not_queried_once_a_price_is_found(monkeypatch, tmp_path):
@@ -618,6 +616,7 @@ def test_skips_when_order_response_lost_and_no_fill(monkeypatch, tmp_path):
 
 
 def _wire_happy_path(monkeypatch, orders):
+    _confirmed_fill(monkeypatch, lambda: 101.0)
     monkeypatch.setattr(kis, "fetch_daily_ohlcv", lambda ticker, lookback_days: _prev_bars(100.0))
     monkeypatch.setattr(kis, "fetch_account_balance", lambda: 100_000_000.0)
     monkeypatch.setattr(kis, "fetch_fill_price", lambda ticker, order_date: 101.0)
@@ -753,3 +752,10 @@ def test_a_corrupt_bar_cannot_crash_the_buy_after_the_order_filled(monkeypatch, 
 
     assert len(updated.positions) == 1 and updated.positions[0].exit_plan is None
     assert json.loads((tmp_path / "journal.jsonl").read_text().strip())["exit_plan_source"] == "default"
+
+
+def _confirmed_fill(monkeypatch, price):
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda *a, **kw: (0, 0.0, 0.0))
+    from src.schemas import FillRecord
+    monkeypatch.setattr(kis, "fill_after_order", lambda ticker, day, side, before, quantity:
+                        FillRecord(quantity=quantity, amount=quantity * price()))

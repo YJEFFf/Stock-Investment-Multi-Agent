@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import requests  # noqa: E402
 
-from src import app_notifications, collectors, exit_only, kis, notify, operating_mode, order_guard, pipeline, sell, translate  # noqa: E402
+from src import portfolio_store, app_notifications, collectors, exit_only, kis, notify, operating_mode, order_guard, pipeline, sell, translate  # noqa: E402
 from src.schemas import AnalystOpinion, Decision, GateResult, PortfolioState, Position, RiskGateConfig, SellAction  # noqa: E402
 
 KST = ZoneInfo("Asia/Seoul")
@@ -69,8 +69,12 @@ class FakeBroker:
         self.gets.append(path)
         if path == kis.CURRENT_PRICE_PATH:
             if self.pre_open_quote:
-                return _Resp({"rt_cd": "0", "output": {"stck_prpr": str(int(PRICE)), "stck_hgpr": "0", "stck_lwpr": "0", "stck_oprc": "0", "prdy_vrss": "0"}})
-            return _Resp({"rt_cd": "0", "output": {"stck_prpr": str(int(PRICE)), "stck_hgpr": str(int(PRICE * 1.01)), "stck_lwpr": str(int(PRICE * 0.99)), "stck_oprc": str(int(PRICE)), "prdy_vrss": "0"}})
+                return _Resp({"rt_cd": "0", "output": {"stck_prpr": str(int(PRICE)), "stck_hgpr": "0", "stck_lwpr": "0", "stck_oprc": "0", "prdy_vrss": "0", "acml_vol": "100", "acml_tr_pbmn": "1000000", "lstn_stcn": "1000", "stck_fcam": "500"}})
+            return _Resp({"rt_cd": "0", "output": {"stck_prpr": str(int(PRICE)), "stck_hgpr": str(int(PRICE * 1.01)), "stck_lwpr": str(int(PRICE * 0.99)), "stck_oprc": str(int(PRICE)), "prdy_vrss": "0", "acml_vol": "100", "acml_tr_pbmn": "1000000", "lstn_stcn": "1000", "stck_fcam": "500"}})
+        if path == kis.MINUTE_PRICE_PATH:
+            return _Resp({"rt_cd": "0", "output1": {"acml_vol": "100", "acml_tr_pbmn": "1000000", "stck_prdy_clpr": str(PRICE), "stck_prpr": str(PRICE), "prdy_vrss": "0"},
+                          "output2": [{"stck_bsop_date": "20261110", "stck_cntg_hour": "090100", "stck_prpr": str(PRICE),
+                                       "stck_lwpr": str(PRICE), "stck_hgpr": str(PRICE)}]})
         if path == kis.DAILY_CHART_PATH:
             today = datetime.now(KST).date()
             rows, px = [], PRICE
@@ -124,6 +128,7 @@ def _wired(broker: FakeBroker):
         (operating_mode, "EXIT_ONLY"): operating_mode.EXIT_ONLY,
         (app_notifications, "enqueue_alert"): app_notifications.enqueue_alert,
         (order_guard, "STATE_PATH"): order_guard.STATE_PATH,
+        (portfolio_store, "PORTFOLIO_STATE_PATH"): portfolio_store.PORTFOLIO_STATE_PATH,
         (kis, "get_access_token"): kis.get_access_token,
         (kis.requests, "get"): kis.requests.get,
         (kis.requests, "post"): kis.requests.post,
@@ -146,6 +151,8 @@ def _wired(broker: FakeBroker):
     try:
         os.chdir(tmp)
         order_guard.STATE_PATH = Path(tmp) / "unconfirmed_orders.json"
+        portfolio_store.PORTFOLIO_STATE_PATH = Path(tmp) / "portfolio_state.json"
+        portfolio_store.save_portfolio(PortfolioState())
         kis.get_access_token = lambda: "drill-token"
         kis.requests.get = broker.get
         kis.requests.post = broker.post
@@ -175,7 +182,7 @@ def _wired(broker: FakeBroker):
 
 
 def _decision() -> Decision:
-    op = AnalystOpinion(agent="chart", ticker=TICKER, score=0.9, confidence=0.9, evidence=["prompt:drill@0"], as_of=datetime.now(KST))
+    op = AnalystOpinion(agent="chart", ticker=TICKER, score=0.9, confidence=0.9, evidence=["prompt:drill@0"], as_of=datetime.now(KST).replace(hour=8, minute=30, second=0, microsecond=0))
     return Decision(ticker=TICKER, action="BUY", reason="drill", inputs=[op], degraded=False)
 
 
@@ -186,6 +193,7 @@ def _journal(tmp: Path) -> list[dict]:
 
 def _buy(broker: FakeBroker, portfolio: PortfolioState | None = None):
     with _wired(broker) as (tmp, alerts):
+        portfolio_store.save_portfolio(portfolio or PortfolioState())
         result = asyncio.run(
             pipeline.execute_buy_order(
                 _decision(), GateResult(approved=True, rejected_by=None), portfolio or PortfolioState(cash_weight=1.0),
@@ -256,6 +264,7 @@ def _sell(broker: FakeBroker):
     portfolio = PortfolioState(positions=[position], cash_weight=0.92)
     action = SellAction(ticker=TICKER, reason="stop_loss", sell_fraction=1.0)
     with _wired(broker):
+        portfolio_store.save_portfolio(portfolio)
         return asyncio.run(sell.execute_sell_order(portfolio, action, PRICE))
 
 
@@ -277,11 +286,12 @@ def s_order_number_missing_after_acceptance() -> Outcome:
     b = FakeBroker(order_behavior="missing_order_number")
     with _wired(b) as (tmp, _):
         state = PortfolioState()
+        portfolio_store.save_portfolio(state)
         args = (_decision(), GateResult(approved=True, rejected_by=None), state, "반도체", .08)
         first = asyncio.run(pipeline.execute_buy_order(*args, log_path=tmp / "journal.jsonl"))
         # 장부 저장 전 이전 상태로 새 회차가 들어와도 주문을 반복하지 않는다.
         asyncio.run(pipeline.execute_buy_order(*args, log_path=tmp / "journal.jsonl"))
-        ok = _order_posts(b) == 1 and first.positions[0].quantity == b.held_qty and order_guard.is_blocked(TICKER)
+        ok = _order_posts(b) == 1 and first.positions[0].quantity == b.held_qty and order_guard.decision_consumed(order_guard.buy_decision_id(args[0], pipeline._kst_today()))
         return Outcome("접수 성공 응답에 주문번호 없음 + 다음 회차", "주문번호 부재는 명시적 거부가 아니다", ok,
                        f"주문 POST {_order_posts(b)}회, 브로커 {b.held_qty}주, 확인 장부 {first.positions[0].quantity}주")
 
@@ -295,6 +305,7 @@ def s_secondary_quote_active_stop_loss() -> Outcome:
     )
     portfolio = PortfolioState(positions=[position], cash_weight=0.92)
     with _wired(b) as (tmp, _):
+        portfolio_store.save_portfolio(portfolio)
         pipeline.SECONDARY_QUOTE_MODE = "active"
         kis.fetch_quote = lambda ticker, policy=None: None
         collectors.fetch_naver_quotes = lambda tickers, **kw: {
@@ -373,12 +384,14 @@ def s_exit_only_liquidation() -> Outcome:
         account = dict(total=100000, securities=50000, observed_at=started.isoformat(),
             holdings=[dict(pdno=TICKER, prdt_name="drill", hldg_qty=5, prpr=10000)])
         path = tmp / "exit_only.json"
-        exit_only.initialize(portfolio.model_dump_json().encode(), account, at=started, path=path)
+        state = exit_only.initialize(portfolio.model_dump_json().encode(), account, at=started, path=path)
+        state.share_basis = {TICKER: {"listed_shares": 1000, "par_value": 500, "day": observed.date().isoformat()}}
+        exit_only.save(state, path)
         asyncio.run(exit_only.monitor(at=observed, path=path))
         requests_after_sale = len(broker.gets)
         asyncio.run(exit_only.monitor(at=observed + timedelta(minutes=1), path=path))
         state = exit_only.load(path)
-        ok = (not broker.posts and broker.gets == [kis.CURRENT_PRICE_PATH]
+        ok = (not broker.posts and broker.gets == [kis.CURRENT_PRICE_PATH, kis.MINUTE_PRICE_PATH]
               and len(broker.gets) == requests_after_sale and not state.portfolio.positions
               and len(state.sales) == 1 and state.sales[0].shares_sold == 5)
         return Outcome("기존 보유분 가상 청산", "새 주문·계좌 조회 없이 가격만 보고 기록, 전량 후 조회 중단",

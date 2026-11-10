@@ -174,7 +174,7 @@ def _rsi(closes: list[float], period: int = 14) -> float:
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
     if avg_loss == 0:
-        return 100.0
+        return 50.0 if avg_gain == 0 else 100.0
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -250,10 +250,20 @@ def fetch_market_context(ticker: str, lookback_days: int = 60) -> MarketContext 
     bars = kis.fetch_daily_ohlcv(ticker, lookback_days)
     if bars is None:
         return None
-
+    from src.data_quality import validate_bars
+    from src.market_calendar import market_session
+    observed = datetime.now(timezone.utc)
+    try:
+        validate_bars(bars, as_of=observed)
+        session = market_session(bars[-1].date)
+        if session is None:
+            raise ValueError("last bar is not a trading session")
+    except ValueError as exc:
+        logger.warning("market_context_invalid ticker=%s error=%s", ticker, exc)
+        return None
     return MarketContext(
         ticker=ticker,
-        as_of=datetime.now(timezone.utc),
+        as_of=min(observed, session.close),
         bars=bars,
         indicators=compute_indicators(bars),
     )
@@ -272,9 +282,8 @@ def fetch_kospi200_index_bars(lookback_days: int = 60) -> list[OHLCVBar] | None:
             from src.collector_health import index_data
             index_data(xml_text, datetime.now(ZoneInfo("Asia/Seoul")))
         bars = _parse_bars(xml_text)
-        if not bars:
-            raise ValueError("no bars parsed for KOSPI200 index")
-        return bars
+        from src.data_quality import validate_bars
+        return validate_bars(bars, as_of=datetime.now(ZoneInfo("Asia/Seoul")))
 
     return _fetch_with_retries(collector_routes.url("index", NAVER_CHART_URL), _parse, params=params, source="index")
 
@@ -361,10 +370,16 @@ def _parse_sector_members(html_text: str) -> list[str]:
 def _read_sector_cache() -> tuple[dict[str, str], datetime] | None:
     try:
         payload = json.loads(SECTOR_CACHE_PATH.read_text())
-        if not isinstance(payload.get("sector_map"), dict) or not payload["sector_map"]:
+        if not isinstance(payload, dict) or not isinstance(payload.get("sector_map"), dict) or not payload["sector_map"]:
             return None
-        return payload["sector_map"], datetime.fromisoformat(payload["fetched_at"])
-    except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError, ValueError):
+        if not all(isinstance(t, str) and re.fullmatch(r"[0-9A-Z]{6}", t) and isinstance(s, str) and s.strip()
+                   for t, s in payload["sector_map"].items()):
+            return None
+        stamp = datetime.fromisoformat(payload["fetched_at"])
+        if stamp.tzinfo is None or stamp > datetime.now(timezone.utc):
+            return None
+        return payload["sector_map"], stamp
+    except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError, ValueError, TypeError):
         return None
 
 
@@ -484,9 +499,8 @@ def fetch_kospi200_sector_map() -> dict[str, str] | None:
     데이터라 파일에 캐시하고 SECTOR_CACHE_TTL_DAYS(기본 30일)가 지나야만 다시
     네이버를 긁는다 — 매일 79개 그룹을 새로 조회할 이유가 없다.
 
-    캐시가 있는데 갱신 시도가 실패하면(네트워크 등) 조용히 기존(다소 오래된) 캐시로
-    폴백한다 — 하루 늦게 반영되는 것보다 그날 파이프라인 전체가 막히는 게 더 나쁘다.
-    캐시가 아예 없는 최초 상태에서 실패하면 None으로 명확히 실패 처리한다.
+    만료 캐시를 갱신하지 못하면 None으로 남긴다. 업종 뉴스는 선택 입력이므로
+    종목 분석 전체를 막지는 않되 만료된 분류를 정상 수집으로 기록하지 않는다.
     """
     cached = _read_sector_cache()
 
@@ -503,9 +517,7 @@ def fetch_kospi200_sector_map() -> dict[str, str] | None:
     _queue_collection_failure("sector_groups", "업종 갱신 실패 또는 구성종목 응답 검증 실패; 기존 캐시 사용 여부와 별도로 수리 확인 필요")
 
     if cached is not None:
-        logger.warning("sector_map_refresh_failed_using_stale_cache")
-        return cached[0]
-
+        logger.warning("sector_map_refresh_failed_expired_cache_rejected")
     return None
 
 
@@ -580,7 +592,7 @@ def _parse_company_news(html_text: str) -> list[NewsItem]:
         published_at = None
         try:
             published_at = datetime.strptime(date_str.strip(), "%Y.%m.%d %H:%M").replace(
-                tzinfo=timezone.utc
+                tzinfo=ZoneInfo("Asia/Seoul")
             )
         except ValueError:
             pass
@@ -641,6 +653,8 @@ _SECTOR_HEADLINE_PATTERN = re.compile(r'href="(/news/news_read\.naver\?[^"]+)"[^
 
 def _parse_sector_news(html_text: str, sector: str) -> list[NewsItem]:
     items = []
+    if not sector.strip():
+        return items
     seen_urls: set[str] = set()
 
     for url_path, title in _SECTOR_HEADLINE_PATTERN.findall(html_text):
@@ -664,6 +678,9 @@ def fetch_sector_news(sector: str, limit: int = 10) -> list[NewsItem] | None:
     단위라 회사명 매칭보다 오탐 허용 범위가 넓다). 개별 기사 타임스탬프는 이 페이지에
     없어 published_at은 항상 None이다.
     """
+    sector = sector.strip()
+    if not sector:
+        return []
     def parse_hub(text):
         if not _SECTOR_HEADLINE_PATTERN.search(text):
             raise ValueError("news hub layout changed")
@@ -954,11 +971,18 @@ def fetch_naver_quotes(tickers: list[str], *, today: date | None = None) -> dict
         price = _naver_raw_number(row, "closePriceRaw")
         if ticker not in tickers or price is None:
             continue
+        # Live inspection confirmed afterMarket snapshots at 20:00. They cannot
+        # establish the regular-session close even when marketStatus is CLOSE.
+        if row.get("marketSessionType") in {"afterMarket", "preMarket"}:
+            continue
         traded_at = str(row.get("localTradedAt") or "")
-        # 체결 시각이 오늘이고 **정규장이 열려 있을 때만** 당일 범위를 믿는다. 장 전·후에는 넥스트레이드
-        # 거래가 섞일 수 있어(독립 리뷰, 실측 미확인) 기준가로 판정하지 않는 쪽을 택한다. active로
-        # 켜기 전에 실제 09:00 응답으로 확인할 것.
-        traded_today = traded_at[:10] == today.isoformat() and row.get("marketStatus") == "OPEN"
+        try:
+            provider_at = datetime.fromisoformat(traded_at)
+            if provider_at.tzinfo is None:
+                provider_at = provider_at.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        except ValueError:
+            continue
+        traded_today = provider_at.date() == today and row.get("marketStatus") in {"OPEN", "CLOSE"}
         change = row.get("compareToPreviousClosePriceRaw")
         try:
             prev_close = price - float(str(change).replace(",", "")) if change is not None else None
@@ -970,6 +994,8 @@ def fetch_naver_quotes(tickers: list[str], *, today: date | None = None) -> dict
             day_low=_naver_raw_number(row, "lowPriceRaw") if traded_today else None,
             open_price=_naver_raw_number(row, "openPriceRaw") if traded_today else None,
             prev_close=prev_close if prev_close and prev_close > 0 else None,
+            provider_at=provider_at, received_at=datetime.now(timezone.utc),
+            market_status=row.get("marketStatus"),
         )
     if set(tickers) - quotes.keys():
         _queue_collection_failure("quotes", "보조 시세 응답의 요청 종목/가격 누락", slots=slots)

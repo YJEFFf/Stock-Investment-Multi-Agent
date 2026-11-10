@@ -4,6 +4,8 @@ from datetime import date, datetime, timezone
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("persisted_order_portfolio")
+
 from src import kis, pipeline, sell
 from src.schemas import AnalystOpinion, ExitPlan, OHLCVBar, PortfolioState, Position, SellAction
 
@@ -364,6 +366,7 @@ def test_llm_layer_analyst_failure_treated_as_no_opinions(monkeypatch, tmp_path)
 
 
 def test_journal_records_weight_reduced_and_sell_amount_on_partial_take_profit(monkeypatch, tmp_path):
+    _confirmed_fill(monkeypatch)
     """부분 익절은 sell_fraction(잔량 대비 비율)만 봐서는 포트폴리오를 얼마나 줄였는지
     안 보인다 — 전체 대비 줄인 비중과 매도 금액이 일지에 같이 남아야 한다."""
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 120.0)  # +20%, 1차 익절
@@ -400,6 +403,7 @@ def test_journal_records_weight_reduced_and_sell_amount_on_partial_take_profit(m
 
 
 def test_journal_records_full_position_on_stop_loss(monkeypatch, tmp_path):
+    _confirmed_fill(monkeypatch)
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 89.0)  # -11%
     monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
 
@@ -430,6 +434,7 @@ def test_journal_records_full_position_on_stop_loss(monkeypatch, tmp_path):
 
 
 def test_journal_records_the_exit_plan_that_actually_applied(monkeypatch, tmp_path):
+    _confirmed_fill(monkeypatch)
     """LLM이 정한 계획으로 잘린 건지 고정 기본값으로 잘린 건지 나중에 갈라볼 수 있어야 한다."""
     monkeypatch.setattr(kis, "fetch_current_price", lambda ticker, policy=None: 94.0)  # -6%
     monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
@@ -460,6 +465,7 @@ def test_journal_records_the_exit_plan_that_actually_applied(monkeypatch, tmp_pa
 
 
 def test_position_fractions_always_sum_to_one(monkeypatch, tmp_path):
+    _confirmed_fill(monkeypatch)
     """한 행만 보고 해석되려면 두 값의 합이 100%여야 한다 — 이게 깨지면 '보유분의
     몇 %'라는 말 자체가 성립하지 않는다. 주식수 내림으로 33.3%를 정확히 못 파는
     경우(30주가 아닌 31주)에도 성립해야 한다."""
@@ -519,13 +525,13 @@ def test_journal_does_not_trust_a_fill_that_missed_part_of_the_order(monkeypatch
     assert entry["reason"] == "stop_loss"
     # 체결 조회가 19주만 잡았어도 실제로 나간 건 31주다.
     assert entry["shares_before"] == 31
-    assert entry["shares_sold"] == 31
-    assert entry["shares_after"] == 0
-    assert entry["position_fraction_sold"] == pytest.approx(1.0)
-    assert entry["position_fraction_remaining"] == pytest.approx(0.0)  # "38.7% 잔여"가 아니다
+    assert entry["shares_sold"] == 19
+    assert entry["shares_after"] == 12
+    assert entry["position_fraction_sold"] == pytest.approx(19 / 31)
+    assert entry["position_fraction_remaining"] == pytest.approx(12 / 31)  # "38.7% 잔여"가 아니다
     # 총액은 19주분 4,364,500원이 아니라 단가 x 실제 수량으로 되세운 값.
-    assert entry["sell_amount"] == pytest.approx(31 * (4_364_500 / 19))
-    assert entry["sell_amount_source"] == "estimated"
+    assert entry["sell_amount"] == pytest.approx(4_364_500)
+    assert entry["sell_amount_source"] == "fill_partial"
     assert entry["exit_price_source"] == "fill_partial"
 
 
@@ -1081,9 +1087,9 @@ def test_journal_scales_fee_up_when_fill_observation_is_partial(monkeypatch, tmp
     )
 
     entry = json.loads(trade_journal_log_path.read_text().strip())
-    assert entry["shares_sold"] == 10
-    assert entry["fee_source"] == "estimated"
-    assert entry["fee_amount"] == pytest.approx(8.0 * 10 / 4)  # 4주분 8원 -> 10주분 20원
+    assert entry["shares_sold"] == 4
+    assert entry["fee_source"] == "fill"
+    assert entry["fee_amount"] == pytest.approx(8.0)  # 4주분 8원 -> 10주분 20원
 
 
 def test_journal_falls_back_to_fee_rate_when_broker_fee_unavailable(monkeypatch, tmp_path):
@@ -1093,7 +1099,7 @@ def test_journal_falls_back_to_fee_rate_when_broker_fee_unavailable(monkeypatch,
         kis, "fetch_quote", lambda ticker, policy=None: kis.Quote(price=120.0, day_high=120.0, day_low=120.0)
     )
     monkeypatch.setattr(kis, "place_market_sell_order", lambda ticker, qty: "order-1")
-    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda ticker, day, side: None)
+    _confirmed_fill(monkeypatch)
 
     position = _position(
         entry_price=100.0, peak_price=100.0, weight=0.12, entry_day=DAY.date(), quantity=30
@@ -1122,3 +1128,10 @@ def test_net_pnl_is_none_when_entry_price_unknown(monkeypatch, tmp_path):
     costs = pipeline._trade_costs(None, shares_sold=10, sell_amount=1200.0, entry_price=None)
     assert costs["net_pnl_amount"] is None
     assert costs["fee_amount"] is None
+
+
+def _confirmed_fill(monkeypatch):
+    from src.schemas import FillRecord
+    monkeypatch.setattr(kis, "fetch_daily_fill_totals", lambda *a, **kw: (0, 0.0, None))
+    monkeypatch.setattr(kis, "fill_after_order", lambda ticker, day, side, before, quantity:
+                        FillRecord(quantity=quantity, amount=quantity * kis.fetch_quote(ticker).price))

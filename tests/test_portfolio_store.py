@@ -17,7 +17,8 @@ from src.schemas import PortfolioState, Position
 
 def test_load_portfolio_returns_default_when_no_file(tmp_path):
     path = tmp_path / "does_not_exist.json"
-    assert portfolio_store.load_portfolio(path) == PortfolioState()
+    with pytest.raises(FileNotFoundError):
+        portfolio_store.load_portfolio(path)
 
 
 def test_save_and_load_portfolio_roundtrip(tmp_path):
@@ -31,7 +32,7 @@ def test_save_and_load_portfolio_roundtrip(tmp_path):
 
 def test_save_uses_atomic_replace_no_leftover_tmp_file(tmp_path):
     path = tmp_path / "portfolio_state.json"
-    portfolio_store.save_portfolio(PortfolioState(cash_weight=0.5), path)
+    portfolio_store.save_portfolio(PortfolioState(positions=[Position(ticker="005930", sector="test", weight=.5)], cash_weight=.5), path)
 
     assert path.exists()
     assert not path.with_suffix(path.suffix + ".tmp").exists()
@@ -45,7 +46,7 @@ def test_default_path_is_late_bound_for_monkeypatching(monkeypatch, tmp_path):
     patched_path = tmp_path / "portfolio_state.json"
     monkeypatch.setattr(portfolio_store, "PORTFOLIO_STATE_PATH", patched_path)
 
-    portfolio = PortfolioState(cash_weight=0.42)
+    portfolio = PortfolioState(positions=[Position(ticker="005930", sector="test", weight=.58)], cash_weight=.42)
     portfolio_store.save_portfolio(portfolio)
 
     assert patched_path.exists()
