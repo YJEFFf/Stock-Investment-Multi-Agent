@@ -284,6 +284,9 @@ def test_partial_sell_recovery_keeps_original_stage_and_only_books_remaining_leg
     action = SellAction(ticker=TICKER, reason="take_profit_trail", sell_fraction=1/3)
     context = {"action": action.model_dump(mode="json"), "day": AT.date().isoformat(), "current_price": 120}
     order_guard.begin(TICKER, "sell", 3, (0, 0., None), portfolio=initial, context=context)
+    orders = order_guard.load_orders()
+    orders[TICKER].created_at = AT
+    order_guard._save(orders)
     order_guard.mark_accepted(TICKER, "123")
     partial = sell.execute_sell(initial, action.model_copy(update={"sell_fraction": 1/9}), 120, today=AT.date())
     partial.positions[0].quantity = 8
@@ -294,12 +297,15 @@ def test_partial_sell_recovery_keeps_original_stage_and_only_books_remaining_leg
                         (3, 360., None) if side == "sell" else (0, 0., None))
     monkeypatch.setattr(kis, "fetch_holdings", lambda **k: {TICKER: (6, 100.)})
     monkeypatch.setattr(pipeline, "display_name", lambda t: t)
-    assert order_recovery.recover_observed_fill(datetime.now(calendar.KST) + timedelta(minutes=1), TICKER)
+    assert order_recovery.recover_observed_fill(AT + timedelta(days=1), TICKER)
     final = portfolio_store.load_portfolio().positions[0]
     assert final.quantity == 6 and final.take_profit_stage == partial.positions[0].take_profit_stage == 1
     rows = [json.loads(line) for line in journal.read_text().splitlines()]
     assert [r["shares_sold"] for r in rows] == [1, 2]
     assert rows[-1]["exit_trigger"] == "take_profit_first"
+    assert rows[-1]["day"] == AT.date().isoformat()
+    assert rows[-1]["holding_days"] == (AT.date() - initial.positions[0].entry_day).days
+    assert rows[-1]["recovered_at"] == (AT + timedelta(days=1)).isoformat()
 
 
 def test_f10_f11_partial_fill_without_fee_recovers_only_remaining_shares(monkeypatch, tmp_path):

@@ -1535,6 +1535,7 @@ async def finalize_sell(
     sell_execute_fn: SellExecuteFn,
     log_path: Path,
     trade_journal_log_path: Path,
+    *, recovered_at: datetime | None = None,
 ) -> PortfolioState:
     """이미 정해진 SellAction 하나를 집행 + 로그 + 알림까지 마무리한다.
 
@@ -1670,6 +1671,8 @@ async def finalize_sell(
             # 나중에 성과를 갈라볼 때 필요하다.
             "exit_plan": position.exit_plan.model_dump(mode="json") if position.exit_plan else None,
         }
+    if recovered_at is not None:
+        sell_row.update(recovery=True, recovered_at=recovered_at.isoformat())
     if fill is not None and order_guard.is_blocked(action.ticker):
         order_guard.commit_effect(action.ticker, before_portfolio, portfolio,
                                   [(trade_journal_log_path, sell_row)],

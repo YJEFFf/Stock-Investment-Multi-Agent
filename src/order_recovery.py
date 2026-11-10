@@ -325,7 +325,7 @@ def recover_observed_fill(now, ticker, *, policy=None):
                        "sector": context["sector"], "quantity": quantity, "entry_price": fill.price,
                        "entry_price_source": "fill", "fee_amount": fee, "order_no": order.order_no,
                        "order_total_fee": cumulative.fee,
-                       "decision": context["decision"], "recovery": True,
+                       "decision": context["decision"], "recovery": True, "recovered_at": now.isoformat(),
                        "exit_plan": updated_position.exit_plan.model_dump(mode="json") if updated_position.exit_plan else None,
                        "exit_plan_source": context["exit_plan_source"]}
                 order_guard.commit_effect(ticker, current, updated, [(context["log_path"], row)],
@@ -351,8 +351,8 @@ def recover_observed_fill(now, ticker, *, policy=None):
                 event_position = position.model_copy(update={"take_profit_stage": initial.take_profit_stage})
                 journal = Path(context["last_entries"][0]["path"]) if context.get("last_entries") else JOURNAL_PATH
                 asyncio.run(pipeline.finalize_sell(current, action, event_position, fill.price,
-                    now.astimezone(KST), verified,
-                    pipeline.DEFAULT_SELL_LOG_PATH, journal))
+                    order.created_at.astimezone(KST), verified,
+                    pipeline.DEFAULT_SELL_LOG_PATH, journal, recovered_at=now.astimezone(KST)))
             return True
     except portfolio_store.PortfolioLockBusy:
         return False
