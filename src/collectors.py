@@ -19,7 +19,7 @@ import requests
 from dotenv import load_dotenv
 
 from src import kis, collector_routes
-from src.schemas import DisclosureItem, MarketContext, NewsItem, OHLCVBar
+from src.schemas import DisclosureItem, DisclosurePage, MarketContext, NewsItem, OHLCVBar
 
 load_dotenv()
 
@@ -37,6 +37,8 @@ NAVER_SECTOR_GROUP_LIST_URL = "https://finance.naver.com/sise/sise_group.naver"
 NAVER_SECTOR_GROUP_DETAIL_URL = "https://finance.naver.com/sise/sise_group_detail.naver"
 DART_CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
+DART_PAGE_SIZE = 100
+DART_MAX_REPORTS = 10_000  # Resource guard, not selection: exceeding it fails the entire collection.
 
 KOSPI200_INDEX_SYMBOL = "KPI200"
 
@@ -96,7 +98,9 @@ def _fetch_with_retries(
     반환해 "판단 불가" 상태로 이어지게 한다.
     """
     merged_headers = {"User-Agent": USER_AGENT, **(headers or {})}
-    last_error: Exception | None = None
+    last_error: str | None = None
+    dart = urlsplit(url).hostname == "opendart.fss.or.kr"
+    log_url = url.split("?", 1)[0] if dart else url
 
     naver = urlsplit(url).scheme == "https" and urlsplit(url).hostname in collector_routes.HOSTS
     for attempt in range(1, MAX_RETRIES + 1):
@@ -112,11 +116,13 @@ def _fetch_with_retries(
             payload = response.content if binary else response.text
             parsed = parse(payload)
             if source and source not in {"sector_groups", "sector_members"}:
-                _record_collection_success(source, payload, slots=source_slots, params=params)
+                _record_collection_success(source, payload, slots=source_slots, params=None if dart else params)
             return parsed
         except (requests.RequestException, ET.ParseError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as exc:
-            last_error = exc
-            logger.warning("fetch_failed url=%s attempt=%d error=%s", url, attempt, exc)
+            # Requests/validation errors can include the complete URL or payload.
+            # Never serialize them for DART, whose API key is a query parameter.
+            last_error = type(exc).__name__ if dart else str(exc)
+            logger.warning("fetch_failed url=%s attempt=%d error=%s", log_url, attempt, last_error)
             if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code in (404, 410):
                 break  # 폐기된 주소를 세 번 기다려도 복구되지 않는다.
             if naver and isinstance(exc, ValueError) and "endpoint redirected" in str(exc):
@@ -124,9 +130,10 @@ def _fetch_with_retries(
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
-    logger.error("fetch_exhausted url=%s error=%s", url, last_error)
+    logger.error("fetch_exhausted url=%s error=%s", log_url, last_error)
     if source:
-        _queue_collection_failure(source, str(last_error)[:400], slots=source_slots, params=params)
+        _queue_collection_failure(source, str(last_error)[:400], slots=source_slots,
+                                  params=None if dart else params)
     return None
 
 
@@ -699,20 +706,31 @@ _corp_code_lock = threading.Lock()
 def _parse_corp_code_zip(zip_bytes: bytes) -> dict[str, str]:
     mapping: dict[str, str] = {}
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        with zf.open(zf.namelist()[0]) as stream:
+        members = [n for n in zf.namelist() if n.upper() == "CORPCODE.XML"]
+        if len(members) != 1:
+            raise ValueError("DART corporation file missing or duplicated")
+        with zf.open(members[0]) as stream:
             parser = ET.iterparse(stream, events=("start", "end"))
             _, root = next(parser)
+            if root.tag != "result":
+                raise ValueError("Unexpected DART corporation root")
             for event, item in parser:
                 if event == "end" and item.tag == "list":
                     stock_code = (item.findtext("stock_code") or "").strip()
                     corp_code = (item.findtext("corp_code") or "").strip()
                     if stock_code:
+                        if (not re.fullmatch(r"[0-9A-Z]{6}", stock_code)
+                                or not re.fullmatch(r"[0-9]{8}", corp_code)
+                                or stock_code in mapping):
+                            raise ValueError("Invalid or duplicate DART corporation identity")
                         mapping[stock_code] = corp_code
                     root.clear()
+    if not mapping:
+        raise ValueError("Empty DART corporation map")
     return mapping
 
 
-def _load_corp_code_map() -> dict[str, str]:
+def _load_corp_code_map() -> dict[str, str] | None:
     """DART 고유번호(corp_code) 매핑을 받아 프로세스 생애주기 동안 캐시한다.
 
     자주 바뀌지 않는 데이터라 파일 캐시까지는 필요 없다. 수집 실패 시에는 캐시하지
@@ -730,61 +748,160 @@ def _load_corp_code_map() -> dict[str, str]:
         mapping = _fetch_with_retries(
             DART_CORP_CODE_URL, _parse_corp_code_zip, params={"crtfc_key": api_key}, binary=True
         )
-        if mapping is None:
-            return {}
+        if not mapping:
+            return None
         _corp_code_cache = mapping
         return _corp_code_cache
 
 
-def _parse_disclosure_list(json_text: str) -> list[DisclosureItem]:
+def _parse_disclosure_page(
+    json_text: str, *, ticker: str | None = None, corp_code: str | None = None,
+    begin_date: date | None = None, end_date: date | None = None,
+    page_no: int | None = None, page_count: int | None = None,
+) -> DisclosurePage:
     data = json.loads(json_text)
+    if not isinstance(data, dict):
+        raise ValueError("DART response is not an object")
     status = data.get("status")
 
     if status == "013":  # 조회된 데이터가 없습니다 — 정상적인 0건 상태
-        return []
+        if (data.get("list", []) != [] or data.get("total_count", 0) not in (0, "0")
+                or data.get("total_page", 0) not in (0, "0")
+                or any(k in data and (isinstance(data[k], bool) or not isinstance(data[k], (int, str)))
+                       for k in ("total_count", "total_page"))
+                or ("page_no" in data and str(data["page_no"]) != str(page_no or 1))
+                or ("page_count" in data and str(data["page_count"]) != str(page_count or DART_PAGE_SIZE))):
+            raise ValueError("Contradictory DART no-data response")
+        return DisclosurePage(page_no=page_no or 1, page_count=page_count or DART_PAGE_SIZE,
+                              total_count=0, total_page=0, items=[])
     if status != "000":
-        raise ValueError(f"DART API error status={status} message={data.get('message')}")
+        # Do not echo provider text: it may include authentication parameters.
+        raise ValueError("DART API returned an error status")
+
+    def integer(key: str) -> int:
+        value = data.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, str)) or not re.fullmatch(r"[0-9]+", str(value)):
+            raise ValueError("Missing or invalid DART pagination metadata")
+        return int(value)
+
+    number, size, total, pages = (integer(k) for k in ("page_no", "page_count", "total_count", "total_page"))
+    if (not 1 <= size <= 100 or total < 1 or not 1 <= number <= pages
+            or pages != (total + size - 1) // size
+            or (page_no is not None and number != page_no)
+            or (page_count is not None and size != page_count)):
+        raise ValueError("Inconsistent DART pagination metadata")
+    rows = data.get("list")
+    if not isinstance(rows, list) or len(rows) != min(size, total - (number - 1) * size):
+        raise ValueError("Missing or incomplete DART page")
 
     items = []
-    for row in data.get("list", []):
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("Invalid DART report row")
+        for key in ("report_nm", "flr_nm", "rcept_dt", "rcept_no", "corp_code", "stock_code"):
+            if not isinstance(row.get(key), str) or not row[key].strip():
+                raise ValueError("Missing DART report field")
+        if (not re.fullmatch(r"[0-9]{8}", row["corp_code"])
+                or not re.fullmatch(r"[0-9A-Z]{6}", row["stock_code"])
+                or (corp_code is not None and row["corp_code"] != corp_code)
+                or (ticker is not None and row["stock_code"] != ticker)
+                or not re.fullmatch(r"[0-9]{14}", row["rcept_no"])
+                or row["rcept_no"] in seen):
+            raise ValueError("Wrong or duplicate DART report identity")
+        if not re.fullmatch(r"[0-9]{8}", row["rcept_dt"]):
+            raise ValueError("Invalid DART receipt date")
+        received = datetime.strptime(row["rcept_dt"], "%Y%m%d").date()
+        if (begin_date is not None and received < begin_date) or (end_date is not None and received > end_date):
+            raise ValueError("DART report outside requested window")
+        remark = row.get("rm")
+        if remark == "":
+            remark = None
+        if remark is not None and (not isinstance(remark, str) or set(remark) - set("유코채넥공연정철")):
+            raise ValueError("Unknown DART remark code")
+        seen.add(row["rcept_no"])
         items.append(
             DisclosureItem(
-                report_name=row["report_nm"],
-                submitter=row["flr_nm"],
-                received_at=datetime.strptime(row["rcept_dt"], "%Y%m%d").date(),
+                report_name=row["report_nm"].strip(),
+                submitter=row["flr_nm"].strip(),
+                received_at=received,
                 receipt_no=row["rcept_no"],
-                remark=row.get("rm") or None,
+                remark=remark,
                 url=f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={row['rcept_no']}",
+                corp_code=row["corp_code"], stock_code=row["stock_code"],
             )
         )
-    return items
+    return DisclosurePage(page_no=number, page_count=size, total_count=total, total_page=pages, items=items)
 
 
-def fetch_disclosures(ticker: str, lookback_days: int = 30, limit: int = 10) -> list[DisclosureItem] | None:
-    """DART 공시검색 API에서 종목별 최근 공시 목록을 가져온다.
+def _parse_disclosure_list(json_text: str) -> list[DisclosureItem]:
+    return _parse_disclosure_page(json_text).items
 
-    corp_code 없이 조회하면 전체 법인 대상 검색이 되어 종목당 독립 호출 원칙(규칙 5)이
-    깨지므로, corp_code를 항상 채워서 요청한다. 우리 유니버스에 없는 종목이면(매핑에
-    없으면) 수집 실패가 아니라 빈 리스트를 반환한다.
+
+def disclosure_window(as_of: datetime, lookback_days: int = 30) -> tuple[date, date]:
+    if as_of.tzinfo is None or type(lookback_days) is not int or lookback_days < 1:
+        raise ValueError("Disclosure window needs an aware cutoff and positive calendar-day count")
+    end = as_of.astimezone(ZoneInfo("Asia/Seoul")).date()
+    return end - timedelta(days=lookback_days - 1), end
+
+
+def fetch_disclosures(
+    ticker: str, lookback_days: int = 30, limit: int | None = None, *,
+    as_of: datetime | None = None, final_only: bool = True,
+) -> list[DisclosureItem] | None:
+    """Collect every page in a KST date window, or return None on uncertainty.
+
+    [] means a verified DART 013, never a missing mapping. The optional limit is
+    a fail-closed resource bound, not a slice. Buy analysis uses DART's final
+    reports; the shadow history reader explicitly requests all revisions.
+    This is a current snapshot, not historical point-in-time reconstruction.
     """
-    corp_code = _load_corp_code_map().get(ticker)
-    if corp_code is None:
-        return []
+    if not re.fullmatch(r"[0-9A-Z]{6}", ticker):
+        raise ValueError("Invalid disclosure ticker")
+    if limit is not None and (type(limit) is not int or limit < 1):
+        raise ValueError("Invalid disclosure resource limit")
+    begin_date, end_date = disclosure_window(as_of or datetime.now(ZoneInfo("Asia/Seoul")), lookback_days)
+    mapping = _load_corp_code_map()
+    corp_code = (mapping or {}).get(ticker)
+    if not isinstance(corp_code, str) or not re.fullmatch(r"[0-9]{8}", corp_code):
+        logger.error("disclosure_unavailable ticker=%s reason=corp_code_unavailable", ticker)
+        return None
 
-    end_date = datetime.now(timezone.utc).date()
-    begin_date = end_date - timedelta(days=lookback_days)
     params = {
         "crtfc_key": os.getenv("DART_API_KEY", ""),
         "corp_code": corp_code,
         "bgn_de": begin_date.strftime("%Y%m%d"),
         "end_de": end_date.strftime("%Y%m%d"),
-        "page_count": limit,
+        "page_count": DART_PAGE_SIZE,
+        "sort": "date", "sort_mth": "desc", "last_reprt_at": "Y" if final_only else "N",
     }
-
-    items = _fetch_with_retries(DART_LIST_URL, _parse_disclosure_list, params=params)
-    if items is None:
-        return None
-    return items[:limit]
+    items, seen = [], set()
+    total, pages, number = None, None, 1
+    while pages is None or number <= pages:
+        page = _fetch_with_retries(
+            DART_LIST_URL,
+            lambda text: _parse_disclosure_page(text, ticker=ticker, corp_code=corp_code,
+                begin_date=begin_date, end_date=end_date, page_no=number, page_count=DART_PAGE_SIZE),
+            params={**params, "page_no": number},
+        )
+        if page is None:
+            return None
+        if page.total_count > min(DART_MAX_REPORTS, limit or DART_MAX_REPORTS):
+            logger.error("disclosure_unavailable ticker=%s reason=report_limit total=%d", ticker, page.total_count)
+            return None
+        if total is not None and (total, pages) != (page.total_count, page.total_page):
+            logger.error("disclosure_unavailable ticker=%s reason=changed_pagination", ticker)
+            return None
+        total, pages = page.total_count, page.total_page
+        for item in page.items:
+            if (item.receipt_no in seen or (items and item.received_at > items[-1].received_at)
+                    or (final_only and any(c in (item.remark or "") for c in "정철"))):
+                logger.error("disclosure_unavailable ticker=%s reason=duplicate_order_or_unresolved_revision", ticker)
+                return None
+            seen.add(item.receipt_no)
+            items.append(item)
+        number += 1
+    return items
 
 
 def _naver_raw_number(row: dict, key: str) -> float | None:

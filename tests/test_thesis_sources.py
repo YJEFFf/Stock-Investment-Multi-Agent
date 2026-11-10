@@ -5,7 +5,7 @@ from datetime import timedelta
 import pytest
 
 from src import thesis_sources as sources
-from src.schemas import DisclosureItem, MarketContext, NewsItem, OHLCVBar
+from src.schemas import DisclosureItem, MarketContext, NewsItem, OHLCVBar, ThesisDocument
 from tests.test_thesis_shadow import ENTRY, REVIEW, OLD_URL, NEW_URL, capture, entry_record, setup
 
 
@@ -66,7 +66,7 @@ def test_new_sources_respect_publication_time_and_original_ids(setup, monkeypatc
     reports = [DisclosureItem(report_name="변경", submitter="회사", received_at=day, receipt_no=receipt,
                               remark=None, url="https://dart.fss.or.kr/dsaf001/main.do?rcpNo="+receipt)
                for day, receipt in [(ENTRY.date(), "20261105000001"), (REVIEW.date(), "20261106000001")]]
-    monkeypatch.setattr(sources.collectors, "fetch_disclosures", lambda ticker: reports)
+    monkeypatch.setattr(sources.collectors, "fetch_disclosures", lambda ticker, **kwargs: reports)
     monkeypatch.setattr(sources.collectors, "_load_corp_code_map", lambda: {"005930": "00126380"})
     fetched = []
     monkeypatch.setattr(sources, "fetch_news_body", lambda item: fetched.append(item.url) or "계약 해지")
@@ -78,16 +78,42 @@ def test_new_sources_respect_publication_time_and_original_ids(setup, monkeypatc
 
 
 def test_failed_dart_mapping_is_not_no_disclosures(monkeypatch):
-    monkeypatch.setattr(sources.collectors, "_load_corp_code_map", lambda: {})
-    monkeypatch.setattr(sources.collectors, "fetch_disclosures", lambda ticker: [])
-    with pytest.raises(sources.SourceUnavailable, match="dart_corp_code_unavailable"):
+    monkeypatch.setattr(sources.collectors, "fetch_disclosures", lambda ticker, **kwargs: None)
+    with pytest.raises(sources.SourceUnavailable, match="dart_collection_unavailable"):
         sources._disclosures("005930")
 
 
 def test_verified_dart_mapping_allows_genuine_zero_reports(monkeypatch):
     monkeypatch.setattr(sources.collectors, "_load_corp_code_map", lambda: {"005930": "00126380"})
-    monkeypatch.setattr(sources.collectors, "fetch_disclosures", lambda ticker: [])
+    monkeypatch.setattr(sources.collectors, "fetch_disclosures", lambda ticker, **kwargs: [])
     assert sources._disclosures("005930") == []
+
+
+def test_shadow_requests_all_revisions_at_its_own_cutoff(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sources.collectors, "fetch_disclosures", lambda ticker, **kw: calls.append((ticker, kw)) or [])
+    assert sources._disclosures("005930", REVIEW) == []
+    assert calls == [("005930", {"as_of": REVIEW, "final_only": False})]
+
+
+@pytest.mark.parametrize("remark", ["유정", "철"])
+def test_shadow_detects_invalidated_known_original_even_before_entry(setup, monkeypatch, remark):
+    capture(setup)
+    thesis = entry_record(setup)
+    receipt = "20261104000001"
+    url = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + receipt
+    thesis.documents.append(ThesisDocument(ticker="005930", source_id=url, kind="disclosure",
+        scope="headline", content="원래 공시", observed_at=ENTRY, published_on=ENTRY.date() - timedelta(days=1)))
+    report = DisclosureItem(report_name="원래 공시", submitter="회사", received_at=ENTRY.date() - timedelta(days=1),
+                            receipt_no=receipt, remark=remark, url=url)
+    monkeypatch.setattr(sources.collectors, "fetch_market_context", lambda ticker: None)
+    monkeypatch.setattr(sources.collectors, "fetch_company_news", lambda ticker: [])
+    monkeypatch.setattr(sources.collectors, "fetch_disclosures", lambda ticker, **kw: [report])
+    def forbidden(item):
+        pytest.fail("Invalidated original must not be fetched as fresh business evidence")
+    monkeypatch.setattr(sources, "fetch_disclosure_body", forbidden)
+    docs, failures = COLLECT(thesis, REVIEW)
+    assert not docs and "disclosure:revision_unresolved:" + url in failures
 
 
 COLLECT = sources.collect_new_documents

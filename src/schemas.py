@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 
 class AppAlert(BaseModel):
@@ -142,6 +142,27 @@ class DisclosureItem(BaseModel):
     receipt_no: str
     remark: str | None
     url: str
+    # Optional only for historical logs created before identity validation.
+    corp_code: str | None = None
+    stock_code: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _preserve_legacy_shape(self, handler):
+        data = handler(self)
+        for key in ("corp_code", "stock_code"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
+
+
+class DisclosurePage(BaseModel):
+    """Validated DART pagination; never discard completeness metadata in parsing."""
+
+    page_no: int
+    page_count: int
+    total_count: int
+    total_page: int
+    items: list[DisclosureItem]
 
 
 class DisclosureContext(BaseModel):
@@ -150,6 +171,18 @@ class DisclosureContext(BaseModel):
     ticker: str
     as_of: datetime
     disclosures: list[DisclosureItem]
+    # Receipt dates have day precision; as_of remains the observation cutoff.
+    query_begin: date | None = None
+    query_end: date | None = None
+    latest_received_at: date | None = None
+
+    @model_serializer(mode="wrap")
+    def _preserve_legacy_shape(self, handler):
+        data = handler(self)
+        for key in ("query_begin", "query_end", "latest_received_at"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class AnalystOpinion(BaseModel):

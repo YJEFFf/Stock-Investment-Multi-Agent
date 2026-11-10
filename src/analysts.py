@@ -1,13 +1,15 @@
 import hashlib
 import random
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 
 from src import llm
 from src.schemas import (
     AnalystOpinion,
+    DataCollectionUnavailable,
     DisclosureContext,
     DisclosureItem,
     MarketContext,
@@ -218,7 +220,8 @@ def _format_disclosure_items(items: list[DisclosureItem]) -> str:
     lines = []
     for item in items:
         remark = f", 비고: {item.remark}" if item.remark else ""
-        lines.append(f"- [{item.received_at.isoformat()}] {item.report_name} (제출인: {item.submitter}{remark})")
+        lines.append(f"- [{item.received_at.isoformat()}] {item.report_name} "
+                     f"(접수번호: {item.receipt_no}, 제출인: {item.submitter}{remark})")
     return "\n".join(lines)
 
 
@@ -226,6 +229,8 @@ def _format_disclosure_prompt(template: str, context: DisclosureContext) -> str:
     return template.format(
         ticker=context.ticker,
         as_of=context.as_of.isoformat(),
+        query_window=f"{context.query_begin} ~ {context.query_end}" if context.query_begin and context.query_end else "not recorded",
+        latest_received_at=max((d.received_at for d in context.disclosures), default=None),
         disclosures=_format_disclosure_items(context.disclosures),
     )
 
@@ -240,6 +245,19 @@ async def disclosure_analyst(context: DisclosureContext) -> AnalystOpinion | Non
     """
     if not context.disclosures:
         return None
+    # Also protect manually supplied/legacy contexts; never let a title stand in
+    # for the valid terms of a corrected or withdrawn report.
+    if context.as_of.tzinfo is None:
+        raise DataCollectionUnavailable("disclosure_cutoff_timezone_missing")
+    end = context.as_of.astimezone(ZoneInfo("Asia/Seoul")).date()
+    if (len({d.receipt_no for d in context.disclosures}) != len(context.disclosures)
+            or any(any(c in (d.remark or "") for c in "정철")
+                   or (d.stock_code is not None and d.stock_code != context.ticker)
+                   or d.received_at > end
+                   or (context.query_begin is not None and d.received_at < context.query_begin)
+                   or (context.query_end is not None and d.received_at > context.query_end)
+                   for d in context.disclosures)):
+        raise DataCollectionUnavailable("disclosure_identity_date_or_revision_unresolved")
 
     template = DISCLOSURE_PROMPT_PATH.read_text()
     version = _prompt_version(template)
@@ -259,7 +277,10 @@ async def disclosure_analyst(context: DisclosureContext) -> AnalystOpinion | Non
         score=result.score,
         confidence=result.confidence,
         evidence=[f"prompt:disclosure@{version}", *dict.fromkeys(d.url for d in context.disclosures)],
-        as_of=context.as_of,
+        # DART supplies a date, not a receipt time. Midnight is a date projection;
+        # the exact observation time and receipt date remain separate in context.
+        as_of=datetime.combine(max(d.received_at for d in context.disclosures), time.min,
+                               tzinfo=ZoneInfo("Asia/Seoul")),
         reasoning=result.reasoning,
         source_context=context,
     )

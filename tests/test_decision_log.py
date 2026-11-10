@@ -160,7 +160,7 @@ def test_each_analysts_score_is_logged_not_just_the_average(tmp_path):
         assert [o["agent"] for o in e["opinions"]] == e["analysts"]
         scores = [o["score"] for o in e["opinions"]]
         assert sum(scores) / len(scores) == e["avg_score"]
-        assert all({"agent", "score", "confidence", "prompt", "as_of", "evidence",
+        assert all({"agent", "score", "confidence", "prompt", "as_of", "as_of_precision", "evidence",
                     "reasoning", "source_context"} == set(o) for o in e["opinions"])
         assert all(o["prompt"] in o["evidence"] and o["as_of"] for o in e["opinions"])
         assert all(o["prompt"] == "prompt:dummy@m1" for o in e["opinions"])

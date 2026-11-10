@@ -531,6 +531,7 @@ FAKE_DISCLOSURE_LIST_JSON = json.dumps(
     {
         "status": "000",
         "message": "정상",
+        "page_no": 1, "page_count": 100, "total_count": 1, "total_page": 1,
         "list": [
             {
                 "corp_code": "00126380",
@@ -581,7 +582,7 @@ def test_corp_code_failed_collection_remains_retryable(monkeypatch):
     monkeypatch.setattr(collectors, "_corp_code_cache", None)
     results = iter([None, {"005930": "00126380"}])
     monkeypatch.setattr(collectors, "_fetch_with_retries", lambda *a, **k: next(results))
-    assert collectors._load_corp_code_map() == {}
+    assert collectors._load_corp_code_map() is None
     assert collectors._load_corp_code_map() == {"005930": "00126380"}
 
 
@@ -638,18 +639,18 @@ def test_fetch_disclosures_success(monkeypatch):
 
     monkeypatch.setattr(collectors.requests, "get", lambda *a, **k: FakeResponse())
 
-    items = collectors.fetch_disclosures("005930")
+    items = collectors.fetch_disclosures("005930", as_of=datetime(2026, 1, 5, tzinfo=collectors.ZoneInfo("Asia/Seoul")))
 
     assert items is not None
     assert len(items) == 1
 
 
-def test_fetch_disclosures_ticker_not_in_map_returns_empty_list(monkeypatch):
+def test_fetch_disclosures_ticker_not_in_map_is_unavailable(monkeypatch):
     monkeypatch.setattr(collectors, "_corp_code_cache", {})
 
     items = collectors.fetch_disclosures("999999")
 
-    assert items == []
+    assert items is None
 
 
 def test_fetch_disclosures_returns_none_after_exhausting_retries(monkeypatch):

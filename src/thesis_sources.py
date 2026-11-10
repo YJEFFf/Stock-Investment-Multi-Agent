@@ -172,12 +172,13 @@ def original_documents(decision: Decision) -> list[ThesisDocument]:
     return list(documents.values())
 
 
-def _disclosures(ticker):
-    # The legacy collector conflates missing corp-code mappings with zero reports.
-    # For this experiment an unverified mapping is an unavailable source.
-    if not collectors._load_corp_code_map().get(ticker):
-        raise SourceUnavailable("dart_corp_code_unavailable")
-    return collectors.fetch_disclosures(ticker)
+def _disclosures(ticker, now=None):
+    # The shadow needs revision/withdrawal events too. Unlike buy analysis it
+    # must not silently erase them by selecting only currently final reports.
+    items = collectors.fetch_disclosures(ticker, as_of=now, final_only=False)
+    if items is None:
+        raise SourceUnavailable("dart_collection_unavailable")
+    return items
 
 
 def collect_new_documents(thesis: EntryThesisRecord, now: datetime) -> tuple[list[ThesisDocument], list[str]]:
@@ -193,7 +194,7 @@ def collect_new_documents(thesis: EntryThesisRecord, now: datetime) -> tuple[lis
     today = now.astimezone(KST).date()
     for kind, fetch in (("chart", lambda: collectors.fetch_market_context(ticker)),
                         ("news", lambda: collectors.fetch_company_news(ticker)),
-                        ("disclosure", lambda: _disclosures(ticker))):
+                        ("disclosure", lambda: _disclosures(ticker, now))):
         try:
             items = fetch()
             if items is None:
@@ -210,6 +211,10 @@ def collect_new_documents(thesis: EntryThesisRecord, now: datetime) -> tuple[lis
                 ))
                 continue
             for item in items:
+                if kind == "disclosure" and any(c in (item.remark or "") for c in "정철"):
+                    if item.url in known or cutoff.astimezone(KST).date() < item.received_at <= today:
+                        failures.append("disclosure:revision_unresolved:" + item.url)
+                    continue  # A known original can become invalid without a new receipt ID.
                 if item.url in known:
                     continue
                 if kind == "news":

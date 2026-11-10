@@ -120,12 +120,12 @@ def test_full_daily_workflow_sell_then_buy_end_to_end(monkeypatch, tmp_path):
     monkeypatch.setattr(
         collectors,
         "fetch_disclosures",
-        lambda ticker, lookback_days=30, limit=10: [
+        lambda ticker, lookback_days=30, limit=None, **kwargs: [
             DisclosureItem(
                 report_name="테스트 공시",
                 submitter="삼성전자",
-                received_at=date(2026, 1, 10),
-                receipt_no="20260110000001",
+                received_at=kwargs["as_of"].date(),
+                receipt_no=kwargs["as_of"].strftime("%Y%m%d") + "000001",
                 remark=None,
                 url="https://example.test/disclosure",
             )

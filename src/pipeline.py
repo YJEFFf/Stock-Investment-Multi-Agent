@@ -696,17 +696,20 @@ def make_news_analyst_fn(news_limit: int = 10) -> AnalystFn:
     return _fn
 
 
-def make_disclosure_analyst_fn(lookback_days: int = 30, limit: int = 10) -> AnalystFn:
+def make_disclosure_analyst_fn(lookback_days: int = 30, limit: int | None = None) -> AnalystFn:
     """실데이터 경로: 공시 분석가만 단독으로 호출. sector는 필요 없어 무시한다."""
 
     async def _fn(ticker: str, sector: str, day: datetime) -> list[AnalystOpinion]:
-        disclosures = await asyncio.to_thread(collectors.fetch_disclosures, ticker, lookback_days, limit)
+        disclosures = await asyncio.to_thread(collectors.fetch_disclosures, ticker, lookback_days, limit, as_of=day)
         run_history.observe(ticker, "disclosure", disclosures,
                             latest=max((d.received_at for d in disclosures or []), default=None))
         if disclosures is None:
             return []
 
-        context = DisclosureContext(ticker=ticker, as_of=day, disclosures=disclosures)
+        begin, end = collectors.disclosure_window(day, lookback_days)
+        context = DisclosureContext(ticker=ticker, as_of=day, disclosures=disclosures,
+                                    query_begin=begin, query_end=end,
+                                    latest_received_at=max((d.received_at for d in disclosures), default=None))
         opinion = await disclosure_analyst(context)
         return [opinion] if opinion is not None else []
 
@@ -1035,6 +1038,7 @@ async def run_day(
                         "confidence": o.confidence,
                         "prompt": next((x for x in o.evidence if x.startswith("prompt:")), None),
                         "as_of": o.as_of.isoformat(),
+                        "as_of_precision": "date" if o.agent == "disclosure" else "timestamp",
                         "evidence": o.evidence,
                         "reasoning": o.reasoning,
                         "source_context": o.source_context.model_dump(mode="json") if o.source_context else None,

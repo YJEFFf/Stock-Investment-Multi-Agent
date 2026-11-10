@@ -1,5 +1,6 @@
 import asyncio
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -56,7 +57,8 @@ def test_disclosure_analyst_builds_opinion_with_prompt_version(monkeypatch):
     assert opinion.confidence == 0.7
     assert opinion.evidence[0] == f"prompt:disclosure@{expected_version}"
     assert set(opinion.evidence[1:]) == {d.url for d in context.disclosures}
-    assert opinion.as_of == context.as_of
+    assert opinion.as_of == datetime(2026, 1, 5, tzinfo=ZoneInfo("Asia/Seoul"))
+    assert opinion.source_context.as_of == context.as_of
 
 
 def test_disclosure_analyst_propagates_llm_failure(monkeypatch):

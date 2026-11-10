@@ -12,14 +12,20 @@ happen on your judgment alone.
 ## Data
 
 Ticker: {ticker}
-As of: {as_of}
+Observed as of: {as_of}
+Receipt-date window (KST, inclusive): {query_window}
+Latest receipt date (day precision, not the observation time): {latest_received_at}
 
-Recent disclosures (report name, submitter, received date, remark code):
+Final reports returned by DART (report name, submitter, received date, receipt ID, remark code):
 {disclosures}
 
 Notes on remark codes you may see: 유(유가증권시장), 코(코스닥), 채(채권), 넥(코넥스),
-공(공정거래위원회 관련), 연(연결), 정(정정신고), 철(철회). These are administrative
-tags, not sentiment signals by themselves.
+공(공정거래위원회 관련), 연(연결) describe jurisdiction or reporting scope.
+The collector requests final reports and rejects unresolved `정` (a subsequent
+correction exists) or `철` (withdrawn) flags. A title beginning [기재정정] or
+[첨부정정] can itself be the final report: it does not establish a new independent
+business event or a deterioration. Do not infer correction relationships by matching
+titles, or infer the economic direction of a correction without its changed terms.
 
 ## Task
 
@@ -34,8 +40,9 @@ late filing, or clustering with other disclosures). Use your knowledge of what t
 disclosure types typically mean, but be conservative about strength of conviction when
 the title alone doesn't make the direction clear.
 
-If there are no disclosures at all in the recent window, say so plainly in your
-reasoning and keep confidence low.
+You have titles and metadata only, not report bodies or financial figures. Do not
+invent earnings changes, transaction amounts, completion, or materiality that the
+titles do not establish. A new observation time does not make an old filing new.
 
 Respond with a single JSON object, and nothing else:
 
