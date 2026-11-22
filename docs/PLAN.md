@@ -217,7 +217,9 @@ KOSPI200 전체에 분석가 4개를 돌리면 하루 800회 호출이다. 정�
 Codex 구독 종료 후 사용자 결정으로 Codex가 맡던 모델 호출 다섯 곳 — 매수 판단(분석가·토론·
 매니저), 06:55 연결·한도 점검, 판단 로그 번역, 기록 전용 근거 감시, 수집 자동 수리 — 을
 `src/claude_plan.py`로 옮겼다. `scripts/decide_buys.py`의 `BUY_LLM_PROVIDER="claude_plan"`이며
-`"codex_plan"`으로 되돌리면 같은 코드로 롤백된다. 기존 보유분 가상 매도는 원래 모델을 쓰지
+`"codex_plan"`으로 되돌리면 같은 판단 코드로 롤백된다. 단 Codex 한도 파일을 쓰던
+`scripts/check_codex_plan.*`는 삭제했으므로 롤백 때 git 이력에서 복원해야 한다(없으면 매일
+`plan_capacity_unavailable`로 실패 폐쇄). 기존 보유분 가상 매도는 원래 모델을 쓰지
 않으므로 이 전환과 무관하게 계속 돈다. `EXIT_ONLY=True` 동안 CLI 실행은 전부 차단된다.
 
 계약은 Codex 경로와 같다. 전용 계정 `sima-claude`(로그인 셸 없음, 홈 750)에서
@@ -228,8 +230,9 @@ Codex 구독 종료 후 사용자 결정으로 Codex가 맡던 모델 호출 다
 구독 로그인을 읽지 않아 쓰지 않는다. 대신 `--tools ""`(구조화 출력 도구만 남음)·
 `--setting-sources ""`·`--strict-mcp-config`·`--disable-slash-commands`·
 `--no-session-persistence`·시스템 프롬프트 파일로 주입 입력만 판단하게 한다. 수집 자동
-수리만 WebSearch·WebFetch를 명시 허용한다. 동시 실행 2, 실패한 전송만 재시도하고 완료된
-판단·스키마 위반 응답은 다시 묻지 않는다. 호출 사용량은 기존 `logs/llm_calls.jsonl`에
+수리만 WebSearch(Codex `--search`와 같은 검색 전용)를 명시 허용한다. 동시 실행 2, 실패한
+전송만 재시도한다. 모델이 이미 구조화 답을 낸 뒤 오류가 나면 429·5xx여도 재시도하지 않고,
+스키마 위반 응답도 다시 묻지 않는다. 호출 사용량은 기존 `logs/llm_calls.jsonl`에
 `provider=claude_plan`과 표준 단가 환산치 `list_cost_usd`(구독 청구액 아님)로 남긴다.
 
 한도: 구독은 무추론 한도 조회 API가 없어서, 06:55 고정 연결 확인 응답에 딸려 오는
@@ -239,7 +242,9 @@ Codex 구독 종료 후 사용자 결정으로 Codex가 맡던 모델 호출 다
 일일 부하는 아직 측정하지 않았다. 구독은 사용자의 대화형 Claude Code 사용과 한도를 공유하고,
 5시간 창이 판단 도중 소진되면 회차 전체가 공급자 거부로 폐기된다. **매수 재개 전**에
 전체 일일 섀도로 소요 시간·한도 소모·모델(현재 `claude-sonnet-5-5`)을 측정하고 문턱을 다시
-정한다. 이것도 매도 설계 수정과 같이 재개 전 필수 항목이다.
+정한다. 이것도 매도 설계 수정과 같이 재개 전 필수 항목이다. 첫 실행은 EC2의 `sima-claude`
+계정·비탐색 임시 cwd·`sudo /usr/bin/env` 경로에서 아직 해 보지 않았다(로컬 Mac에서만 확인).
+그때 매 호출에 `rate_limit_event`가 오는지, Sonnet 전용 주간 창 같은 별도 창이 있는지도 본다.
 
 서버 준비는 `sudo bash deploy/install_claude_plan.sh`(전용 계정·공식 네이티브 CLI 설치·격리
 확인)이며, 구독 로그인은 사용자가 `ssh -t sima-ec2 'sudo -u sima-claude -H

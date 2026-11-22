@@ -133,6 +133,23 @@ def test_completed_turn_with_nonzero_exit_is_uncertain_and_never_retried(monkeyp
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("status", [429, 529])
+def test_error_after_the_answer_was_produced_is_never_retried(monkeypatch, tmp_path, status):
+    calls = []
+
+    def reply(command, kwargs):
+        calls.append(1)
+        stream = _stream({"status": "ok"}, subtype="error_during_execution", is_error=True, api_error_status=status)
+        answer = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "StructuredOutput", "input": {"status": "ok"}}]}}
+        return _Completed(1, stdout=json.dumps(answer) + "\n" + stream)
+    _fake(monkeypatch, reply=reply)
+    monkeypatch.setattr(claude_plan.asyncio, "sleep", lambda s: pytest.fail("retried a produced answer"))
+    with pytest.raises(claude_plan.PlanUnavailable, match="uncertain") as caught:
+        asyncio.run(claude_plan.check_health(log_path=tmp_path / "calls.jsonl"))
+    assert type(caught.value) is claude_plan.PlanUnavailable and len(calls) == 1
+
+
 def test_rate_limited_call_retries_only_the_failed_transport(monkeypatch, tmp_path):
     replies = iter([_Completed(1, stdout=_stream(None, subtype="error_during_execution", is_error=True, api_error_status=429)),
                     _Completed(stdout=_stream({"status": "ok"}))])
@@ -255,7 +272,7 @@ def test_exit_only_blocks_every_cli_start(monkeypatch):
                                                 json_schema={}))
 
 
-def test_collector_repair_search_allows_only_web_tools(monkeypatch, tmp_path):
+def test_collector_repair_search_allows_only_web_search(monkeypatch, tmp_path):
     from src import collector_repair
     seen = []
     _fake(monkeypatch, seen=seen, reply=lambda c, k: _Completed(stdout=_stream({"status": "ok"})))
@@ -263,6 +280,6 @@ def test_collector_repair_search_allows_only_web_tools(monkeypatch, tmp_path):
     monkeypatch.setattr(collector_repair, "audit", lambda *a, **k: None)
     collector_repair.model_call("collector_repair.md", {"x": 1}, claude_plan.HealthResponse, search=True)
     command, kwargs = seen[-1]
-    assert command[command.index("--tools") + 1] == "WebSearch,WebFetch"
-    assert command[command.index("--allowedTools") + 1] == "WebSearch,WebFetch"
+    assert command[command.index("--tools") + 1] == "WebSearch"
+    assert command[command.index("--allowedTools") + 1] == "WebSearch"
     assert kwargs["input"].startswith("UNTRUSTED INPUT DATA:")

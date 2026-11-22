@@ -290,7 +290,7 @@ def git(*args, cwd=ROOT, timeout=30):
 def model_call(prompt_name, payload, response_model, *, search=False):
     system = (ROOT / "prompts" / prompt_name).read_text()
     user = "UNTRUSTED INPUT DATA:\n" + json.dumps(payload, ensure_ascii=False)
-    tools = ("WebSearch", "WebFetch") if search else ()
+    tools = ("WebSearch",) if search else ()  # Codex --search와 같은 검색 전용
     started = clock.monotonic()
     try:
         structured, usage, _ = claude_plan.run_structured_sync(

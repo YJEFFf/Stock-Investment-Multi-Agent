@@ -15,7 +15,7 @@
 - 전환한 호출부:
   - `decide_buys`: `BUY_LLM_PROVIDER="claude_plan"`. `"codex_plan"`은 같은 코드로 롤백되며,
     이를 위해 codex_plan에 공통 이름 별칭을 추가했다.
-  - `translate`, `thesis_shadow`, `collector_repair`(검색 호출만 WebSearch·WebFetch 허용)
+  - `translate`, `thesis_shadow`, `collector_repair`(검색 호출만 WebSearch 허용)
   - `scripts/check_codex_plan.*` → `scripts/check_claude_plan.*`, 준비 잠금 `plan-readiness.lock`
   - `recover_operations`
   - 앱·노션·알림의 한도 문구와 파일(`claude_plan_capacity.json`)
@@ -27,8 +27,16 @@
   - 확인한 항목: `structured_output`, `apiKeySource=none`, `rate_limit_event`(5시간·7일),
     stdin 입력, `--system-prompt-file`
   - `--bare`는 구독 로그인을 읽지 않아 쓰지 않는다.
-- 새 `tests/test_claude_plan.py` 27개와 Codex 롤백 경로 테스트를 추가했다. 기존 테스트의 목킹 대상을 옮겼다.
-  전체 `SIMA_LIVE_TEST= .venv/bin/python -m pytest tests/ -q`: **1,177 통과·5 생략**.
+- 독립 리뷰(`0e5e9f9`, EXIT_ONLY 하 승인)의 지적을 반영했다.
+  - M1: 모델이 구조화 답을 낸 뒤 오는 429·5xx를 재시도하던 경로를 막았다. 규칙 4에 해당하며, 답이 이미 나왔으면 불확실 완료로 처리하고 재시도하지 않는다.
+  - EXIT_ONLY에서 연결 확인이 실패 로그를 남기지 않게 했다.
+  - 임시 디렉터리 정리 실패와 usage null 때문에 완료된 결과를 버리지 않게 했다.
+  - 수집 수리의 WebFetch를 제거해 검색 전용으로 했다.
+  - 설치 스크립트의 로그인 확인 grep을 고쳤다.
+  - Codex 롤백 시 준비 스크립트 복원이 필요하다는 점과 EC2 첫 실행 미검증을 PLAN에 적었다.
+  - 리뷰 중 로컬 `logs/claude_plan_calls.jsonl`에 남은 차단 기록 1줄은 삭제했다.
+- 새 `tests/test_claude_plan.py`(이후 29개)와 Codex 롤백 경로 테스트를 추가했다. 기존 테스트의 목킹 대상을 옮겼다.
+  전체 `SIMA_LIVE_TEST= .venv/bin/python -m pytest tests/ -q`: **1,179 통과·5 생략**(리뷰 반영 후).
 
 ## 2026-11-23 (운영 배포·셀트리온 경고 해제 완료)
 

@@ -21,7 +21,7 @@ if ! sudo -n -u "$USER_NAME" /usr/bin/test ! -x /home/ubuntu/sima; then
 fi
 sudo -n -H -u "$USER_NAME" /usr/bin/env DISABLE_AUTOUPDATER=1 "$CLI" --version
 if sudo -n -H -u "$USER_NAME" /usr/bin/env DISABLE_AUTOUPDATER=1 "$CLI" auth status --json \
-    | grep -q '"authMethod": "claude.ai"'; then
+    | grep -Eq '"authMethod": ?"claude\.ai"'; then
   echo "구독 로그인 확인됨"
 else
   echo "로그인 필요: ssh -t sima-ec2 'sudo -u $USER_NAME -H $CLI auth login'"

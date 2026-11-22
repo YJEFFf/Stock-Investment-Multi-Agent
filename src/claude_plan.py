@@ -159,9 +159,10 @@ def _ensure_filesystem_isolation(env: dict[str, str], timeout_s: float = DEFAULT
         raise PlanUnavailable("Claude OS user can access the production repository")
 
 
-def _events(stdout: str) -> tuple[dict | None, dict | None, dict | None]:
-    """stream-json에서 init·최종 result·마지막 rate_limit_info를 고른다."""
+def _events(stdout: str) -> tuple[dict | None, dict | None, dict | None, bool]:
+    """stream-json에서 init·최종 result·마지막 rate_limit_info와 답변 산출 여부를 고른다."""
     init = final = limits = None
+    produced = False
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -175,7 +176,12 @@ def _events(stdout: str) -> tuple[dict | None, dict | None, dict | None]:
             final = event
         elif event.get("type") == "rate_limit_event" and isinstance(event.get("rate_limit_info"), dict):
             limits = event["rate_limit_info"]
-    return init, final, limits
+        elif event.get("type") == "assistant":
+            content = (event.get("message") or {}).get("content")
+            produced = produced or any(isinstance(block, dict) and block.get("type") == "tool_use"
+                                       and block.get("name") == "StructuredOutput" for block in content or [])
+    produced = produced or (final is not None and final.get("structured_output") is not None)
+    return init, final, limits, produced
 
 
 def _usage(final: dict | None) -> dict[str, Any]:
@@ -184,11 +190,11 @@ def _usage(final: dict | None) -> dict[str, Any]:
         return {}
     details = raw.get("output_tokens_details") if isinstance(raw.get("output_tokens_details"), dict) else {}
     usage: dict[str, Any] = {
-        "input_tokens": int(raw.get("input_tokens", 0)),
-        "cached_input_tokens": int(raw.get("cache_read_input_tokens", 0)),
-        "cache_write_input_tokens": int(raw.get("cache_creation_input_tokens", 0)),
-        "output_tokens": int(raw.get("output_tokens", 0)),
-        "reasoning_output_tokens": int(details.get("thinking_tokens", 0)),
+        "input_tokens": int(raw.get("input_tokens") or 0),
+        "cached_input_tokens": int(raw.get("cache_read_input_tokens") or 0),
+        "cache_write_input_tokens": int(raw.get("cache_creation_input_tokens") or 0),
+        "output_tokens": int(raw.get("output_tokens") or 0),
+        "reasoning_output_tokens": int(details.get("thinking_tokens") or 0),
     }
     cost = final.get("total_cost_usd")
     if isinstance(cost, (int, float)) and math.isfinite(cost):
@@ -220,7 +226,7 @@ def run_structured_sync(
     """한 번의 CLI 실행. (structured_output, usage, rate_limit_info)를 돌려준다.
 
     tools가 비어 있으면 내장 도구가 하나도 없다(구조화 출력 전용 도구만 CLI가 붙인다).
-    수집 자동 수리처럼 검색이 필요한 호출만 WebSearch·WebFetch를 명시적으로 허용한다.
+    수집 자동 수리처럼 검색이 필요한 호출만 WebSearch를 명시적으로 허용한다.
     """
     env = _subscription_environment()
     deadline = None if timeout_s is None else time.monotonic() + timeout_s
@@ -235,7 +241,8 @@ def run_structured_sync(
 
     _ensure_filesystem_isolation(env, timeout_s=remaining())
     _ensure_subscription_login(env, timeout_s=remaining())
-    with tempfile.TemporaryDirectory(prefix="sima-claude-plan-") as tmp:
+    # 전용 계정이 cwd에 남긴 파일 때문에 정리가 실패해도 완료된 결과를 버리지 않는다.
+    with tempfile.TemporaryDirectory(prefix="sima-claude-plan-", ignore_cleanup_errors=True) as tmp:
         tmp_path = Path(tmp)
         # 전용 계정은 이 임시 디렉터리 안에서 시스템 프롬프트만 읽는다.
         # 임의 경로를 나열할 수 없게 other에는 write+execute만 준다.
@@ -255,18 +262,18 @@ def run_structured_sync(
             result = _run(_claude_command(*args), env=env, input_text=user, cwd=tmp, timeout_s=remaining())
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
             raise PlanUnavailable(f"Claude execution unavailable: {exc}") from exc
-    init, final, limits = _events(result.stdout)
+    init, final, limits, produced = _events(result.stdout)
     if init is not None and init.get("apiKeySource") != "none":
         raise PlanUnavailable(f"Claude CLI used an API key source: {init.get('apiKeySource')}")
     ok = final is not None and final.get("subtype") == "success" and final.get("is_error") is False
-    if result.returncode != 0:
-        if ok:
-            raise PlanUnavailable("Claude exited with output but uncertain completion; no retry")
+    if result.returncode != 0 or not ok:
+        # 모델이 이미 답을 냈다면 뒤따른 오류가 429·5xx여도 재시도 대상이 아니다.
+        # 완료된 판단을 다시 묻는 경로를 만들지 않는다(AGENTS.md 절대 규칙 4).
+        if produced:
+            raise PlanUnavailable("Claude produced an answer but completion is uncertain; no retry")
         raise _execution_error(result.returncode, final, limits, result.stderr)
     if init is None:
         raise PlanUnavailable("Claude init event missing; API key source unverified")
-    if not ok:
-        raise _execution_error(result.returncode, final, limits, result.stderr)
     structured = final.get("structured_output")
     if not isinstance(structured, dict):
         raise PlanUnavailable("Claude structured output missing")
@@ -431,6 +438,8 @@ async def call_structured(
 
 async def check_health(*, log_path: Path | None = None, limits_sink: list | None = None) -> HealthResponse:
     """고정 입력으로 구독 연결만 확인한다. 외부 데이터·주문 입력은 받지 않는다."""
+    from src import operating_mode
+    operating_mode.require_broker_mode()  # EXIT_ONLY에서는 실패 로그도 남기지 않는다
     return await _call_structured(
         system="You are a connectivity probe.", user='Return {"status":"ok"}.',
         response_model=HealthResponse, json_schema=_HEALTH_SCHEMA, label="health_check",
