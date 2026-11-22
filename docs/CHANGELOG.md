@@ -1,3 +1,20 @@
+## 2026-11-23 (Codex → Claude 구독 전환 운영 배포 — 서버 CLI 설치·로그인은 사용자 몫)
+
+- 독립 리뷰 2회:
+  - `0e5e9f9`는 EXIT_ONLY 조건에서 승인됐고, M1 1건과 LOW 6건이 지적됐다.
+  - 수정본 `583f40460aa2ec013921e2d0687d1697cc412880`은 차단 결함 없이 승인됐다.
+  - 남은 지적: 비정상 assistant 이벤트 형식 방어(LOW, 실패 폐쇄), EC2 첫 실행 미검증.
+  - 도구 이름 `StructuredOutput`은 로컬 실호출 출력에서 확인했다.
+- 00:38 KST `SIMA_REVIEWED=583f404 deploy/pull.sh` 배포. EC2 격리 테스트 **1,179 통과·5 생략**.
+  `install_pwa.sh`로 같은 커밋의 앱을 설치했다. pwa·push·balance active, `/healthz` 200, 새 한도 사유 문구 반영.
+- 배포 전후 보존을 확인했다.
+  - 다음 해시가 모두 동일하다: 가상 장부 `b86c80de…`, 원래 포트폴리오 `fb531e51…`, 매매일지 `9cf3f6ac…`, 크론.
+  - `EXIT_ONLY=True`를 유지한다.
+  - 매분 복구 타이머는 새 코드로 `Result=success`이고, `recover_operations`·`mobile_data`·`claude_plan` import도 정상이다.
+- **미완료:** `sudo bash deploy/install_claude_plan.sh`(전용 계정 생성·공식 CLI 설치)는 이 세션의 자동 권한 검사가
+  root 계정 생성·외부 설치 스크립트 실행을 거부해 실행하지 않았다. 현재 서버에 `sima-claude` 계정이 없다.
+  EXIT_ONLY 동안 모델 호출 경로가 없어 운영 영향은 없다. 매수 재개 준비 전에 사용자가 설치·로그인해야 한다.
+
 ## 2026-11-23 (Codex → Claude 구독 전환 — 로컬 구현·검증)
 
 - 사용자 결정: Codex 구독 종료로 Codex가 하던 일을 Claude Code로 옮기고 배포까지 한다.
