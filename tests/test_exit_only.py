@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -266,3 +267,61 @@ def test_missing_state_never_initializes_itself(tmp_path):
     with pytest.raises(FileNotFoundError):
         asyncio.run(exit_only.monitor(at=NEXT, path=path))
     assert not path.exists()
+
+
+def test_reviewed_share_count_release_resumes_tracking_without_touching_position(tmp_path):
+    from scripts.release_exit_only_basis import released_state
+    state, _, _ = initialized(tmp_path / "ledger.json")
+    issued = replace(quote(100), listed_shares=1001)
+    exit_only.apply_quotes(state, {"005930": (issued, "kis")}, at=NEXT)
+    assert state.basis_warnings == ["005930"] and state.missing_quotes == ["005930"]
+    before = state.model_dump(mode="json")
+    at = NEXT + timedelta(hours=20)
+    for wrong, match in [(replace(issued, listed_shares=1002), "reviewed"),
+                         (replace(issued, par_value=100), "par value"), (None, "reviewed")]:
+        with pytest.raises(ValueError, match=match):
+            released_state(state, "005930", wrong, reviewed_listed_shares=1001, at=at)
+    result = released_state(state, "005930", issued, reviewed_listed_shares=1001, at=at)
+    assert state.model_dump(mode="json") == before  # Input is never mutated.
+    assert result.basis_warnings == [] and result.share_basis["005930"]["listed_shares"] == 1001
+    assert result.portfolio == state.portfolio and result.quotes == state.quotes
+    assert (result.sales, result.cash, result.nav_history) == (state.sales, state.cash, state.nav_history)
+    assert "추적 재개" in result.outbox[-1].title
+    path = tmp_path / "released.json"
+    exit_only.save(result, path)
+    exit_only.load(path)
+    later = at.replace(hour=9, minute=1) + timedelta(days=1)
+    exit_only.apply_quotes(result, {"005930": (replace(issued, provider_at=later), "kis")}, at=later)
+    assert result.missing_quotes == [] and result.nav_history[-1]["day"] == later.date().isoformat()
+    with pytest.raises(ValueError, match="no latched"):
+        released_state(result, "005930", issued, reviewed_listed_shares=1001, at=later)
+
+
+def test_price_mismatch_warning_is_not_released_as_share_count_change(tmp_path):
+    from scripts.release_exit_only_basis import released_state
+    state, _, _ = initialized(tmp_path / "ledger.json")
+    state.basis_warnings = ["005930"]
+    with pytest.raises(ValueError, match="unchanged"):
+        released_state(state, "005930", quote(100), reviewed_listed_shares=1000, at=NEXT + timedelta(hours=20))
+
+
+def test_app_shows_liquidation_progress_and_frozen_exit_levels(tmp_path):
+    path = tmp_path / "data/exit_only_state.json"
+    state, _, _ = initialized(path)
+    exit_only.apply_quotes(state, {"005930": (quote(120), "kis")}, at=NEXT)
+    exit_only.save(state, path)
+    result = mobile_data.snapshot(path.parent, now=NEXT)
+    plan = sell.DEFAULT_EXIT_PLAN
+    levels = result.holdings[0]["exit"]
+    assert levels["stage"] == 1 and levels["take_profit_price"] is None
+    assert levels["stop_price"] == pytest.approx(100 * (1 + plan.stop_loss_pct))
+    assert levels["trail_price"] == pytest.approx(120 * (1 + plan.trail_pct))
+    assert levels["original_quantity"] == 9 and levels["suspended"] is False
+    progress = result.operation["liquidation"]
+    assert (progress["original"], progress["remaining"], progress["sales"]) == (1, 1, 1)
+    assert progress["closed"] == [] and progress["partial"] == ["삼성전자"]
+    assert progress["realized_net_pnl"] == pytest.approx(state.sales[0].net_pnl_amount)
+    fresh, _, _ = initialized(tmp_path / "fresh/exit_only_state.json")
+    untouched = mobile_data.snapshot(tmp_path / "fresh", now=NEXT).holdings[0]["exit"]
+    assert untouched["take_profit_price"] == pytest.approx(100 * (1 + plan.take_profit_pct))
+    assert untouched["trail_price"] is None

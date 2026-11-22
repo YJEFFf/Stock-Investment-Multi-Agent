@@ -273,13 +273,29 @@ def exit_only_snapshot(result: MobileSnapshot, root: Path, now: datetime, initia
             day.update(status="paused", signal=False)
     if state.completed_at:
         result.operation.update(status="completed", label="기존 보유분 가상 매도 완료")
+    from src import sell
+    original = {p.ticker: p.quantity for p in state.source_portfolio.positions}
     for p in state.portfolio.positions:
         q = state.quotes[p.ticker]
         value, cost = p.quantity * q.price, p.quantity * p.entry_price
+        plan = sell.plan_for(p)
+        # Display of the frozen thresholds only; evaluation stays in sell.evaluate_with_day_range.
+        exit_levels = {"stage": p.take_profit_stage, "stop_price": p.entry_price * (1 + plan.stop_loss_pct),
+                       "take_profit_price": p.entry_price * (1 + plan.take_profit_pct) if p.take_profit_stage == 0 else None,
+                       "trail_price": p.peak_price * (1 + plan.trail_pct) if p.take_profit_stage and p.peak_price else None,
+                       "peak_price": p.peak_price, "original_quantity": original[p.ticker],
+                       "suspended": p.ticker in state.basis_warnings, "quote_missing": p.ticker in state.missing_quotes}
         result.holdings.append({"ticker": p.ticker, "name": state.names[p.ticker], "quantity": p.quantity,
                                "entry_price": p.entry_price, "price": q.price, "value": value,
                                "pnl": value - cost, "pnl_pct": (value / cost - 1) * 100,
-                               "observed_at": q.observed_at.isoformat(), "simulated": True})
+                               "observed_at": q.observed_at.isoformat(), "simulated": True, "exit": exit_levels})
+    remaining = {p.ticker: p.quantity for p in state.portfolio.positions}
+    result.operation["liquidation"] = {
+        "original": len(original), "remaining": len(remaining),
+        "closed": [state.names[t] for t in original if t not in remaining],
+        "partial": [state.names[t] for t, n in remaining.items() if n < original[t]],
+        "sales": len(state.sales), "realized_net_pnl": sum(s.net_pnl_amount for s in state.sales),
+        "suspended": [state.names[t] for t in state.basis_warnings]}
     stocks = sum(h["value"] for h in result.holdings)
     costs = sum(h["quantity"] * h["entry_price"] for h in result.holdings)
     total = state.cash + stocks

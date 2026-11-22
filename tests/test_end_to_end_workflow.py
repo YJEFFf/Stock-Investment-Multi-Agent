@@ -25,6 +25,7 @@ import scripts.run_daily as rd
 from src import pipeline, judgment, sell, portfolio_store
 from src.schemas import RiskGateConfig
 from src import analysts, collectors, kis
+from src.market_calendar import previous_session_day
 from src.schemas import DisclosureItem, NewsItem, OHLCVBar, PortfolioState, Position
 
 NEW_BUY_TICKER = "005930"
@@ -35,11 +36,13 @@ def _flat_bars(n: int = 60, close: float = 70000.0) -> list[OHLCVBar]:
     """마지막 날만 거래량이 5배 튀는 것 말고는 완전히 평평한 60일치 일봉 —
     정량 필터(거래량 서지)는 통과시키되, execute_buy_order의 갭 체크(전일 종가
     대비 현재가)는 0%로 걸리지 않게 한다."""
+    # 마지막 봉은 직전 거래일이어야 한다 — 달력상 어제로 두면 월요일·휴일 다음 날 실패한다.
+    last = previous_session_day(datetime.now(collectors.ZoneInfo("Asia/Seoul")).date())
     bars = []
     for i in range(n):
         volume = 5000 if i == n - 1 else 1000
         bars.append(
-            OHLCVBar(date=datetime.now(collectors.ZoneInfo("Asia/Seoul")).date() - timedelta(days=n - i), open=close, high=close, low=close, close=close, volume=volume)
+            OHLCVBar(date=last - timedelta(days=n - 1 - i), open=close, high=close, low=close, close=close, volume=volume)
         )
     return bars
 

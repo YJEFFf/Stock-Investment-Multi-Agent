@@ -70,9 +70,22 @@ function holdingsRows(holdings) {
   return holdings.map(h => `<div class="holding row"><div class="stock-identity"><div class="stock-mark">${esc(h.name.slice(0,2))}</div><div><div class="stock-name">${esc(h.name)}</div><div class="stock-caption">${amount(h.quantity)}주 · ${esc(h.ticker)}</div></div></div><div class="align-right"><div class="amount">${money(h.value)}</div><div class="change ${tone(h.pnl)}">${pct(h.pnl_pct,true)}</div></div></div>`).join('');
 }
 function isExitOnly() { return state.data?.operation?.mode === 'exit_only'; }
+function liquidationCard() {
+  const l = state.data.operation.liquidation;
+  if (!l) return '';
+  const done = l.original - l.remaining;
+  return `<div class="section-heading"><h2>매도 진행</h2><span class="eyebrow">가상 장부</span></div><div class="card"><div class="row"><div><p class="eyebrow">전량 매도 완료</p><div class="progress-count">${done}<small> / ${l.original}종목</small></div></div><span class="tag">가상 매도 ${l.sales}건</span></div>${progress(done,l.original)}<dl class="detail-grid"><div><dt>보유 중</dt><dd>${l.remaining}종목</dd></div><div><dt>비용 반영 실현손익</dt><dd class="${tone(l.realized_net_pnl)}">${signedMoney(l.realized_net_pnl)}</dd></div></dl>${l.closed.length ? `<p class="fine">전량 매도: ${esc(l.closed.join(', '))}</p>` : ''}${l.partial.length ? `<p class="fine">일부 매도 후 보유: ${esc(l.partial.join(', '))}</p>` : ''}${l.suspended.length ? `<p class="danger-text">매도 판정 보류: ${esc(l.suspended.join(', '))}</p>` : ''}</div>`;
+}
+function exitLevels(h) {
+  const e = h.exit;
+  if (!e) return '';
+  const gap = target => target ? ` <small>(${pct((target / h.price - 1) * 100, true)})</small>` : '';
+  const upper = e.stage ? ['트레일링 매도선', e.trail_price] : ['첫 익절선', e.take_profit_price];
+  return `<dl class="detail-grid"><div><dt>손절선</dt><dd>${money(e.stop_price)}${gap(e.stop_price)}</dd></div><div><dt>${upper[0]}</dt><dd>${money(upper[1])}${gap(upper[1])}</dd></div><div><dt>매도 단계</dt><dd>${e.stage ? `익절 ${e.stage}회 후` : '첫 익절 전'}</dd></div><div><dt>최초 수량</dt><dd>${amount(e.original_quantity)}주</dd></div></dl>${e.suspended ? '<p class="danger-text">주식 수 기준 변경 확인 중 · 매도 판정을 멈추고 기존 기준을 보존해요.</p>' : e.quote_missing ? '<p class="danger-text">최근 시세 미확인 · 마지막 가격을 표시해요.</p>' : ''}<p class="fine">괄호는 현재가 대비 거리예요. 매도선은 진입 때 정해져 보유 중에는 바뀌지 않아요.</p>`;
+}
 function operationCard() {
   const o = state.data.operation;
-  if (isExitOnly()) return `<div class="card status-card"><span class="status-dot ${o.status === 'failed' ? 'error' : ''}"></span><div><h3>${esc(o.label)}</h3><p>${o.completed_at ? '잔여 수량 0주 · 시세 조회 종료' : '신규 매수 분석 중단 · 거래일 09:00–15:30 매분 감시'}</p><p>기존 매도 기준 충족 시 조회 가격으로 가상 매도를 기록해요.</p><p class="fine">증권사 주문·체결 없이 기록하며 수수료·세금은 추정해요.</p></div></div>`;
+  if (isExitOnly()) return `<div class="card status-card"><span class="status-dot ${o.status === 'failed' ? 'error' : ''}"></span><div><h3>${esc(o.label)}</h3><p>${o.completed_at ? '잔여 수량 0주 · 시세 조회 종료' : '신규 매수 분석 중단 · 거래일 09:00–15:30 매분 감시'}</p><p>기존 매도 기준 충족 시 조회 가격으로 가상 매도를 기록해요.</p><p class="fine">증권사 주문·체결 없이 기록하며 수수료·세금은 추정해요.</p></div></div>` + liquidationCard();
   const bad = ['failed','degraded','missing','skipped','unconfirmed'].includes(o.status);
   const idle = ['holiday','waiting'].includes(o.status);
   const reasons = {universe_fetch_failed:'구성 종목 자료를 불러오지 못했어요.',all_market_contexts_unavailable:'시세 자료를 불러오지 못했어요.',deadline_exceeded:'정해진 시각 안에 분석을 끝내지 못했어요.',codex_plan_capacity_insufficient:'분석에 사용할 잔여 한도가 부족해요.'};
@@ -94,7 +107,7 @@ function home() {
 }
 function holdingsPage() {
   const d = state.data, a = d.account;
-  return heading('보유 종목', a ? `${a.day} ${isExitOnly() ? '가상 장부' : '계좌 조회'} 기준 · ${d.holdings.length}종목` : '마지막으로 확인한 계좌 기록') + (a ? `<div class="metric-grid"><div class="metric"><div class="label">주식 평가액</div><strong>${amount(a.securities)}<small>원</small></strong></div><div class="metric"><div class="label">현금 비중</div><strong>${a.cash_ratio == null ? '—' : (a.cash_ratio * 100).toFixed(1)}<small>%</small></strong></div></div><p class="fine">${isExitOnly() ? '가상 매도 후 남은 수량과 마지막 조회 가격이에요. 장중 매분 갱신하며 시세는 지연될 수 있어요.' : '마지막 증권사 잔고 조회 값이에요. 모의투자 시세는 지연될 수 있어요.'}</p>` : '') + `<div class="section-heading"><h2>종목별 현황</h2></div>` + (d.holdings.length ? d.holdings.map(h => `<article class="card">${holdingsRows([h])}<dl class="detail-grid"><div><dt>평균 매입가</dt><dd>${money(h.entry_price)}</dd></div><div><dt>관측 시점 주가</dt><dd>${money(h.price)}</dd></div><div><dt>평가 손익</dt><dd class="${tone(h.pnl)}">${signedMoney(h.pnl)}</dd></div><div><dt>보유 수량</dt><dd>${amount(h.quantity)}주</dd></div></dl>${h.observed_at ? `<p class="fine">시세 확인 ${stamp(h.observed_at)} (한국시간)</p>` : ''}</article>`).join('') : `<div class="card">${empty('보유 종목이 없어요','다음 기록이 갱신되면 여기에 반영돼요.','holdings')}</div>`);
+  return heading('보유 종목', a ? `${a.day} ${isExitOnly() ? '가상 장부' : '계좌 조회'} 기준 · ${d.holdings.length}종목` : '마지막으로 확인한 계좌 기록') + (a ? `<div class="metric-grid"><div class="metric"><div class="label">주식 평가액</div><strong>${amount(a.securities)}<small>원</small></strong></div><div class="metric"><div class="label">현금 비중</div><strong>${a.cash_ratio == null ? '—' : (a.cash_ratio * 100).toFixed(1)}<small>%</small></strong></div></div><p class="fine">${isExitOnly() ? '가상 매도 후 남은 수량과 마지막 조회 가격이에요. 장중 매분 갱신하며 시세는 지연될 수 있어요.' : '마지막 증권사 잔고 조회 값이에요. 모의투자 시세는 지연될 수 있어요.'}</p>` : '') + `<div class="section-heading"><h2>종목별 현황</h2></div>` + (d.holdings.length ? d.holdings.map(h => `<article class="card">${holdingsRows([h])}<dl class="detail-grid"><div><dt>평균 매입가</dt><dd>${money(h.entry_price)}</dd></div><div><dt>관측 시점 주가</dt><dd>${money(h.price)}</dd></div><div><dt>평가 손익</dt><dd class="${tone(h.pnl)}">${signedMoney(h.pnl)}</dd></div><div><dt>보유 수량</dt><dd>${amount(h.quantity)}주</dd></div></dl>${exitLevels(h)}${h.observed_at ? `<p class="fine">시세 확인 ${stamp(h.observed_at)} (한국시간)</p>` : ''}</article>`).join('') : `<div class="card">${empty('보유 종목이 없어요','다음 기록이 갱신되면 여기에 반영돼요.','holdings')}</div>`);
 }
 const reasonLabels = {stop_loss:'손절',take_profit_first:'첫 부분 익절',take_profit_trail:'트레일링 익절',llm_discretionary:'보유 재평가',gap_too_large:'개장 가격 차이 초과',balance_unavailable:'잔고 조회 실패',quantity_zero:'주문 가능 수량 없음',order_rejected:'주문 거부',price_data_unavailable:'시세 조회 실패',order_response_lost:'주문 응답 확인 필요'};
 function tradesPage() {
