@@ -257,8 +257,8 @@ def test_current_price_http_still_allowed(monkeypatch):
 
 
 def test_disabled_analysis_entry_points_do_no_work():
-    from scripts import check_codex_plan, decide_buys, decide_llm_sell, execute_open, run_daily
-    for module in [check_codex_plan, decide_buys, decide_llm_sell, execute_open, run_daily]:
+    from scripts import check_claude_plan, decide_buys, decide_llm_sell, execute_open, run_daily
+    for module in [check_claude_plan, decide_buys, decide_llm_sell, execute_open, run_daily]:
         asyncio.run(module.main())
 
 

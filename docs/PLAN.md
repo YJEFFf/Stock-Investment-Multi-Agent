@@ -128,6 +128,8 @@ IC·근거 감시·수집 자동수리는 중단하며 서비스 건강 확인�
 - [ ] 기존 매매 경로 변경 절차에 따라 격리 테스트·독립 리뷰·주문 드릴과 가능한
   기록 전용 관측을 수행하고, 확정 규칙·검증 결과·적용 버전을 CHANGELOG에 남긴다.
 - [ ] 기존 계좌의 체결·가상 청산 기록과 새 계좌의 기록·규칙 버전을 구분한다.
+- [ ] Claude 구독 경로로 전체 일일 섀도를 돌려 소요 시간·5시간/7일 한도 소모·모델을 측정하고
+  한도 보호 문턱(현재 Codex에서 옮긴 2%)을 다시 정한다. 구독 로그인 상태도 확인한다.
   위 항목을 완료한 뒤 새 계좌에서 사용할 모드와 크론을 적용하고 신규 매수를 재개한다.
 
 현재의 가격 조회·가상 매도 운영과 기존11종목의 기준을 이 작업 때문에 바꾸지 않는다.
@@ -210,7 +212,40 @@ KOSPI200 전체에 분석가 4개를 돌리면 하루 800회 호출이다. 정�
 종목당 독립 호출(비교 금지) 원칙 때문에 호출 수가 늘지만, 무리한 매수를 막는 가장
 효과적인 장치라 이 비용은 감수한다.
 
-### ChatGPT 플랜 기반 Codex 경로 (2026-09-15, 모의 매수 판단)
+### Claude 구독 기반 Claude Code 경로 (2026-11-23, Codex 대체)
+
+Codex 구독 종료 후 사용자 결정으로 Codex가 맡던 모델 호출 다섯 곳 — 매수 판단(분석가·토론·
+매니저), 06:55 연결·한도 점검, 판단 로그 번역, 기록 전용 근거 감시, 수집 자동 수리 — 을
+`src/claude_plan.py`로 옮겼다. `scripts/decide_buys.py`의 `BUY_LLM_PROVIDER="claude_plan"`이며
+`"codex_plan"`으로 되돌리면 같은 코드로 롤백된다. 기존 보유분 가상 매도는 원래 모델을 쓰지
+않으므로 이 전환과 무관하게 계속 돈다. `EXIT_ONLY=True` 동안 CLI 실행은 전부 차단된다.
+
+계약은 Codex 경로와 같다. 전용 계정 `sima-claude`(로그인 셸 없음, 홈 750)에서
+`/home/sima-claude/.local/bin/claude`를 실행하고, 운영 저장소를 탐색할 수 있으면 거부한다.
+자식 환경에는 PATH·로캘만 넘긴다. 매 호출 전 `claude auth status`가 claude.ai 구독 로그인
+(`authMethod=claude.ai`, `apiProvider=firstParty`)인지 확인하고, 실행 결과의 init 이벤트
+`apiKeySource`가 `none`이 아니면 결과를 버린다. API 과금으로 폴백하지 않는다. `--bare`는
+구독 로그인을 읽지 않아 쓰지 않는다. 대신 `--tools ""`(구조화 출력 도구만 남음)·
+`--setting-sources ""`·`--strict-mcp-config`·`--disable-slash-commands`·
+`--no-session-persistence`·시스템 프롬프트 파일로 주입 입력만 판단하게 한다. 수집 자동
+수리만 WebSearch·WebFetch를 명시 허용한다. 동시 실행 2, 실패한 전송만 재시도하고 완료된
+판단·스키마 위반 응답은 다시 묻지 않는다. 호출 사용량은 기존 `logs/llm_calls.jsonl`에
+`provider=claude_plan`과 표준 단가 환산치 `list_cost_usd`(구독 청구액 아님)로 남긴다.
+
+한도: 구독은 무추론 한도 조회 API가 없어서, 06:55 고정 연결 확인 응답에 딸려 오는
+`rate_limit_event`의 5시간·7일 창 사용률을 `logs/claude_plan_capacity.json`에 저장한다.
+7일 잔여 2% 이하이거나 어느 창이든 허용 상태가 아니면 Codex 때와 같이 그날 판단을 실패
+폐쇄한다. 이 2%는 Codex 실측(일일 부하 ≈ 주간 2%p)에서 옮긴 자리표시값이며 Claude 구독의
+일일 부하는 아직 측정하지 않았다. 구독은 사용자의 대화형 Claude Code 사용과 한도를 공유하고,
+5시간 창이 판단 도중 소진되면 회차 전체가 공급자 거부로 폐기된다. **매수 재개 전**에
+전체 일일 섀도로 소요 시간·한도 소모·모델(현재 `claude-sonnet-5-5`)을 측정하고 문턱을 다시
+정한다. 이것도 매도 설계 수정과 같이 재개 전 필수 항목이다.
+
+서버 준비는 `sudo bash deploy/install_claude_plan.sh`(전용 계정·공식 네이티브 CLI 설치·격리
+확인)이며, 구독 로그인은 사용자가 `ssh -t sima-ec2 'sudo -u sima-claude -H
+/home/sima-claude/.local/bin/claude auth login'`으로 직접 한다.
+
+### ChatGPT 플랜 기반 Codex 경로 (2026-09-15, 모의 매수 판단 — 2026-11-23 종료)
 
 기존 Anthropic API 정지 뒤 별도 API 요금 없이 현재 ChatGPT 플랜을 쓸 수 있는지 확인하기 위해
 `src/codex_plan.py`를 추가했다. 이 경로는 `OPENAI_API_KEY`와 `CODEX_API_KEY`를 자식

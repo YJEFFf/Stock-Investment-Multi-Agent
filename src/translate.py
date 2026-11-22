@@ -7,7 +7,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, field_validator
 
-from src import codex_plan
+from src import claude_plan
 
 logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "translate.md"
@@ -49,7 +49,7 @@ async def to_korean(text: str | None, label: str = "translate") -> str | None:
             return _Translation.model_validate_json(cache_path.read_text()).translated
         except (OSError, ValueError):
             pass
-        result = await codex_plan.call_structured(
+        result = await claude_plan.call_structured(
             system=system,
             user=text,
             response_model=_Translation,

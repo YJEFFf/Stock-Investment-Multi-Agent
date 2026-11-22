@@ -180,7 +180,7 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     `trade_journal.jsonl`에 적힌 뒤 다음 날 노션 매매일지까지 동기화됐다.
     그래서 이제 **`src` 전체의 `logs/` 기본값을 빠짐없이 등록한다.**
     """
-    from src import app_notifications, codex_plan, collectors, collector_repair, collector_routes, evaluation, judgment, llm, notion_sync, order_guard, order_recovery, pipeline, portfolio_store, run_history, thesis_shadow, translate
+    from src import app_notifications, claude_plan, codex_plan, collectors, collector_repair, collector_routes, evaluation, judgment, llm, notion_sync, order_guard, order_recovery, pipeline, portfolio_store, run_history, thesis_shadow, translate
 
     monkeypatch.setattr(collector_repair, "STATE_DIR", tmp_path / "collector_repair")
     monkeypatch.setattr(thesis_shadow, "STATE_DIR", tmp_path / "thesis_shadow")
@@ -216,13 +216,16 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(codex_plan, "DEFAULT_CALL_LOG_PATH", tmp_path / "codex_plan_calls.jsonl")
     monkeypatch.setattr(codex_plan, "DEFAULT_JUDGMENT_CALL_LOG_PATH", tmp_path / "llm_calls.jsonl")
     monkeypatch.setattr(codex_plan, "DEFAULT_CAPACITY_STATE_PATH", tmp_path / "codex_plan_capacity.json")
+    monkeypatch.setattr(claude_plan, "DEFAULT_CALL_LOG_PATH", tmp_path / "claude_plan_calls.jsonl")
+    monkeypatch.setattr(claude_plan, "DEFAULT_JUDGMENT_CALL_LOG_PATH", tmp_path / "llm_calls.jsonl")
+    monkeypatch.setattr(claude_plan, "DEFAULT_CAPACITY_STATE_PATH", tmp_path / "claude_plan_capacity.json")
     monkeypatch.setattr(notion_sync, "DEFAULT_PIPELINE_LOG_PATH", tmp_path / "pipeline.jsonl")
     monkeypatch.setattr(notion_sync, "DEFAULT_TRADE_JOURNAL_LOG_PATH", tmp_path / "trade_journal.jsonl")
     monkeypatch.setattr(
         notion_sync, "DEFAULT_DAILY_REPORT_STATE_PATH", tmp_path / "notion_daily_report_state.json"
     )
     monkeypatch.setattr(
-        notion_sync, "DEFAULT_CODEX_CAPACITY_STATE_PATH", tmp_path / "codex_plan_capacity.json"
+        notion_sync, "DEFAULT_PLAN_CAPACITY_STATE_PATH", tmp_path / "claude_plan_capacity.json"
     )
     monkeypatch.setattr(notion_sync, "DEFAULT_SYNC_STATE_PATH", tmp_path / "notion_sync_state.json")
     monkeypatch.setattr(portfolio_store, "PORTFOLIO_STATE_PATH", tmp_path / "portfolio_state.json")
@@ -231,7 +234,10 @@ def _isolate_default_state_paths(monkeypatch, tmp_path):
 
 @pytest.fixture(autouse=True)
 def _never_spend_the_chatgpt_plan(monkeypatch):
-    """테스트가 저장된 ChatGPT 플랜을 실제로 소모하지 않게 막는다."""
+    """테스트가 저장된 ChatGPT·Claude 구독을 실제로 소모하지 않게 막는다.
+
+    두 모듈은 같은 `subprocess` 모듈 객체를 쓰므로 여기서 한 번 막으면 claude_plan도 막힌다.
+    """
     from src import codex_plan
 
     def blocked(*args, **kwargs):

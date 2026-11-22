@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 from scripts import recover_operations as recovery
-from src import codex_plan, run_history
+from src import claude_plan, run_history
 
 spec = importlib.util.spec_from_file_location('recover_services', Path('deploy/recover_services.py'))
 services = importlib.util.module_from_spec(spec)
@@ -28,13 +28,13 @@ def test_restart_budget_and_active_services():
 
 @pytest.mark.parametrize('hour,minute,reason,started,already,expected', [
     (7,4,None,False,False,False), (7,5,None,False,False,True),
-    (8,0,None,False,False,False), (7,30,'codex_capacity_unavailable',False,False,True),
-    (7,30,'codex_capacity_unavailable',True,False,False),
+    (8,0,None,False,False,False), (7,30,'plan_capacity_unavailable',False,False,True),
+    (7,30,'plan_capacity_unavailable',True,False,False),
     (7,30,None,False,True,False), (7,30,'no_candidates',False,False,False),
     (7,30,'process_interrupted',False,False,False),
 ])
 def test_missed_start_boundaries(hour, minute, reason, started, already, expected):
-    at = datetime(2026,10,23,hour,minute,tzinfo=codex_plan.KST)
+    at = datetime(2026,10,23,hour,minute,tzinfo=claude_plan.KST)
     rows = [] if reason is None else [SimpleNamespace(reason=reason,analysis_started=started)]
     assert recovery.eligible(at,rows,already) is expected
 
@@ -45,12 +45,12 @@ def test_prior_day_interrupted_run_is_finalized_without_touching_pending(monkeyp
     monkeypatch.setattr(recovery,'SERVICES',tmp_path/'none')
     monkeypatch.setattr(run_history,'RUN_LOG_PATH',tmp_path/'runs.jsonl')
     monkeypatch.setattr(run_history,'RUN_LOCK_PATH',tmp_path/'run.lock')
-    at=datetime(2026,10,23,18,tzinfo=codex_plan.KST)
+    at=datetime(2026,10,23,18,tzinfo=claude_plan.KST)
     class Clock:
         @staticmethod
         def now(tz): return at
     monkeypatch.setattr(recovery,'datetime',Clock)
-    row=run_history.new_run(datetime(2026,10,22,7,tzinfo=codex_plan.KST),'codex_plan','gpt-5.6-sol')
+    row=run_history.new_run(datetime(2026,10,22,7,tzinfo=claude_plan.KST),'codex_plan','gpt-5.6-sol')
     row.analysis_started=True
     run_history.write(row)
     monkeypatch.setattr(recovery.notify,'send_telegram_alert',lambda *a:None)
@@ -69,7 +69,7 @@ def test_recovery_rechecks_latest_run_inside_analysis_lock(monkeypatch,tmp_path)
     import asyncio
     db=recovery.decide_buys
     monkeypatch.chdir(tmp_path)
-    at=datetime(2026,10,23,7,20,tzinfo=codex_plan.KST)
+    at=datetime(2026,10,23,7,20,tzinfo=claude_plan.KST)
     class Clock:
         @staticmethod
         def now(tz): return at
@@ -167,7 +167,7 @@ def test_corrupt_state_alert_is_delivered_once(monkeypatch, tmp_path):
     monkeypatch.setattr(recovery, 'SERVICES', services.STATE)
     monkeypatch.setattr(run_history, 'RUN_LOG_PATH', tmp_path / 'runs')
     monkeypatch.setattr(run_history, 'RUN_LOCK_PATH', tmp_path / 'run.lock')
-    at = datetime(2026, 10, 23, 18, tzinfo=codex_plan.KST)
+    at = datetime(2026, 10, 23, 18, tzinfo=claude_plan.KST)
     class Clock:
         @staticmethod
         def now(tz): return at

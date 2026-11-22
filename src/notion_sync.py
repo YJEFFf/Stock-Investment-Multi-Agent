@@ -44,7 +44,7 @@ GITHUB_URL = "https://github.com/YJEFFf/Stock-Investment-Multi-Agent"
 DEFAULT_PIPELINE_LOG_PATH = Path("logs/pipeline.jsonl")
 DEFAULT_TRADE_JOURNAL_LOG_PATH = Path("logs/trade_journal.jsonl")
 DEFAULT_DAILY_REPORT_STATE_PATH = Path("logs/notion_daily_report_state.json")
-DEFAULT_CODEX_CAPACITY_STATE_PATH = Path("logs/codex_plan_capacity.json")
+DEFAULT_PLAN_CAPACITY_STATE_PATH = Path("logs/claude_plan_capacity.json")
 
 # AGENTS.md/PLAN.md와 다른 파일로 관리하는 이유: 코드가 아니라 노션 표시용
 # 텍스트라 손보는 이유가 다르다(문서 내용이 아니라 노션 블록 포맷을 고치게 됨).
@@ -286,7 +286,7 @@ def _intro_page_blocks() -> list[dict]:
         _heading("기술 스택", level=2),
         _bulleted("Python 3.11+, pydantic v2, asyncio"),
         _bulleted(
-            "현재 자동 운영은 ChatGPT 플랜 기반 Codex 연결 점검을 주문과 격리해 검증 중이다. "
+            "매수 판단 모델 호출은 Claude 구독 기반 Claude Code CLI를 주문과 격리한 계정에서 실행한다(2026-11-23 Codex에서 전환). "
             "기존 Anthropic API 판단 경로는 정지 상태로 이력·롤백을 위해 남겨뒀고, "
             "LangGraph/CrewAI/AutoGen은 사용하지 않는다"
         ),
@@ -1089,7 +1089,7 @@ async def _daily_report_children(
     skips: list[dict],
     portfolio: PortfolioState,
     account: kis.AccountSnapshot | None = None,
-    codex_capacity: dict | None = None,
+    plan_capacity: dict | None = None,
 ) -> list[dict]:
     blocks = [_heading("오늘의 판단 요약", level=2)]
     runs = [r for r in run_history.load_runs() if r.day == day]
@@ -1100,19 +1100,14 @@ async def _daily_report_children(
         blocks.append(_paragraph(f"{label} · 후보 {actual_run.candidates}개 · 판단 {actual_run.decisions}개 · "
                                  f"발행 매수 {actual_run.pending}개" +
                                  (f" · 사유: {actual_run.reason}" if actual_run.reason else "")))
-    if codex_capacity and codex_capacity.get("day") == day:
-        if codex_capacity.get("buy_judgment_allowed"):
+    if plan_capacity and plan_capacity.get("day") == day:
+        if plan_capacity.get("buy_judgment_allowed"):
             result = "한도 점검 통과"
-        elif codex_capacity.get("ordinary_usage_allowed") is False:
-            result = "백엔드 일반 사용 불허로 신규 매수 판단 중지"
+        elif plan_capacity.get("ordinary_usage_allowed") is False:
+            result = "구독 한도 상태가 허용이 아니어서 신규 매수 판단 중지"
         else:
-            result = "잔여 2% 이하로 신규 매수 판단 중지"
-        blocks.append(
-            _paragraph(
-                f"Codex 주간 한도 잔여 {codex_capacity['remaining_percent']:.2f}% · "
-                f"같은 일일 부하 약 {codex_capacity['estimated_daily_runs_remaining']:.1f}회분 · {result}"
-            )
-        )
+            result = "주간 잔여 보호 기준 이하로 신규 매수 판단 중지"
+        blocks.append(_paragraph(f"Claude 구독 7일 한도 잔여 {plan_capacity['remaining_percent']:.2f}% · {result}"))
     if decisions_today:
         approved_buy_decisions = [d for d in decisions_today if d["action"] == "BUY" and d["approved"]]
         # 게이트 거부는 rejected_by가 있는 것만이다. approved=False로 세면 HOLD가
@@ -1239,13 +1234,13 @@ async def sync_daily_report(
     day: str, portfolio: PortfolioState, database_id: str,
     pipeline_log_path: Path | None = None, trade_journal_log_path: Path | None = None,
     state_path: Path | None = None, account: kis.AccountSnapshot | None = None,
-    codex_capacity_path: Path | None = None,
+    plan_capacity_path: Path | None = None,
 ) -> bool:
     from src.portfolio_store import portfolio_lock
     state_path = state_path or DEFAULT_DAILY_REPORT_STATE_PATH
     with portfolio_lock(state_path.with_suffix(".lock")):
         return await _sync_daily_report_locked(day, portfolio, database_id, pipeline_log_path,
-            trade_journal_log_path, state_path, account, codex_capacity_path)
+            trade_journal_log_path, state_path, account, plan_capacity_path)
 
 
 async def _sync_daily_report_locked(
@@ -1256,7 +1251,7 @@ async def _sync_daily_report_locked(
     trade_journal_log_path: Path | None = None,
     state_path: Path | None = None,
     account: kis.AccountSnapshot | None = None,
-    codex_capacity_path: Path | None = None,
+    plan_capacity_path: Path | None = None,
 ) -> bool:
     """하루에 한 번, 장 마감 뒤 그날의 판단·매수·매도·최종 보유 종목을 요약해
     노션에 한 페이지로 남긴다. logs/pipeline.jsonl(그날의 모든 판단)과
@@ -1277,7 +1272,7 @@ async def _sync_daily_report_locked(
     pipeline_log_path = pipeline_log_path or DEFAULT_PIPELINE_LOG_PATH
     trade_journal_log_path = trade_journal_log_path or DEFAULT_TRADE_JOURNAL_LOG_PATH
     state_path = state_path or DEFAULT_DAILY_REPORT_STATE_PATH
-    codex_capacity_path = codex_capacity_path or DEFAULT_CODEX_CAPACITY_STATE_PATH
+    plan_capacity_path = plan_capacity_path or DEFAULT_PLAN_CAPACITY_STATE_PATH
     synced_days = _load_synced_days(state_path)
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
     if day in state.get("creation_pending", []):
@@ -1297,11 +1292,11 @@ async def _sync_daily_report_locked(
     buys = [e for e in trades_today if e["event"] == "buy"]
     sells = [e for e in trades_today if e["event"] == "sell"]
     skips = [e for e in trades_today if e["event"] == "buy_skipped"]
-    codex_capacity = None
+    plan_capacity = None
     try:
-        raw_capacity = json.loads(codex_capacity_path.read_text())
+        raw_capacity = json.loads(plan_capacity_path.read_text())
         if raw_capacity.get("day") == day:
-            codex_capacity = raw_capacity
+            plan_capacity = raw_capacity
     except (OSError, json.JSONDecodeError, AttributeError):
         pass
 
@@ -1309,7 +1304,7 @@ async def _sync_daily_report_locked(
         "parent": {"database_id": database_id},
         "properties": _daily_report_properties(day, buys, sells, portfolio),
         "children": await _daily_report_children(
-            day, decisions_today, buys, sells, skips, portfolio, account, codex_capacity
+            day, decisions_today, buys, sells, skips, portfolio, account, plan_capacity
         ),
     }
     from src.order_guard import _atomic_bytes

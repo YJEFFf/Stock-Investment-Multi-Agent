@@ -59,7 +59,7 @@ def test_duplicate_completed_analysis_keeps_existing_pending(monkeypatch, tmp_pa
 
 def test_supervisor_closes_killed_run_without_reanalysis(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    record = db.run_history.new_run(db.datetime.now(db.KST), "codex_plan", "test")
+    record = db.run_history.new_run(db.datetime.now(db.KST), "claude_plan", "test")
     record.analysis_started = True
     db.run_history.write(record)
     db._write_pending_state(record.day, [], skipped="decision_in_progress")
@@ -79,7 +79,7 @@ def test_supervisor_closes_killed_run_without_reanalysis(monkeypatch, tmp_path):
 
 def test_supervisor_does_not_overwrite_completed_pending(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    record = db.run_history.new_run(db.datetime.now(db.KST), "codex_plan", "test")
+    record = db.run_history.new_run(db.datetime.now(db.KST), "claude_plan", "test")
     record.ended_at = db.datetime.now(db.KST)
     record.status = "completed"
     db.run_history.write(record)
@@ -118,7 +118,7 @@ def _no_real_notify_or_name_lookup(monkeypatch):
     monkeypatch.setattr(db.pipeline, "display_name", lambda ticker: ticker)
     monkeypatch.setattr(db, "_seconds_until_deadline", lambda now: 60.0)
     monkeypatch.setattr(
-        db.codex_plan,
+        db.claude_plan,
         "load_capacity_status",
         lambda day: SimpleNamespace(
             day=day,
@@ -349,17 +349,17 @@ def test_main_skips_the_whole_buy_decision_when_claude_api_is_off(monkeypatch, t
     assert len(alerts) == 1 and "매수 판단 건너뜀" in alerts[0]
 
 
-def test_main_uses_codex_plan_when_claude_api_is_off(monkeypatch, tmp_path):
+def test_main_uses_claude_plan_when_claude_api_is_off(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
-    monkeypatch.setattr(db, "BUY_LLM_PROVIDER", "codex_plan")
+    monkeypatch.setattr(db, "BUY_LLM_PROVIDER", "claude_plan")
     monkeypatch.setattr(db.llm, "CLAUDE_API_ENABLED", False)
     monkeypatch.setattr(db, "load_portfolio", lambda: PortfolioState(cash_weight=1.0))
 
-    async def fake_codex_call(**kwargs):
+    async def fake_plan_call(**kwargs):
         raise AssertionError("가짜 run_daily 안에서는 실제 호출하지 않는다")
 
-    monkeypatch.setattr(db.codex_plan, "call_structured", fake_codex_call)
+    monkeypatch.setattr(db.claude_plan, "call_structured", fake_plan_call)
     captured = {}
 
     async def fake_run_daily(day, portfolio, config, analyst_fn, judge_fn, execute_fn, total_expected_analysts):
@@ -370,21 +370,46 @@ def test_main_uses_codex_plan_when_claude_api_is_off(monkeypatch, tmp_path):
 
     asyncio.run(db.main())
 
-    assert captured["provider"] is not fake_codex_call  # 실패 집계 래퍼를 한 겹 둔다.
-    assert db.llm.call_structured is not fake_codex_call
+    assert captured["provider"] is not fake_plan_call  # 실패 집계 래퍼를 한 겹 둔다.
+    assert db.llm.call_structured is not fake_plan_call
     assert json.loads(db.PENDING_BUYS_PATH.read_text())["decisions"] == []
 
 
-def test_main_reports_aggregated_codex_failures_once(monkeypatch, tmp_path):
+def test_codex_rollback_routes_through_the_same_provider_code(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
     monkeypatch.setattr(db, "BUY_LLM_PROVIDER", "codex_plan")
+    monkeypatch.setattr(db, "load_portfolio", lambda: PortfolioState(cash_weight=1.0))
+    status = db.claude_plan.load_capacity_status("unused")
+    monkeypatch.setattr(db.codex_plan, "load_capacity_status", lambda day: status)
+    monkeypatch.setattr(db.claude_plan, "load_capacity_status", lambda day: pytest.fail("claude used on rollback"))
+    used = []
+
+    async def codex_call(**kwargs):
+        used.append(kwargs["label"])
+        return db.codex_plan.HealthResponse(status="ok")
+    monkeypatch.setattr(db.codex_plan, "call_structured", codex_call)
+    monkeypatch.setattr(db.claude_plan, "call_structured", lambda **k: pytest.fail("claude used on rollback"))
+
+    async def fake_run_daily(day, portfolio, config, analyst_fn, judge_fn, execute_fn, total_expected_analysts):
+        await db.llm.call_structured(system="", user="", response_model=None, json_schema={}, label="chart")
+        return portfolio, []
+    monkeypatch.setattr(db.pipeline, "run_daily", fake_run_daily)
+    asyncio.run(db.main())
+    assert used == ["chart"]
+    assert db.run_history.load_runs()[-1].model == db.codex_plan.DEFAULT_MODEL
+
+
+def test_main_reports_aggregated_plan_failures_once(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
+    monkeypatch.setattr(db, "BUY_LLM_PROVIDER", "claude_plan")
     monkeypatch.setattr(db, "load_portfolio", lambda: PortfolioState(cash_weight=1.0))
 
     async def failed_call(**kwargs):
         raise RuntimeError("plan limit")
 
-    monkeypatch.setattr(db.codex_plan, "call_structured", failed_call)
+    monkeypatch.setattr(db.claude_plan, "call_structured", failed_call)
     alerts = []
     monkeypatch.setattr(db.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
 
@@ -441,7 +466,7 @@ def test_main_discards_results_when_deadline_expires(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("remaining", [2.0, 0.0])
-def test_main_skips_codex_buy_judgment_at_or_below_two_percent(monkeypatch, tmp_path, remaining):
+def test_main_skips_plan_buy_judgment_at_or_below_two_percent(monkeypatch, tmp_path, remaining):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
     status = SimpleNamespace(
@@ -454,11 +479,10 @@ def test_main_skips_codex_buy_judgment_at_or_below_two_percent(monkeypatch, tmp_
             "remaining_percent": remaining,
             "ordinary_usage_allowed": True,
             "buy_judgment_allowed": False,
-            "estimated_daily_runs_remaining": remaining / 2,
-            "estimated_token_equivalent_remaining": 0,
+            "threshold_percent": 2.0,
         },
     )
-    monkeypatch.setattr(db.codex_plan, "load_capacity_status", lambda day: status)
+    monkeypatch.setattr(db.claude_plan, "load_capacity_status", lambda day: status)
     monkeypatch.setattr(
         db.pipeline, "run_daily", lambda *a, **k: (_ for _ in ()).throw(AssertionError("LLM 판단 호출 금지"))
     )
@@ -469,7 +493,7 @@ def test_main_skips_codex_buy_judgment_at_or_below_two_percent(monkeypatch, tmp_
 
     payload = json.loads(db.PENDING_BUYS_PATH.read_text())
     assert payload["decisions"] == []
-    assert payload["skipped"] == "codex_weekly_capacity_low"
+    assert payload["skipped"] == "plan_weekly_capacity_low"
     assert any(f"잔여 {remaining:.2f}%" in message and "손절·익절 감시" in message for message in alerts)
 
 
@@ -477,9 +501,9 @@ def test_main_fails_closed_when_today_capacity_state_is_unavailable(monkeypatch,
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(db, "is_krx_trading_day", lambda day: True)
     monkeypatch.setattr(
-        db.codex_plan,
+        db.claude_plan,
         "load_capacity_status",
-        lambda day: (_ for _ in ()).throw(db.codex_plan.CodexPlanUnavailable("stale")),
+        lambda day: (_ for _ in ()).throw(db.claude_plan.PlanUnavailable("stale")),
     )
     alerts = []
     monkeypatch.setattr(db.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
@@ -487,7 +511,7 @@ def test_main_fails_closed_when_today_capacity_state_is_unavailable(monkeypatch,
     asyncio.run(db.main())
 
     payload = json.loads(db.PENDING_BUYS_PATH.read_text())
-    assert payload["skipped"] == "codex_capacity_unavailable"
+    assert payload["skipped"] == "plan_capacity_unavailable"
     assert any("한도 점검" in message and "신규 매수 판단 중지" in message for message in alerts)
 
 
@@ -505,20 +529,19 @@ def test_main_reports_backend_usage_block_separately_from_low_capacity(monkeypat
             "remaining_percent": 50.0,
             "ordinary_usage_allowed": False,
             "buy_judgment_allowed": False,
-            "estimated_daily_runs_remaining": 25.0,
-            "estimated_token_equivalent_remaining": 92_091_700,
+            "threshold_percent": 2.0,
         },
     )
-    monkeypatch.setattr(db.codex_plan, "load_capacity_status", lambda checked_day: status)
+    monkeypatch.setattr(db.claude_plan, "load_capacity_status", lambda checked_day: status)
     alerts = []
     monkeypatch.setattr(db.notify, "send_telegram_alert", lambda message: alerts.append(message) or True)
 
     asyncio.run(db.main())
 
     payload = json.loads(db.PENDING_BUYS_PATH.read_text())
-    assert payload["skipped"] == "codex_ordinary_usage_blocked"
+    assert payload["skipped"] == "plan_ordinary_usage_blocked"
     assert "잔여 50.00%" in alerts[0]
-    assert "일반 사용을 허용하지 않음" in alerts[0]
+    assert "한도 상태가 허용이 아님" in alerts[0]
     assert "2% 이하 보호 기준 도달" not in alerts[0]
 
 
@@ -551,14 +574,14 @@ def test_completion_alert_distinguishes_unavailable_from_hold(monkeypatch, tmp_p
 def test_provider_rejection_discards_partial_pending_and_does_not_retry(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(db, 'is_krx_trading_day', lambda day: True)
-    monkeypatch.setattr(db, 'BUY_LLM_PROVIDER', 'codex_plan')
+    monkeypatch.setattr(db, 'BUY_LLM_PROVIDER', 'claude_plan')
     monkeypatch.setattr(db, 'load_portfolio', lambda: PortfolioState(cash_weight=1.0))
     alerts, calls = [], []
     monkeypatch.setattr(db.notify, 'send_telegram_alert', lambda m: alerts.append(m) or True)
     async def reject(**kwargs):
         calls.append(1)
-        raise db.codex_plan.CodexProviderRejected('429 Too Many Requests', 'rate_limited')
-    monkeypatch.setattr(db.codex_plan, '_call_structured', reject)
+        raise db.claude_plan.PlanProviderRejected('429 Too Many Requests', 'rate_limited')
+    monkeypatch.setattr(db.claude_plan, '_call_structured', reject)
     async def run(*args, **kwargs):
         db.run_history.claim_analysis()
         record = db.run_history.CURRENT.get()
@@ -567,12 +590,12 @@ def test_provider_rejection_discards_partial_pending_and_does_not_retry(monkeypa
         record.buy = 1
         await args[5](_decision(), GateResult(approved=True, rejected_by=None), args[1], '반도체', 0.08)
         try:
-            await db.llm.call_structured(system='', user='', response_model=db.codex_plan.HealthResponse, json_schema={})
-        except db.codex_plan.CodexProviderRejected:
+            await db.llm.call_structured(system='', user='', response_model=db.claude_plan.HealthResponse, json_schema={})
+        except db.claude_plan.PlanProviderRejected:
             pass
         try:
-            await db.llm.call_structured(system='', user='', response_model=db.codex_plan.HealthResponse, json_schema={})
-        except db.codex_plan.CodexProviderRejected:
+            await db.llm.call_structured(system='', user='', response_model=db.claude_plan.HealthResponse, json_schema={})
+        except db.claude_plan.PlanProviderRejected:
             pass
         return args[1], []
     monkeypatch.setattr(db.pipeline, 'run_daily', run)
@@ -581,11 +604,11 @@ def test_provider_rejection_discards_partial_pending_and_does_not_retry(monkeypa
     assert result.status == 'failed'
     assert result.provider_attempted == result.provider_failed == 1
     assert json.loads(db.PENDING_BUYS_PATH.read_text()) == {
-        'day': result.day, 'decisions': [], 'skipped': 'codex_provider_unavailable:rate_limited',
+        'day': result.day, 'decisions': [], 'skipped': 'plan_provider_unavailable:rate_limited',
     }
     assert len(alerts) == 1 and '중단' in alerts[0]
     assert 'not_attempted=1' in alerts[0]
-    assert db.codex_plan.CALL_SESSION.get() is None
+    assert db.claude_plan.CALL_SESSION.get() is None
     asyncio.run(db.main())
     assert len(calls) == 1
 

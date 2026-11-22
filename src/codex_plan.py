@@ -70,6 +70,12 @@ class CodexProviderRejected(CodexPlanUnavailable):
         self.attempted = attempted
 
 
+# claude_plan과 같은 이름 — decide_buys가 두 공급자를 같은 코드로 다룬다(롤백용).
+PlanUnavailable = CodexPlanUnavailable
+PlanTransientFailure = CodexTransientFailure
+PlanProviderRejected = CodexProviderRejected
+
+
 @dataclass
 class CallSession:
     """한 분석 회차의 공급자 거부를 공유한다. 성공한 판단은 재시도하지 않는다."""

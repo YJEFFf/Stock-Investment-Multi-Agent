@@ -1,3 +1,35 @@
+## 2026-11-23 (Codex → Claude 구독 전환 — 로컬 구현·검증)
+
+- 사용자 결정: Codex 구독 종료로 Codex가 하던 일을 Claude Code로 옮기고 배포까지 한다.
+  기존 보유분이 전부 매도되기 전까지 매수 판단·신규 종목 탐색은 재개하지 않는다(`EXIT_ONLY=True` 유지).
+  보유분 가상 매도는 원래 모델을 쓰지 않는 코드 경로라 그대로 계속 돈다.
+- `src/claude_plan.py` 추가: 전용 계정 `sima-claude`에서 Claude Code CLI를 `-p --output-format stream-json
+  --json-schema`로 실행한다. 다음 조건 중 하나라도 어긋나면 호출을 거부한다.
+  - 구독 로그인 확인(`auth status`가 claude.ai)
+  - 실행 결과의 `apiKeySource=none`
+  - 운영 저장소 접근 불가
+  - 도구·설정·MCP·슬래시 명령 없음
+  호출 세션·동시성 2·전송 실패만 재시도·호출 로그는 Codex 경로와 같다. 한도는 응답의
+  `rate_limit_event` 5시간·7일 사용률로 읽는다. 2% 문턱은 Codex에서 옮긴 자리표시값이며
+  재개 전 섀도로 다시 정한다(PLAN 체크리스트에 추가).
+- 전환한 호출부:
+  - `decide_buys`: `BUY_LLM_PROVIDER="claude_plan"`. `"codex_plan"`은 같은 코드로 롤백되며,
+    이를 위해 codex_plan에 공통 이름 별칭을 추가했다.
+  - `translate`, `thesis_shadow`, `collector_repair`(검색 호출만 WebSearch·WebFetch 허용)
+  - `scripts/check_codex_plan.*` → `scripts/check_claude_plan.*`, 준비 잠금 `plan-readiness.lock`
+  - `recover_operations`
+  - 앱·노션·알림의 한도 문구와 파일(`claude_plan_capacity.json`)
+  - skip 사유 `codex_*` → `plan_*`
+- `deploy/install_claude_plan.sh` 추가: 전용 계정 생성, 공식 네이티브 CLI 설치, 운영 저장소 격리 확인.
+  로그인은 사용자가 직접 한다.
+- 출력 형식 확인을 위해 로컬 Mac에서 사용자 구독으로 고정 연결 확인 3회를 실제 호출했다
+  (`claude-sonnet-5-5`, 표준 단가 환산 합계 약 $0.006).
+  - 확인한 항목: `structured_output`, `apiKeySource=none`, `rate_limit_event`(5시간·7일),
+    stdin 입력, `--system-prompt-file`
+  - `--bare`는 구독 로그인을 읽지 않아 쓰지 않는다.
+- 새 `tests/test_claude_plan.py` 27개와 Codex 롤백 경로 테스트를 추가했다. 기존 테스트의 목킹 대상을 옮겼다.
+  전체 `SIMA_LIVE_TEST= .venv/bin/python -m pytest tests/ -q`: **1,177 통과·5 생략**.
+
 ## 2026-11-23 (운영 배포·셀트리온 경고 해제 완료)
 
 - 독립 리뷰 에이전트가 `dda2f0f5882efb02a9eb0126a36cbfdb3b76fe27`을 승인했다(차단 결함 없음, 1,150 통과·5 생략 재확인).

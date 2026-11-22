@@ -286,17 +286,19 @@ def test_reconcile_alert_survives_a_zero_local_value():
     assert "%" not in message
 
 
-def test_codex_capacity_alert_preserves_exact_two_percent_boundary():
-    message = notify.format_codex_capacity_alert(
+def test_plan_capacity_alert_preserves_exact_two_percent_boundary():
+    message = notify.format_plan_capacity_alert(
         {
             "day": "2026-09-16",
             "remaining_percent": 2.01,
+            "five_hour_used_percent": 18.0,
             "ordinary_usage_allowed": True,
             "buy_judgment_allowed": True,
-            "estimated_daily_runs_remaining": 1.0,
-            "estimated_token_equivalent_remaining": 3_702_086,
+            "threshold_percent": 2.0,
         }
     )
 
-    assert "잔여 2.01%" in message
+    assert "Claude 구독" in message
+    assert "7일 잔여 2.01%" in message
+    assert "5시간 사용 18.0%" in message
     assert "07:00 매수 판단 진행" in message

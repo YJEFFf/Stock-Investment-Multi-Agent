@@ -184,7 +184,7 @@ def snapshot(root: Path, *, now: datetime | None = None, initial_capital: float 
             state, label = "unconfirmed", "분석 종료 기록 없음"
     elif now.time() >= session_clock(now.date(), 8, 55):
         state, label = "missing", "오늘 분석 기록 없음"
-    capacity = data.json("codex_plan_capacity.json") or {}
+    capacity = data.json("claude_plan_capacity.json") or {}
     if not isinstance(capacity, dict):
         capacity = {}
     unconfirmed = data.json("unconfirmed_orders.json")

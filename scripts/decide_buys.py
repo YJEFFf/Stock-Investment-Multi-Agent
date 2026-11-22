@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import codex_plan, judgment, llm, notify, pipeline, run_history  # noqa: E402
+from src import claude_plan, codex_plan, judgment, llm, notify, pipeline, run_history  # noqa: E402
 from src.market_calendar import is_krx_trading_day  # noqa: E402
 from src.portfolio_store import load_portfolio, portfolio_lock, PortfolioLockBusy  # noqa: E402
 from src.schemas import DataCollectionUnavailable, Decision, GateResult, PortfolioState, RiskGateConfig  # noqa: E402
@@ -37,7 +37,10 @@ PENDING_BUYS_PATH = Path("logs/pending_buys.json")
 # 2026-09-15 전체 41종목 섀도(244/244 성공, 주간 한도 약 2%p) 뒤 사용자가 다음
 # 거래일부터 모의 매수 판단에 쓰기로 결정했다. "disabled"는 즉시 정지,
 # "anthropic"은 이력·롤백용이며 llm.CLAUDE_API_ENABLED도 켜져 있어야 한다.
-BUY_LLM_PROVIDER = "codex_plan"  # "codex_plan" | "anthropic" | "disabled"
+# 2026-11-23 Codex 구독 종료 후 사용자 결정으로 Claude 구독(claude_plan)으로 옮겼다.
+# "codex_plan"은 이력·롤백용으로 남긴다. EXIT_ONLY 동안에는 어느 쪽도 호출되지 않는다.
+BUY_LLM_PROVIDER = "claude_plan"  # "claude_plan" | "codex_plan" | "anthropic" | "disabled"
+PLAN_PROVIDERS = {"claude_plan": claude_plan, "codex_plan": codex_plan}
 DECISION_DEADLINE = time(8, 55)  # 09:01 execute_open보다 6분 먼저 실패 폐쇄
 
 
@@ -140,25 +143,26 @@ async def _main() -> None:
         _write_pending_state(today_kst.isoformat(), [], skipped=skipped_reason)
         notify.send_telegram_alert(notify.format_buy_decision_skipped_alert(today_kst.isoformat()))
         return
-    if BUY_LLM_PROVIDER not in {"codex_plan", "anthropic"}:
+    if BUY_LLM_PROVIDER not in {*PLAN_PROVIDERS, "anthropic"}:
         raise ValueError(f"unknown BUY_LLM_PROVIDER={BUY_LLM_PROVIDER!r}")
 
-    if BUY_LLM_PROVIDER == "codex_plan":
+    plan = PLAN_PROVIDERS.get(BUY_LLM_PROVIDER, claude_plan)
+    if BUY_LLM_PROVIDER in PLAN_PROVIDERS:
         try:
-            capacity = codex_plan.load_capacity_status(today_kst.isoformat())
-        except codex_plan.CodexPlanUnavailable as exc:
-            _write_pending_state(today_kst.isoformat(), [], skipped="codex_capacity_unavailable")
+            capacity = plan.load_capacity_status(today_kst.isoformat())
+        except plan.PlanUnavailable as exc:
+            _write_pending_state(today_kst.isoformat(), [], skipped="plan_capacity_unavailable")
             notify.send_telegram_alert(
-                notify.format_error_alert("06:55 Codex 한도 점검을 확인할 수 없어 오늘 신규 매수 판단 중지", str(exc))
+                notify.format_error_alert("06:55 구독 한도 점검을 확인할 수 없어 오늘 신규 매수 판단 중지", str(exc))
             )
             return
         if not capacity.ordinary_usage_allowed:
-            _write_pending_state(today_kst.isoformat(), [], skipped="codex_ordinary_usage_blocked")
-            notify.send_telegram_alert(notify.format_codex_usage_blocked_alert(capacity.model_dump(mode="json")))
+            _write_pending_state(today_kst.isoformat(), [], skipped="plan_ordinary_usage_blocked")
+            notify.send_telegram_alert(notify.format_plan_usage_blocked_alert(capacity.model_dump(mode="json")))
             return
-        if capacity.remaining_percent <= codex_plan.BUY_CAPACITY_FLOOR_PERCENT:
-            _write_pending_state(today_kst.isoformat(), [], skipped="codex_weekly_capacity_low")
-            notify.send_telegram_alert(notify.format_codex_capacity_skip_alert(capacity.model_dump(mode="json")))
+        if capacity.remaining_percent <= plan.BUY_CAPACITY_FLOOR_PERCENT:
+            _write_pending_state(today_kst.isoformat(), [], skipped="plan_weekly_capacity_low")
+            notify.send_telegram_alert(notify.format_plan_capacity_skip_alert(capacity.model_dump(mode="json")))
             return
 
     from src import collector_repair
@@ -204,17 +208,17 @@ async def _main() -> None:
     recorded: list[dict] = []
     original_call_structured = llm.call_structured
     provider_stats = {"attempted": 0, "failed": 0}
-    call_session = codex_plan.CallSession()
-    session_token = codex_plan.CALL_SESSION.set(call_session)
-    if BUY_LLM_PROVIDER == "codex_plan":
-        async def _tracked_codex_call(*args, **kwargs):
+    call_session = plan.CallSession()
+    session_token = plan.CALL_SESSION.set(call_session)
+    if BUY_LLM_PROVIDER in PLAN_PROVIDERS:
+        async def _tracked_plan_call(*args, **kwargs):
             provider_stats["attempted"] += 1
             try:
-                return await codex_plan.call_structured(*args, **kwargs)
+                return await plan.call_structured(*args, **kwargs)
             except asyncio.CancelledError:
                 provider_stats["failed"] += 1
                 raise
-            except codex_plan.CodexProviderRejected as exc:
+            except plan.PlanProviderRejected as exc:
                 if exc.attempted:
                     provider_stats["failed"] += 1
                 else:
@@ -224,7 +228,7 @@ async def _main() -> None:
                 provider_stats["failed"] += 1
                 raise
 
-        llm.call_structured = _tracked_codex_call
+        llm.call_structured = _tracked_plan_call
     deadline_exceeded = False
     try:
         try:
@@ -250,7 +254,7 @@ async def _main() -> None:
     finally:
         # main()은 단발 프로세스지만 테스트·수동 import에서도 공급자 변경이 새지 않게 한다.
         llm.call_structured = original_call_structured
-        codex_plan.CALL_SESSION.reset(session_token)
+        plan.CALL_SESSION.reset(session_token)
         record = run_history.CURRENT.get()
         if record is not None:
             record.provider_attempted = provider_stats["attempted"]
@@ -260,7 +264,7 @@ async def _main() -> None:
         _write_pending_state(today_kst.isoformat(), [], skipped="decision_deadline_exceeded")
         notify.send_telegram_alert(
             notify.format_error_alert(
-                "Codex 매수 판단이 08:55까지 끝나지 않아 오늘 신규 매수를 건너뜁니다",
+                "매수 판단이 08:55까지 끝나지 않아 오늘 신규 매수를 건너뜁니다",
                 f"attempted={provider_stats['attempted']} failed={provider_stats['failed']}",
             )
         )
@@ -268,10 +272,10 @@ async def _main() -> None:
 
     record = run_history.CURRENT.get()
     if call_session.rejected is not None:
-        reason = "codex_provider_unavailable:" + call_session.rejected.code
+        reason = "plan_provider_unavailable:" + call_session.rejected.code
         _write_pending_state(today_kst.isoformat(), [], skipped=reason)
         notify.send_telegram_alert(notify.format_error_alert(
-            "매수 판단 중단 — Codex 공급자 거부로 오늘 신규 매수 없음",
+            "매수 판단 중단 — 구독 공급자 거부로 오늘 신규 매수 없음",
             f"reason={call_session.rejected.code} failed={provider_stats['failed']} "
             f"attempted={provider_stats['attempted']} not_attempted={call_session.skipped}\n"
             "부분 승인 결과는 폐기했습니다. 정상 관망이 아니며 오늘 분석을 재실행하지 않습니다.",
@@ -332,13 +336,13 @@ async def main(*, recovery: bool = False) -> None:
         with portfolio_lock(run_history.RUN_LOCK_PATH, blocking=False):
             if recovery:
                 rows = [r for r in run_history.load_runs() if r.day == now.date().isoformat()]
-                if now.hour >= 8 or (rows and rows[-1].reason != "codex_capacity_unavailable"):
+                if now.hour >= 8 or (rows and rows[-1].reason != "plan_capacity_unavailable"):
                     return
             if run_history.already_analyzed(now.date().isoformat(), pipeline.DEFAULT_LOG_PATH):
                 logger.warning("decide_buys_duplicate_blocked day=%s — 기존 pending 보존", now.date())
                 return
-            record = run_history.new_run(now, BUY_LLM_PROVIDER,
-                                        codex_plan.DEFAULT_MODEL if BUY_LLM_PROVIDER == "codex_plan" else "anthropic")
+            record = run_history.new_run(now, BUY_LLM_PROVIDER, PLAN_PROVIDERS[BUY_LLM_PROVIDER].DEFAULT_MODEL
+                                        if BUY_LLM_PROVIDER in PLAN_PROVIDERS else "anthropic")
             token = run_history.CURRENT.set(record)
             try:
                 run_history.write(record)

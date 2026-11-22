@@ -88,7 +88,7 @@ function operationCard() {
   if (isExitOnly()) return `<div class="card status-card"><span class="status-dot ${o.status === 'failed' ? 'error' : ''}"></span><div><h3>${esc(o.label)}</h3><p>${o.completed_at ? '잔여 수량 0주 · 시세 조회 종료' : '신규 매수 분석 중단 · 거래일 09:00–15:30 매분 감시'}</p><p>기존 매도 기준 충족 시 조회 가격으로 가상 매도를 기록해요.</p><p class="fine">증권사 주문·체결 없이 기록하며 수수료·세금은 추정해요.</p></div></div>` + liquidationCard();
   const bad = ['failed','degraded','missing','skipped','unconfirmed'].includes(o.status);
   const idle = ['holiday','waiting'].includes(o.status);
-  const reasons = {universe_fetch_failed:'구성 종목 자료를 불러오지 못했어요.',all_market_contexts_unavailable:'시세 자료를 불러오지 못했어요.',deadline_exceeded:'정해진 시각 안에 분석을 끝내지 못했어요.',codex_plan_capacity_insufficient:'분석에 사용할 잔여 한도가 부족해요.'};
+  const reasons = {universe_fetch_failed:'구성 종목 자료를 불러오지 못했어요.',all_market_contexts_unavailable:'시세 자료를 불러오지 못했어요.',deadline_exceeded:'정해진 시각 안에 분석을 끝내지 못했어요.',codex_plan_capacity_insufficient:'분석에 사용할 잔여 한도가 부족해요.',plan_capacity_unavailable:'구독 한도 점검을 확인하지 못했어요.',plan_weekly_capacity_low:'구독 주간 잔여 한도가 부족해요.',plan_ordinary_usage_blocked:'구독 한도 상태가 사용을 허용하지 않아요.'};
   const detail = o.status === 'holiday' ? `다음 거래일 ${shortDay(o.next_trading_day)} · 오전 8:30 분석 예정` : o.run?.ended_at ? `${stamp(o.run.ended_at)} 종료 · ${o.run.decisions ?? 0}종목 판단` : bad ? (reasons[o.reason] || '알림에서 실행 결과와 사유를 확인해주세요.') : '오전 8:30에 그날의 투자 판단을 시작해요.';
   return `<div class="card status-card"><span class="status-dot ${bad ? 'error' : idle ? 'waiting' : ''}"></span><div><h3>${esc(o.label)}</h3><p>${esc(detail)}</p>${o.unconfirmed_orders ? `<p class="danger-text">확인이 필요한 주문 ${o.unconfirmed_orders}건</p>` : ''}</div></div>`;
 }

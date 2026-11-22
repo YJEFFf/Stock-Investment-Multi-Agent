@@ -246,7 +246,7 @@ def test_daily_repair_budget_is_persisted_before_model(monkeypatch):
 def test_proposal_cannot_change_a_healthy_route(monkeypatch):
     async def capacity():
         return SimpleNamespace(buy_judgment_allowed=True)
-    monkeypatch.setattr(repair.codex_plan, "read_capacity", capacity)
+    monkeypatch.setattr(repair.claude_plan, "read_capacity", capacity)
     monkeypatch.setattr(repair, "git", lambda *a, **k: "" if a[0] in {"status", "fetch"} else "base")
     candidate = routes.default_manifest()
     candidate["routes"]["quotes"]["url"] = "https://stock.naver.com/api/quotes/{codes}"
@@ -305,7 +305,7 @@ def transaction_fixture(monkeypatch, tmp_path):
     monkeypatch.setattr(repair, 'ROOT', tmp_path / 'repo')
     repair.ROOT.mkdir()
     monkeypatch.setattr(repair, 'git', git)
-    monkeypatch.setattr(repair.codex_plan, 'read_capacity', capacity)
+    monkeypatch.setattr(repair.claude_plan, 'read_capacity', capacity)
     monkeypatch.setattr(repair, 'model_call', model)
     monkeypatch.setattr(repair, 'build_commit', lambda *a, rollback=False: 'rollback' if rollback else 'candidate')
     monkeypatch.setattr(repair, 'run_tests', lambda *a: 'passed')
@@ -718,20 +718,19 @@ def test_same_problem_has_no_periodic_status_alerts(monkeypatch):
 
 
 @pytest.mark.parametrize('allowed', [True, False])
-def test_codex_preparation_only_notifies_when_blocked(monkeypatch, allowed):
+def test_plan_preparation_only_notifies_when_blocked(monkeypatch, allowed):
     import asyncio
-    from scripts import check_codex_plan as script
+    from scripts import check_claude_plan as script
     monkeypatch.setattr(script, 'datetime', type('FixedTime', (datetime,), {'now': classmethod(lambda cls, tz=None: AT)}))
-    capacity = SimpleNamespace(buy_judgment_allowed=allowed, remaining_percent=50 if allowed else 1,
+    capacity = SimpleNamespace(buy_judgment_allowed=allowed, remaining_percent=50 if allowed else 1, five_hour_used_percent=10,
                                resets_at=AT, model_dump=lambda **k: {})
-    async def health_ok():
+    async def health_ok(limits_sink):
+        limits_sink.append({'status': 'allowed'})
         return SimpleNamespace(status='ok')
-    async def capacity_ok():
-        return capacity
-    monkeypatch.setattr(script.codex_plan, 'check_health', health_ok)
-    monkeypatch.setattr(script.codex_plan, 'read_capacity', capacity_ok)
-    monkeypatch.setattr(script.codex_plan, 'save_capacity_status', lambda c: None)
-    monkeypatch.setattr(notify, 'format_codex_capacity_alert', lambda c: 'blocked')
+    monkeypatch.setattr(script.claude_plan, 'check_health', health_ok)
+    monkeypatch.setattr(script.claude_plan, 'capacity_from_limits', lambda limits: capacity)
+    monkeypatch.setattr(script.claude_plan, 'save_capacity_status', lambda c: None)
+    monkeypatch.setattr(notify, 'format_plan_capacity_alert', lambda c: 'blocked')
     sent = []
     monkeypatch.setattr(notify, 'send_telegram_alert', lambda m: sent.append(m) or True)
     asyncio.run(script.main())

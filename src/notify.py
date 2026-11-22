@@ -218,34 +218,34 @@ def format_buy_decision_skipped_alert(day: str) -> str:
     )
 
 
-def format_codex_capacity_alert(capacity: dict) -> str:
+def format_plan_capacity_alert(capacity: dict) -> str:
     if capacity["buy_judgment_allowed"]:
         action = "07:00 매수 판단 진행"
     elif not capacity["ordinary_usage_allowed"]:
-        action = "백엔드 일반 사용 불허 — 오늘 신규 매수 판단 중지"
+        action = "구독 한도 상태가 허용이 아님 — 오늘 신규 매수 판단 중지"
     else:
-        action = "잔여 2% 이하 — 오늘 신규 매수 판단 중지"
+        action = f"주간 잔여 {capacity['threshold_percent']:g}% 이하 — 오늘 신규 매수 판단 중지"
+    five_hour = capacity.get("five_hour_used_percent")
     return (
-        f"🧮 [SIMA] Codex 주간 한도 점검 ({capacity['day']})\n"
-        f"잔여 {capacity['remaining_percent']:.2f}% · 같은 일일 부하 약 "
-        f"{capacity['estimated_daily_runs_remaining']:.1f}회분 "
-        f"(토큰 환산 약 {capacity['estimated_token_equivalent_remaining']:,}개)\n"
-        f"판정: {action} · 2% 이하면 중지"
+        f"🧮 [SIMA] Claude 구독 한도 점검 ({capacity['day']})\n"
+        f"7일 잔여 {capacity['remaining_percent']:.2f}%"
+        + (f" · 5시간 사용 {five_hour:.1f}%" if five_hour is not None else "") + "\n"
+        f"판정: {action}"
     )
 
 
-def format_codex_capacity_skip_alert(capacity: dict) -> str:
+def format_plan_capacity_skip_alert(capacity: dict) -> str:
     return (
         f"⏸ [SIMA] 매수 판단 건너뜀 ({capacity['day']})\n"
-        f"Codex 주간 잔여 {capacity['remaining_percent']:.2f}% — 2% 이하 보호 기준 도달\n"
+        f"Claude 구독 7일 잔여 {capacity['remaining_percent']:.2f}% — {capacity['threshold_percent']:g}% 이하 보호 기준 도달\n"
         "신규 매수 판단 없음 · 기존 보유 종목 손절·익절 감시는 정상 동작"
     )
 
 
-def format_codex_usage_blocked_alert(capacity: dict) -> str:
+def format_plan_usage_blocked_alert(capacity: dict) -> str:
     return (
         f"⏸ [SIMA] 매수 판단 건너뜀 ({capacity['day']})\n"
-        f"Codex 주간 잔여 {capacity['remaining_percent']:.2f}% · 백엔드가 일반 사용을 허용하지 않음\n"
+        f"Claude 구독 7일 잔여 {capacity['remaining_percent']:.2f}% · 한도 상태가 허용이 아님\n"
         "신규 매수 판단 없음 · 기존 보유 종목 손절·익절 감시는 정상 동작"
     )
 

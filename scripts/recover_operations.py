@@ -9,7 +9,7 @@ from datetime import datetime, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src import codex_plan, notify, pipeline, run_history
+from src import claude_plan, notify, pipeline, run_history
 from src.market_calendar import is_krx_trading_day, session_clock
 from src.portfolio_store import portfolio_lock, PortfolioLockBusy
 from scripts import decide_buys
@@ -32,7 +32,7 @@ def eligible(at, rows, already):
         return False
     # A readiness failure has not made an investment judgment. Other failures are
     # deliberately left to their existing recovery paths.
-    return not rows or rows[-1].reason == 'codex_capacity_unavailable'
+    return not rows or rows[-1].reason == 'plan_capacity_unavailable'
 
 
 def main():
@@ -53,7 +53,7 @@ def main():
         if operating_mode.EXIT_ONLY:
             from src import exit_only
             from src.market_calendar import monitor_due
-            at = datetime.now(codex_plan.KST)
+            at = datetime.now(claude_plan.KST)
             try:
                 ledger = exit_only.load()
                 due = monitor_due(at) if ledger.portfolio.positions else None
@@ -67,7 +67,7 @@ def main():
                 notify.alert_once_per_day("exit_only_watchdog_invalid", notify.format_error_alert(
                     "가상 매도 감시 확인 불가", "장부 또는 거래 달력을 읽지 못했습니다."), today=at.date())
             return
-        at = datetime.now(codex_plan.KST)
+        at = datetime.now(claude_plan.KST)
         # Use exactly the analysis lock. A live run is never finalized or replaced.
         with portfolio_lock(run_history.RUN_LOCK_PATH, blocking=False):
             latest = {r.run_id: r for r in run_history.load_runs()}
@@ -94,7 +94,7 @@ def main():
         # Readiness has its own cross-process lock. Analysis rechecks its own lock
         # and durable analysis_started marker after we release it above.
         try:
-            result = subprocess.run(['bash', 'scripts/check_codex_plan.sh'], timeout=500)
+            result = subprocess.run(['bash', 'scripts/check_claude_plan.sh'], timeout=500)
             code = result.returncode
         except subprocess.TimeoutExpired:
             code = 124
@@ -104,8 +104,8 @@ def main():
                     '장전 준비 자동 복구 실패 — 확인 필요',
                     f'{day}: 2회 복구 소진, exit={code}; 신규 매수 판단 차단 유지'))
             return
-        capacity = codex_plan.load_capacity_status(day)
-        if not capacity.buy_judgment_allowed or datetime.now(codex_plan.KST).time() >= session_clock(at.date(), 8, 0):
+        capacity = claude_plan.load_capacity_status(day)
+        if not capacity.buy_judgment_allowed or datetime.now(claude_plan.KST).time() >= session_clock(at.date(), 8, 0):
             return
         asyncio.run(decide_buys.main(recovery=True))
 

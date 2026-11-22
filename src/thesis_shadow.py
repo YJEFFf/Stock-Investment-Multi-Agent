@@ -16,7 +16,7 @@ from datetime import date, datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from src import codex_plan, run_history, thesis_sources
+from src import claude_plan, run_history, thesis_sources
 from src.market_calendar import is_krx_trading_day, session_clock
 from src.schemas import (
     Decision, EntryThesisRecord, EntryThesisResponse, HoldingThesisRecord,
@@ -141,18 +141,18 @@ def validate_new_documents(documents, thesis, now):
 
 async def _call(template, data, response_model, *, label, root, deadline, clock):
     current = clock()
-    capacity = codex_plan.load_capacity_status(current.astimezone(KST).date().isoformat())
+    capacity = claude_plan.load_capacity_status(current.astimezone(KST).date().isoformat())
     if not capacity.ordinary_usage_allowed or not capacity.buy_judgment_allowed:
-        raise ValueError("codex_capacity_unavailable")
-    if capacity.remaining_percent <= codex_plan.BUY_CAPACITY_FLOOR_PERCENT:
-        raise ValueError("codex_capacity_low")
+        raise ValueError("plan_capacity_unavailable")
+    if capacity.remaining_percent <= claude_plan.BUY_CAPACITY_FLOOR_PERCENT:
+        raise ValueError("plan_capacity_low")
     user = template.format(data=json.dumps(data, ensure_ascii=False, sort_keys=True))
     if len(user) > MAX_PROMPT_CHARS:
         raise ValueError("input_budget_exceeded")
     seconds = (deadline - current).total_seconds()
     if seconds <= 0:
         raise ValueError("shadow_deadline_exceeded")
-    response = await codex_plan.call_structured(
+    response = await claude_plan.call_structured(
         system="", user=user, response_model=response_model, json_schema=response_model.model_json_schema(),
         label=label, log_path=root / "calls.jsonl", timeout_s=min(120.0, seconds),
     )
@@ -195,7 +195,7 @@ async def capture_entries(pending_path, *, root=None, clock=now_kst):
     version = "prompt:entry_thesis@" + hashlib.sha256(template.encode()).hexdigest()[:6]
     deadline = datetime.combine(now.date(), session_clock(now.date(), 8, 55), KST)
     results = []
-    token = codex_plan.CALL_SESSION.set(codex_plan.CallSession())
+    token = claude_plan.CALL_SESSION.set(claude_plan.CallSession())
     try:
         for raw in payload.get("decisions", []):
             decision = Decision.model_validate(raw["decision"])
@@ -206,7 +206,7 @@ async def capture_entries(pending_path, *, root=None, clock=now_kst):
             path = _path(root, "entries", now.date(), decision.ticker)
             record = EntryThesisRecord(
                 day=now.date(), ticker=decision.ticker, started_at=clock(), decision=decision,
-                decision_hash=digest(decision), prompt_version=version, model=codex_plan.DEFAULT_MODEL,
+                decision_hash=digest(decision), prompt_version=version, model=claude_plan.DEFAULT_MODEL,
                 git_commit=run_history.git_commit(),
             )
             if not _claim(path, record):
@@ -232,7 +232,7 @@ async def capture_entries(pending_path, *, root=None, clock=now_kst):
             _finish(path, record)
             results.append({"ticker": decision.ticker, "status": record.status, "reason": record.reason})
     finally:
-        codex_plan.CALL_SESSION.reset(token)
+        claude_plan.CALL_SESSION.reset(token)
     return _summary(root, "capture", now, results)
 
 
@@ -274,13 +274,13 @@ async def review_holdings(portfolio_path, journal_path, *, fee_rate, tax_rate, r
     version = "prompt:holding_thesis@" + hashlib.sha256(template.encode()).hexdigest()[:6]
     deadline = datetime.combine(now.date(), REVIEW_DEADLINE, KST)
     results = []
-    token = codex_plan.CALL_SESSION.set(codex_plan.CallSession())
+    token = claude_plan.CALL_SESSION.set(claude_plan.CallSession())
     try:
         for position in portfolio.positions:
             path = _path(root, "reviews", now.date(), position.ticker)
             record = HoldingThesisRecord(
                 day=now.date(), ticker=position.ticker, started_at=clock(), position=position,
-                prompt_version=version, model=codex_plan.DEFAULT_MODEL,
+                prompt_version=version, model=claude_plan.DEFAULT_MODEL,
                 git_commit=run_history.git_commit(),
                 hypothetical_sell_fee_rate=fee_rate, hypothetical_sell_tax_rate=tax_rate,
                 unconfirmed_order=position.ticker in unconfirmed,
@@ -321,5 +321,5 @@ async def review_holdings(portfolio_path, journal_path, *, fee_rate, tax_rate, r
             _finish(path, record)
             results.append({"ticker": position.ticker, "status": record.status, "reason": record.reason})
     finally:
-        codex_plan.CALL_SESSION.reset(token)
+        claude_plan.CALL_SESSION.reset(token)
     return _summary(root, "review", now, results)

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, StrictBool
 
-from src import codex_plan, collector_health as health, collector_routes as routes, notify, run_history
+from src import claude_plan, collector_health as health, collector_routes as routes, notify, run_history
 from src.market_calendar import is_krx_trading_day, session_clock
 from src.portfolio_store import portfolio_lock
 
@@ -288,30 +288,20 @@ def git(*args, cwd=ROOT, timeout=30):
 
 
 def model_call(prompt_name, payload, response_model, *, search=False):
-    env = codex_plan._subscription_environment()
-    codex_plan._ensure_filesystem_isolation(env, timeout_s=budget(15))
-    codex_plan._ensure_chatgpt_login(env, timeout_s=budget(15))
-    prompt = (ROOT / "prompts" / prompt_name).read_text() + "\n\nUNTRUSTED INPUT DATA:\n" + json.dumps(payload, ensure_ascii=False)
-    with tempfile.TemporaryDirectory(prefix="sima-repair-model-") as tmp:
-        path = Path(tmp)
-        path.chmod(0o733)
-        schema = path / "schema.json"
-        schema.write_text(json.dumps(response_model.model_json_schema()))
-        schema.chmod(0o644)
-        output = path / "result.json"
-        args = (["--search"] if search else []) + [
-            "exec", "--json", "--ephemeral", "--ignore-user-config", "--skip-git-repo-check",
-            "--sandbox", "read-only", "--model", codex_plan.DEFAULT_MODEL,
-            "--output-schema", str(schema), "--output-last-message", str(output), "-C", tmp, "-",
-        ]
-        started = clock.monotonic()
-        result = codex_plan._run(codex_plan._codex_command(*args), env=env,
-                                 input_text=prompt, cwd=tmp, timeout_s=budget(120))
-        audit("model_call", purpose=prompt_name, success=result.returncode == 0,
-              elapsed_s=round(clock.monotonic() - started, 2), usage=codex_plan._usage_from_events(result.stdout))
-        if result.returncode:
-            raise RuntimeError("repair model unavailable")
-        return response_model.model_validate_json(output.read_text())
+    system = (ROOT / "prompts" / prompt_name).read_text()
+    user = "UNTRUSTED INPUT DATA:\n" + json.dumps(payload, ensure_ascii=False)
+    tools = ("WebSearch", "WebFetch") if search else ()
+    started = clock.monotonic()
+    try:
+        structured, usage, _ = claude_plan.run_structured_sync(
+            system, user, response_model.model_json_schema(), timeout_s=budget(120),
+            tools=tools, max_turns=30 if search else 2)
+    except claude_plan.PlanUnavailable:
+        audit("model_call", purpose=prompt_name, success=False, elapsed_s=round(clock.monotonic() - started, 2))
+        raise RuntimeError("repair model unavailable")
+    audit("model_call", purpose=prompt_name, success=True,
+          elapsed_s=round(clock.monotonic() - started, 2), usage=usage)
+    return response_model.model_validate(structured)
 
 
 def run_tests(worktree):
@@ -451,9 +441,9 @@ def repair(state, current, report_data):
     slot = attempt_window(at)
     if attempts_used(state, at) >= MAX_ATTEMPTS:
         raise RuntimeError("repair session attempt budget exhausted")
-    capacity = asyncio.run(codex_plan.read_capacity())
+    capacity = asyncio.run(claude_plan.read_capacity())
     if not capacity.buy_judgment_allowed:
-        raise RuntimeError("Codex capacity unavailable for repair")
+        raise RuntimeError("Claude capacity unavailable for repair")
     state["attempts"][slot] = state["attempts"].get(slot, 0) + 1
     atomic_json(STATE_DIR / "state.json", state)  # claim before invoking a model
     audit("repair_started", slot=slot, attempt=state["attempts"][slot])

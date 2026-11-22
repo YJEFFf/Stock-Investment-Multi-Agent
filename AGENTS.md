@@ -5,11 +5,12 @@ LLM 분석가들이 각자 의견을 내고, 결정론적 리스크 게이트가
 
 작업 시작 전 `docs/PLAN.md`를 읽을 것. 이 파일은 규칙만 담고, 배경과 근거는 그쪽에 있다.
 
-이 저장소의 자동화 작업 지침은 `AGENTS.md`가 단일 원본이다. Codex는 저장소에 들어오면
-이 파일을 먼저 읽고, OpenAI 제품·모델·플랜 동작을 바꿀 때는 공식 OpenAI 문서를 확인한다.
-ChatGPT 플랜 기반 Codex 경로는 2026-09-15 전체 일일 섀도와 사용자 결정을 거쳐
-분석가·매수 판단에 연결했다. 주문 승인권은 계속 결정론적 게이트가 가지며 Codex는
-전용 OS 계정에서 운영 저장소·API 키와 격리한다.
+이 저장소의 자동화 작업 지침은 `AGENTS.md`가 단일 원본이다. Claude Code·Codex 등 어떤
+에이전트든 저장소에 들어오면 이 파일을 먼저 읽고, 모델·플랜 동작을 바꿀 때는 해당 공급자의
+공식 문서를 확인한다. 2026-11-23 Codex 구독 종료 후 사용자 결정으로 개발·운영 작업과
+모델 호출 경로(`src/claude_plan.py`, Claude 구독 기반 Claude Code CLI)를 Claude로 옮겼다.
+ChatGPT 플랜 Codex 경로(`src/codex_plan.py`)는 이력·롤백용으로 남긴다. 주문 승인권은
+계속 결정론적 게이트가 가지며 모델 CLI는 전용 OS 계정에서 운영 저장소·API 키와 격리한다.
 
 **수정하거나 특이사항을 발견할 때마다 `docs/CHANGELOG.md` 맨 위에 날짜와 함께 남길 것.**
 코드 수정뿐 아니라 EC2 크론탭·상태 파일처럼 커밋에 안 남는 운영 변경도 반드시 여기 쓴다.
@@ -140,7 +141,8 @@ class GateResult(BaseModel):
 src/
   schemas.py      # 계약 (처음부터 분리)
   llm.py          # 정지된 기존 Anthropic API 래퍼 — 이력·롤백용
-  codex_plan.py   # ChatGPT 플랜 기반 Codex 연결·주간 한도·구조화 호출 — 주문과 격리
+  claude_plan.py  # Claude 구독 기반 Claude Code CLI 연결·한도·구조화 호출 — 주문과 격리
+  codex_plan.py   # 종료된 ChatGPT 플랜 Codex 경로 — 이력·롤백용
   collectors.py   # 수집 전부
   analysts.py     # 분석가 전부
   pipeline.py     # 토론 → 매니저 → 게이트 → 집행
@@ -163,8 +165,9 @@ docs/CHANGELOG.md  # 변경·특이사항 기록 (날짜 필수)
 ## 기술 스택
 
 - Python 3.11+, pydantic v2, asyncio
-- 운영 매수 판단은 ChatGPT 플랜 기반 Codex CLI의 `gpt-5.6-sol`을 사용한다.
-  정지된 Anthropic API 경로는 이력·롤백용으로 유지한다.
+- 매수 판단 모델 호출은 Claude 구독 기반 Claude Code CLI(`claude_plan`, 기본
+  `claude-sonnet-5-5`)를 사용한다(2026-11-23 Codex에서 전환, EXIT_ONLY 동안 호출 없음).
+  종료된 Codex 경로와 정지된 Anthropic API 경로는 이력·롤백용으로 유지한다.
   **LangGraph / CrewAI / AutoGen 사용하지 않는다.**
   이 시스템은 에이전트 간 대화나 동적 툴 호출이 없고 병렬 호출 후 스키마 취합이
   전부라서, 프레임워크는 디버깅만 어렵게 만든다.

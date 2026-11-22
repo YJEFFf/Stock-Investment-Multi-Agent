@@ -59,7 +59,7 @@ def setup(tmp_path, monkeypatch):
     portfolio.write_text(PortfolioState(positions=[position], cash_weight=0.92).model_dump_json())
     journal.write_text(json.dumps({"event": "buy", "day": ENTRY.date().isoformat(), "ticker": "005930",
                                   "quantity": 30, "decision": decision().model_dump(mode="json")}) + "\n")
-    monkeypatch.setattr(shadow.codex_plan, "load_capacity_status", lambda day: SimpleNamespace(
+    monkeypatch.setattr(shadow.claude_plan, "load_capacity_status", lambda day: SimpleNamespace(
         ordinary_usage_allowed=True, buy_judgment_allowed=True, remaining_percent=50))
     calls = []
 
@@ -70,7 +70,7 @@ def setup(tmp_path, monkeypatch):
             return EntryThesisResponse(status="documented", explanation="원래 근거와 출처 확인", claims=[claim()])
         return response()
 
-    monkeypatch.setattr(shadow.codex_plan, "call_structured", model)
+    monkeypatch.setattr(shadow.claude_plan, "call_structured", model)
     monkeypatch.setattr(sources, "collect_new_documents", lambda thesis, now: ([fresh_document()], []))
     return SimpleNamespace(root=tmp_path / "shadow", pending=pending, portfolio=portfolio,
                            journal=journal, position=position, calls=calls)
@@ -186,7 +186,7 @@ def test_uncertain_failed_call_is_not_retried(setup, monkeypatch):
         attempts.append(kwargs)
         raise TimeoutError("result unknown")
 
-    monkeypatch.setattr(shadow.codex_plan, "call_structured", fail)
+    monkeypatch.setattr(shadow.claude_plan, "call_structured", fail)
     capture(setup); capture(setup)
     assert len(attempts) == 1 and entry_record(setup).status == "unavailable"
 
@@ -227,7 +227,7 @@ def test_late_completion_is_unavailable(setup):
 
 
 def test_capacity_unavailable_never_uses_another_provider(setup, monkeypatch):
-    monkeypatch.setattr(shadow.codex_plan, "load_capacity_status", lambda day: SimpleNamespace(
+    monkeypatch.setattr(shadow.claude_plan, "load_capacity_status", lambda day: SimpleNamespace(
         ordinary_usage_allowed=True, buy_judgment_allowed=False, remaining_percent=1))
     assert capture(setup)["counts"] == {"unavailable": 1}
     assert not setup.calls

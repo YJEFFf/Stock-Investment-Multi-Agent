@@ -409,27 +409,6 @@ def test_shared_limit_bounds_running_calls(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_concurrent_readiness_failure_removes_old_permission(monkeypatch, tmp_path):
-    from scripts import check_codex_plan as script
-    monkeypatch.setattr(script, 'is_krx_trading_day', lambda day: True)
-    state = tmp_path / 'capacity.json'
-    state.write_text('previous permission')
-    monkeypatch.setattr(codex_plan, 'DEFAULT_CAPACITY_STATE_PATH', state)
-    calls = []
-    async def health():
-        calls.append(1)
-        if len(calls) == 1:
-            raise codex_plan.CodexProviderRejected('429', 'rate_limited')
-        return codex_plan.HealthResponse(status='ok')
-    async def forbidden():
-        raise AssertionError('failed health must not save permission')
-    monkeypatch.setattr(codex_plan, 'check_health', health)
-    monkeypatch.setattr(codex_plan, 'read_capacity', forbidden)
-    with pytest.raises(codex_plan.CodexPlanUnavailable, match='Concurrent'):
-        asyncio.run(script.main())
-    assert len(calls) == 2
-    assert not state.exists()
-
 @pytest.mark.parametrize('error,retries', [
     (codex_plan.CodexProviderRejected('429','rate_limited'),1),
     (codex_plan.CodexTransientFailure('503'),1),
