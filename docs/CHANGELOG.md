@@ -1,3 +1,25 @@
+## 2026-11-23 (앱 알림 재동기화 장중 앱 단독 배포 — git 밖 운영 변경)
+
+- 사용자가 장중 반영을 승인했다("가상매도니까 장 중이어도 수정 진행해도 상관없을 것 같다").
+  10/6 선례와 같이 매매 체크아웃·크론은 건드리지 않고 앱 릴리스만 바꿨다. `deploy/pull.sh`는 쓰지 않았다(장중 거부).
+- 독립 리뷰: `1aac29e` 승인(MEDIUM 1·LOW 7) → 반영 `0a8a9b8` 재리뷰 승인(LOW 2, 비차단).
+  남은 LOW: 해시 비교~POST 사이 수 ms의 끄기 경합, 만료 세션 endpoint 인수 분기는 변경 기록을 남기지 않음.
+- 14:05 KST 순서:
+  - EC2 `~/sima`에서 `git fetch`만 했다. 작업 트리 HEAD는 `1fb22f6` 그대로다.
+  - `git archive 0a8a9b8…`로 `/opt/sima-pwa/releases/0a8a9b8ddde283e42b69cd06cf27160931391cf8`를 만들었다.
+    파일 목록은 install_pwa.sh와 같고 `uv sync --frozen --no-dev`, `chmod -R a+rX`를 거쳤다.
+  - 이전 릴리스 `583f404…`와 다른 파일은 `src/mobile_store.py`·`web/assets/app.js`·`web/service-worker.js` 3개뿐이다.
+  - `current`를 `ln -sfn current.tmp && mv -T`로 원자 교체하고 **sima-pwa만 재시작**했다.
+    sima-push·sima-balance는 코드 경로가 바뀌지 않아 재시작하지 않았다(이전 릴리스 디렉터리에서 계속 실행).
+- 확인:
+  - pwa·push·balance active, `/healthz` 200, 비인증 `/api/push` 401
+  - 배포된 app.js에 `syncPush`·`pushEpoch`, 서비스 워커 `sima-shell-v8`
+  - 아이폰·FCM 세션 모두 `enabled`이고 지문이 나온다. `push_endpoint_changed` 기록은 아직 없다.
+  - 14:05 가상 매도 감시 정상(positions=6, sales=10), 크론 해시 동일
+- 되돌리기: `current`를 `/opt/sima-pwa/releases/583f40460aa2ec013921e2d0687d1697cc412880`로 돌리고 sima-pwa를 재시작한다.
+- **남은 일(16:10 이후):** 정규 `SIMA_REVIEWED=<origin/main> deploy/pull.sh`로 `~/sima`를 맞추고, 이어서 install_pwa.sh를 실행한다.
+  origin/main은 이 기록 커밋(문서만)이고 리뷰된 코드는 `0a8a9b8`이다. 아직 하지 않았다.
+
 ## 2026-11-23 (앱 알림 구독 자동 재동기화 — 재발 방지)
 
 - 사용자 결정: 아래 미표시 원인(낡은 Apple endpoint)의 재발 방지를 진행한다. 가상 매도는 시세 확인·기준 판정만 하므로
