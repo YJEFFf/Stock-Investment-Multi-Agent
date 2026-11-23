@@ -139,9 +139,12 @@ def test_push_status_exposes_endpoint_fingerprint_for_device_resync(web):
     assert request(client, "POST", "/api/push", json=old, headers=HEADERS).status_code == 200
     with store.connect() as db:
         assert dict(db.execute("SELECT generation,created FROM subscriptions").fetchone()) == before
+    assert store.get_meta("push_endpoint_changed") is None
     new = subscription("https://web.push.apple.com/Qnew")
     assert request(client, "POST", "/api/push", json=new, headers=HEADERS).status_code == 200
     assert request(client, "GET", "/api/push").json["endpoint_sha256"] == hashlib.sha256(new["endpoint"].encode()).hexdigest()
+    changed = json.loads(store.get_meta("push_endpoint_changed"))
+    assert "Qnew" not in json.dumps(changed) and changed["at"] > 0
 
 
 def test_alert_lands_in_app_outbox(monkeypatch):

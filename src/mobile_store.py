@@ -117,9 +117,14 @@ class Store:
                 db.execute("UPDATE subscriptions SET session=?,info=?,created=?,active=1,last_status=NULL,generation=generation+1 WHERE id=?",
                            (session, json.dumps(info), time.time(), owner["id"]))
                 return
-            existing = db.execute("SELECT endpoint,info FROM subscriptions WHERE session=?", (session,)).fetchone()
+            existing = db.execute("SELECT endpoint,info,active FROM subscriptions WHERE session=?", (session,)).fetchone()
             if existing and existing["info"] != json.dumps(info):
                 db.execute("UPDATE deliveries SET state='cancelled' WHERE state='pending' AND subscription IN (SELECT id FROM subscriptions WHERE session=?)", (session,))
+            if existing and existing["active"] and existing["endpoint"] != info["endpoint"]:
+                # 켜진 채로 endpoint만 바뀐 기록(앱 재동기화 등). 2026-11-23 미표시가 재발했을 때 이 기록이
+                # 없으면 기기 구독은 그대로인데 Apple이 전달을 멈춘 경우로 좁힐 수 있다. endpoint는 남기지 않는다.
+                db.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)", ("push_endpoint_changed",
+                           json.dumps({"at": time.time(), "session": session[:8]})))
             db.execute("""INSERT INTO subscriptions (session,endpoint,info,created) VALUES (?,?,?,?)
                         ON CONFLICT(session) DO UPDATE SET
                         generation=CASE WHEN subscriptions.active=0 OR subscriptions.info<>excluded.info THEN subscriptions.generation+1 ELSE subscriptions.generation END,

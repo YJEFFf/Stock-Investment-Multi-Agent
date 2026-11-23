@@ -50,6 +50,7 @@ function refreshBusy(busy) {
   button.setAttribute('aria-label', busy ? '최신 기록 확인 중' : '최신 기록 불러오기');
 }
 function showLogin(message = '') {
+  pushEpoch++; state.pushProblem = null;
   state.data = null; state.alerts = []; state.authenticated = false; state.checkedAt = null;
   $('#navigation').hidden = true; $('#refresh').hidden = true;
   // 설치 감지는 안내에만 사용한다. 감지 결과 때문에 개인 인증을 막지 않는다.
@@ -159,7 +160,7 @@ async function refresh({manual = false} = {}) {
 // 2026-11-23: 기기의 push 구독이 바뀌어도 서버는 10/5 endpoint로 계속 보냈고 Apple은 201로 받았다.
 // 서버는 이 차이를 알 수 없으므로 앱이 열릴 때 기기 구독을 서버 지문과 비교해 다르면 다시 등록한다.
 const PUSH_SYNC_INTERVAL = 600000;
-let pushSyncedAt = 0, pushSyncing = false;
+let pushSyncedAt = 0, pushSyncing = false, pushEpoch = 0;
 async function sha256Hex(text) {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
   return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
@@ -170,6 +171,7 @@ async function syncPush() {
   // 정상이면 10분에 한 번만 확인하고, 문제가 보이는 동안은 새로고침마다 다시 확인해 경고를 빨리 내린다.
   if (pushSyncing || (!state.pushProblem && Date.now() - pushSyncedAt < PUSH_SYNC_INTERVAL)) return;
   pushSyncing = true; pushSyncedAt = Date.now();
+  const epoch = pushEpoch;
   let problem = null;
   try {
     if (Notification.permission !== 'granted') problem = 'permission';
@@ -177,12 +179,15 @@ async function syncPush() {
       const registration = await navigator.serviceWorker.getRegistration();
       if (!registration?.active) { pushSyncedAt = 0; return; }
       const subscription = await registration.pushManager.getSubscription() || await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:decodeKey(state.key)});
+      // 확인 도중 사용자가 알림을 끄거나 연결을 해제했으면 다시 켜지 않는다.
+      if (epoch !== pushEpoch || !state.push?.enabled) return;
       if (await sha256Hex(subscription.endpoint) !== p.endpoint_sha256) {
         await api('/api/push',{method:'POST',body:JSON.stringify(subscription.toJSON())});
         state.push = await api('/api/push');
       }
     }
-  } catch (_) { problem = 'sync'; } finally { pushSyncing = false; }
+  } catch (_) { problem = epoch === pushEpoch ? 'sync' : null; } finally { pushSyncing = false; }
+  if (epoch !== pushEpoch) return;
   if (state.pushProblem !== problem) { state.pushProblem = problem; if (state.data) render(); }
 }
 const PUSH_PROBLEMS = {
@@ -200,7 +205,7 @@ async function enablePush() {
     if (!registration?.active) throw new Error('service worker unavailable');
     const subscription = await registration.pushManager.getSubscription() || await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:decodeKey(state.key)});
     await api('/api/push',{method:'POST',body:JSON.stringify(subscription.toJSON())});
-    state.pushProblem = null; pushSyncedAt = Date.now();
+    state.pushProblem = null; pushSyncedAt = Date.now(); pushEpoch++;
     await refresh(); toast('알림을 등록했어요. 테스트 알림으로 수신을 확인하세요.');
   } catch (_) { toast('알림을 연결하지 못했어요. 다시 시도해주세요.'); }
 }
@@ -208,7 +213,7 @@ function bind() {
   document.querySelectorAll('[data-filter]').forEach(button => button.onclick = () => { state.filter = button.dataset.filter; render(); });
   $('#enable-push')?.addEventListener('click', enablePush);
   $('#test-push')?.addEventListener('click', async () => { try { await api('/api/push/test',{method:'POST',body:'{}'}); toast('테스트 알림을 요청했어요. 잠금 화면에서도 확인해주세요.'); await refresh(); } catch (_) { toast('테스트 알림 요청에 실패했어요. 잠시 후 다시 시도해주세요.'); } });
-  $('#disable-push')?.addEventListener('click', async () => { try { await api('/api/push',{method:'DELETE'}); const reg = await navigator.serviceWorker.ready; const sub = await reg.pushManager.getSubscription(); if (sub) await sub.unsubscribe(); await refresh(); } catch (_) { toast('알림을 해제하지 못했어요. 다시 시도해주세요.'); } });
+  $('#disable-push')?.addEventListener('click', async () => { pushEpoch++; state.pushProblem = null; try { await api('/api/push',{method:'DELETE'}); const reg = await navigator.serviceWorker.ready; const sub = await reg.pushManager.getSubscription(); if (sub) await sub.unsubscribe(); await refresh(); } catch (_) { toast('알림을 해제하지 못했어요. 다시 시도해주세요.'); } });
   $('#mark-read')?.addEventListener('click', () => { try { localStorage.setItem('sima-seen-at',state.alerts[0]?.created_at || new Date().toISOString()); } catch (_) {} render(); });
   $('#logout')?.addEventListener('click', async () => {
     try {
