@@ -134,10 +134,15 @@ class Store:
 
     def subscription_status(self, session: str) -> dict:
         with self.connect() as db:
-            row = db.execute("SELECT active,last_status FROM subscriptions WHERE session=?", (session,)).fetchone()
+            row = db.execute("SELECT active,last_status,endpoint FROM subscriptions WHERE session=?", (session,)).fetchone()
             pending = db.execute("SELECT COUNT(*) FROM deliveries d JOIN subscriptions s ON d.subscription=s.id WHERE s.session=? AND d.state='pending'", (session,)).fetchone()[0]
-        return {"enabled": bool(row and row["active"]), "last_status": row["last_status"] if row else None,
-                "pending": pending, "worker_seen": self.get_meta("worker_seen")}
+        status = {"enabled": bool(row and row["active"]), "last_status": row["last_status"] if row else None,
+                  "pending": pending, "worker_seen": self.get_meta("worker_seen")}
+        if row and row["active"]:
+            # 2026-11-23: Apple은 기기에 닿지 않는 낡은 endpoint도 201로 받아 서버는 차이를 모른다.
+            # endpoint 자체는 비밀이므로 지문만 주고, 앱이 기기 구독과 비교해 다르면 다시 등록한다.
+            status["endpoint_sha256"] = hashlib.sha256(row["endpoint"].encode()).hexdigest()
+        return status
 
     def add_alert(self, alert: AppAlert, *, only_session: str | None = None):
         created = alert.created_at.timestamp()

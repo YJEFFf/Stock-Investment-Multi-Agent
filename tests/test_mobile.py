@@ -1,5 +1,6 @@
 import base64
 import fcntl
+import hashlib
 import json
 import threading
 import time
@@ -121,6 +122,26 @@ def test_push_registration_test_notification_and_logout_cancel(web):
     assert len(store.pending()) == 1
     assert request(client, "POST", "/api/logout", json={}, headers=HEADERS).status_code == 200
     assert store.pending() == []
+
+
+def test_push_status_exposes_endpoint_fingerprint_for_device_resync(web):
+    """2026-11-23: Apple은 낡은 endpoint도 201로 받는다. 앱이 기기 구독과 비교할 지문을 준다."""
+    _, client, store = web
+    login(web)
+    assert "endpoint_sha256" not in request(client, "GET", "/api/push").json
+    old = subscription("https://web.push.apple.com/Qold")
+    assert request(client, "POST", "/api/push", json=old, headers=HEADERS).status_code == 200
+    status = request(client, "GET", "/api/push").json
+    assert status["endpoint_sha256"] == hashlib.sha256(old["endpoint"].encode()).hexdigest()
+    with store.connect() as db:
+        before = dict(db.execute("SELECT generation,created FROM subscriptions").fetchone())
+    # 같은 구독을 다시 보내도 발송 세대·생성 시각이 바뀌지 않는다(재동기화가 대기 발송을 취소하지 않음).
+    assert request(client, "POST", "/api/push", json=old, headers=HEADERS).status_code == 200
+    with store.connect() as db:
+        assert dict(db.execute("SELECT generation,created FROM subscriptions").fetchone()) == before
+    new = subscription("https://web.push.apple.com/Qnew")
+    assert request(client, "POST", "/api/push", json=new, headers=HEADERS).status_code == 200
+    assert request(client, "GET", "/api/push").json["endpoint_sha256"] == hashlib.sha256(new["endpoint"].encode()).hexdigest()
 
 
 def test_alert_lands_in_app_outbox(monkeypatch):

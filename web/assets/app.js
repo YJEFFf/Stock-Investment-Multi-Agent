@@ -136,7 +136,7 @@ function insightsPage() {
 function render() {
   if (!state.authenticated || !state.data) return;
   const pages = {home,holdings:holdingsPage,trades:tradesPage,alerts:alertsPage,insights:insightsPage};
-  const warnings = [...(state.offline ? ['최신 기록 확인에 실패했어요. 화면은 마지막으로 불러온 기록이에요.'] : []), ...state.data.warnings];
+  const warnings = [...(state.offline ? ['최신 기록 확인에 실패했어요. 화면은 마지막으로 불러온 기록이에요.'] : []), ...(state.push?.enabled && PUSH_PROBLEMS[state.pushProblem] ? [PUSH_PROBLEMS[state.pushProblem]] : []), ...state.data.warnings];
   $('#main').innerHTML = warnings.map(w => `<div class="warning-banner">${esc(w)}</div>`).join('') + (pages[route()] || home)() + `<p class="footer-note">서버 기록 확인 ${checkedTime(state.checkedAt)}<br>${isExitOnly() ? '새로고침은 cron이 저장한 최신 시세·가상 장부를 불러와요.' : '새로고침을 누르면 증권사 잔고를 다시 조회해요.'}</p>`;
   nav(); bind();
 }
@@ -148,6 +148,7 @@ async function refresh({manual = false} = {}) {
     const [data, alerts, push] = await Promise.all([manual ? api('/api/account/refresh', {method:'POST',body:'{}'}) : api('/api/snapshot'),api('/api/alerts'),api('/api/push')]);
     if (!state.authenticated) return;
     state.data = data; state.alerts = alerts.alerts; state.push = push; state.offline = false; state.checkedAt = new Date().toISOString(); render();
+    syncPush();
     if (manual) toast(`새로고침 완료 · ${checkedTime(data.account?.observed_at)} ${isExitOnly() ? '시세 기준 가상 장부예요.' : '증권사 잔고를 확인했어요.'}`);
   } catch (error) {
     if (error.status === 401) { showLogin('기기 연결이 만료됐어요. 새 연결 코드로 다시 연결해주세요.'); if (manual) toast('기기 연결이 만료됐어요. 다시 연결해주세요.'); }
@@ -155,6 +156,39 @@ async function refresh({manual = false} = {}) {
     else { $('#main').innerHTML = `<div class="card">${empty('기록을 불러오지 못했어요','인터넷 연결을 확인한 뒤 다시 시도해주세요.')}<button class="button" id="retry">다시 불러오기</button></div>`; $('#retry').onclick = () => refresh({manual:true}); if (manual) toast('새로고침에 실패했어요. 다시 시도해주세요.'); }
   } finally { state.loading = false; refreshBusy(false); }
 }
+// 2026-11-23: 기기의 push 구독이 바뀌어도 서버는 10/5 endpoint로 계속 보냈고 Apple은 201로 받았다.
+// 서버는 이 차이를 알 수 없으므로 앱이 열릴 때 기기 구독을 서버 지문과 비교해 다르면 다시 등록한다.
+const PUSH_SYNC_INTERVAL = 600000;
+let pushSyncedAt = 0, pushSyncing = false;
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+async function syncPush() {
+  const p = state.push;
+  if (!p?.enabled || !state.key || !('Notification' in window) || !('PushManager' in window) || !('serviceWorker' in navigator)) return;
+  // 정상이면 10분에 한 번만 확인하고, 문제가 보이는 동안은 새로고침마다 다시 확인해 경고를 빨리 내린다.
+  if (pushSyncing || (!state.pushProblem && Date.now() - pushSyncedAt < PUSH_SYNC_INTERVAL)) return;
+  pushSyncing = true; pushSyncedAt = Date.now();
+  let problem = null;
+  try {
+    if (Notification.permission !== 'granted') problem = 'permission';
+    else {
+      const registration = await navigator.serviceWorker.getRegistration();
+      if (!registration?.active) { pushSyncedAt = 0; return; }
+      const subscription = await registration.pushManager.getSubscription() || await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:decodeKey(state.key)});
+      if (await sha256Hex(subscription.endpoint) !== p.endpoint_sha256) {
+        await api('/api/push',{method:'POST',body:JSON.stringify(subscription.toJSON())});
+        state.push = await api('/api/push');
+      }
+    }
+  } catch (_) { problem = 'sync'; } finally { pushSyncing = false; }
+  if (state.pushProblem !== problem) { state.pushProblem = problem; if (state.data) render(); }
+}
+const PUSH_PROBLEMS = {
+  permission: '이 기기의 SIMA 알림 권한이 꺼져 있어 휴대폰에 알림이 뜨지 않아요. 설정 → 알림 → SIMA를 켜주세요.',
+  sync: '이 기기의 알림 연결을 확인하지 못했어요. 알림함에서 ‘알림 끄기’ → ‘알림 켜기’를 눌러주세요.',
+};
 function decodeKey(value) { const raw = atob(value.replace(/-/g,'+').replace(/_/g,'/') + '='.repeat((4 - value.length % 4) % 4)); return Uint8Array.from(raw,c => c.charCodeAt(0)); }
 async function enablePush() {
   if (!state.key) { toast('서버의 알림 설정을 확인해야 해요.'); return; }
@@ -166,6 +200,7 @@ async function enablePush() {
     if (!registration?.active) throw new Error('service worker unavailable');
     const subscription = await registration.pushManager.getSubscription() || await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:decodeKey(state.key)});
     await api('/api/push',{method:'POST',body:JSON.stringify(subscription.toJSON())});
+    state.pushProblem = null; pushSyncedAt = Date.now();
     await refresh(); toast('알림을 등록했어요. 테스트 알림으로 수신을 확인하세요.');
   } catch (_) { toast('알림을 연결하지 못했어요. 다시 시도해주세요.'); }
 }
