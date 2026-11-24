@@ -325,3 +325,43 @@ def test_app_shows_liquidation_progress_and_frozen_exit_levels(tmp_path):
     untouched = mobile_data.snapshot(tmp_path / "fresh", now=NEXT).holdings[0]["exit"]
     assert untouched["take_profit_price"] == pytest.approx(100 * (1 + plan.take_profit_pct))
     assert untouched["trail_price"] is None
+
+
+def test_watchdog_waits_for_the_opening_and_valuation_checks_to_finish(tmp_path):
+    # 11/24 09:00:04: the watchdog read yesterday's valuation time while the 09:00 check
+    # was still running (it saved at 09:00:15) and raised a false delay alert.
+    path = tmp_path / "exit_only_state.json"
+    state, _, _ = initialized(path)
+    day = datetime(2026, 11, 11, tzinfo=exit_only.KST)
+    state.last_checked_at = datetime(2026, 11, 10, 15, 35, 12, tzinfo=exit_only.KST)
+    assert not exit_only.monitor_overdue(state, day.replace(hour=9, second=4))
+    assert exit_only.monitor_overdue(state, day.replace(hour=9, minute=1, second=31))
+    state.last_checked_at = day.replace(hour=9, second=15)
+    assert not exit_only.monitor_overdue(state, day.replace(hour=9, minute=1, second=31))
+    state.last_checked_at = day.replace(hour=15, minute=30, second=14)
+    assert not exit_only.monitor_overdue(state, day.replace(hour=15, minute=35, second=4))
+    assert exit_only.monitor_overdue(state, day.replace(hour=15, minute=36, second=31))
+    exit_only.save(state, path)
+    opening = mobile_data.snapshot(tmp_path, now=day.replace(hour=15, minute=35, second=4))
+    assert not any("놓쳤습니다" in w for w in opening.warnings)
+    late = mobile_data.snapshot(tmp_path, now=day.replace(hour=15, minute=36, second=31))
+    assert any("놓쳤습니다" in w for w in late.warnings)
+
+
+@pytest.mark.parametrize("second_quote, alerted", [(None, ["삼성전자"]), ("valid", [])])
+def test_missing_quote_alerts_only_when_it_persists_past_one_check(tmp_path, monkeypatch, second_quote, alerted):
+    # Every open since 11/17, 1-5 holdings lacked a stamped first minute at 09:00 and
+    # were valid at 09:01. One unconfirmed minute is not an error; a repeat is.
+    path = tmp_path / "ledger.json"
+    initialized(path)
+    opening = NEXT.replace(minute=0)
+    responses = iter([kis.Quote(price=100), kis.Quote(price=100) if second_quote is None else quote(100)])
+    monkeypatch.setattr(kis, "fetch_quote", lambda t, **kw: next(responses))
+    monkeypatch.setattr(collectors, "fetch_naver_quotes", lambda ts: {})
+    monkeypatch.setattr(app_notifications, "enqueue_alert", lambda a: True)
+    alerts = []
+    monkeypatch.setattr(exit_only.notify, "alert_once_per_day", lambda key, msg, today=None: alerts.append(msg))
+    asyncio.run(exit_only.monitor(at=opening, path=path))
+    assert exit_only.load(path).missing_quotes == ["005930"] and not alerts
+    asyncio.run(exit_only.monitor(at=NEXT, path=path))
+    assert [name for name in ["삼성전자"] if any(name in m for m in alerts)] == alerted

@@ -211,6 +211,21 @@ def apply_quotes(state: ExitOnlyState, quotes: dict, *, at: datetime) -> None:
         state.nav_history.append({"day": today, "total": total, "daily_return": total / previous - 1 if previous else None})
 
 
+# A cron check for minute M saves its result by M+53s (timeout 50s, kill 3s). The open and
+# the closing valuation follow a long gap, so judging them before that run ends always
+# looked late: 11/23·11/24 09:00:04 false delay alerts while the 09:00 check finished at 09:00:15.
+MONITOR_GRACE = timedelta(seconds=90)
+
+
+def monitor_overdue(state: ExitOnlyState, at: datetime) -> bool:
+    """Whether a check that should already have finished is missing. Shared by watchdog and app."""
+    if not state.portfolio.positions:
+        return False
+    due = monitor_due(at - MONITOR_GRACE)
+    return due >= state.started_at and (state.last_checked_at is None
+                                        or (due - state.last_checked_at).total_seconds() > 120)
+
+
 def flush_outbox(state: ExitOnlyState, path: Path) -> None:
     while state.outbox:
         if not app_notifications.enqueue_alert(state.outbox[0]):
@@ -307,12 +322,16 @@ async def monitor(*, at: datetime | None = None, path: Path | None = None) -> No
                 except Exception:
                     logger.exception("exit_only_secondary_quote_failed")
             at = at if supplied_time else datetime.now(KST)
+            previously_missing = set(state.missing_quotes)
             apply_quotes(state, quotes, at=at)
             save(state, path)
             flush_outbox(state, path)
-            if state.missing_quotes:
+            # At the open some holdings have no stamped first minute yet (1-5 every day since
+            # 11/17, all valid by 09:01). One unconfirmed check is not an error; a repeat is.
+            persistent = [t for t in state.missing_quotes if t in previously_missing]
+            if persistent:
                 notify.alert_once_per_day("exit_only_missing_quotes", notify.format_error_alert(
-                    "가상 매도 시세 조회 실패", ", ".join(state.names[t] for t in state.missing_quotes)), today=at.date())
+                    "가상 매도 시세 조회 실패", ", ".join(state.names[t] for t in persistent)), today=at.date())
             logger.info("exit_only_checked positions=%d quotes=%d sales=%d missing=%d",
                         len(state.portfolio.positions), len(quotes), len(state.sales), len(state.missing_quotes))
     except PortfolioLockBusy:

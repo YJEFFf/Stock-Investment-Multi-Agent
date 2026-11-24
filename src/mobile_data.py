@@ -325,11 +325,8 @@ def exit_only_snapshot(result: MobileSnapshot, root: Path, now: datetime, initia
         result.warnings.append("주식 수·가격 기준 변경 확인 필요: " + ", ".join(state.names[t] for t in state.basis_warnings)
                                + ". 해당 종목의 가상 매도를 중단하고 기존 수량·매도 기준을 보존했습니다.")
     if state.portfolio.positions:
-        from src.market_calendar import monitor_due
         try:
-            due = monitor_due(now)
-            if (due >= state.started_at and (state.last_checked_at is None
-                    or (due - state.last_checked_at).total_seconds() > 120)):
+            if exit_only.monitor_overdue(state, now):
                 result.warnings.append("가상 매도 감시의 예정 확인 시각을 2분 넘게 놓쳤습니다. 마지막 가격 확인 시각을 확인하세요.")
         except ValueError:
             result.warnings.append("거래 달력이 등록되지 않아 시세 감시를 중단했습니다. 달력 갱신이 필요합니다.")

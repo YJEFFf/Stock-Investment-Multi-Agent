@@ -52,14 +52,9 @@ def main():
         from src import operating_mode
         if operating_mode.EXIT_ONLY:
             from src import exit_only
-            from src.market_calendar import monitor_due
             at = datetime.now(claude_plan.KST)
             try:
-                ledger = exit_only.load()
-                due = monitor_due(at) if ledger.portfolio.positions else None
-                delayed = due and due >= ledger.started_at and (ledger.last_checked_at is None
-                           or (due - ledger.last_checked_at).total_seconds() > 120)
-                if delayed:
+                if exit_only.monitor_overdue(exit_only.load(), at):
                     notify.alert_once_per_day("exit_only_watchdog", notify.format_error_alert(
                         "가상 매도 감시 갱신 지연", "예정 확인 시각이 지났습니다. cron 로그와 마지막 시세 확인 시각을 확인하세요."),
                         today=at.date())
