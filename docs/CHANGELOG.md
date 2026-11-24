@@ -37,9 +37,14 @@
   - 크론탭은 바뀌지 않았다(`deploy/crontab`과 일치).
   - 함께 들어온 `src/mobile_store.py`·`web/`은 11/23에 리뷰를 거쳐 앱 릴리스로 이미 배포된 `0a8a9b8`의 변경이다.
   - 확인: 13:26:24 sima-operations 정상 종료. 운영 장부에서 `monitor_overdue`가 False이고 13:26:15 확인 기준 missing은 없다.
-  - **남은 일:** 앱 경고(`src/mobile_data.py`)는 앱 릴리스를 바꿔야 반영된다. 16:10 이후
-    `sudo env SIMA_PWA_HOST=sima.3-35-112-100.sslip.io bash deploy/install_pwa.sh`를 실행해야 한다(관리자 권한, 사용자 몫).
-    그 전까지 앱 화면에는 장 시작 몇 초 동안 예전 지연 경고가 보일 수 있다.
+  - **앱 릴리스(장중, 사용자 승인):** 앱 경고(`src/mobile_data.py`)를 반영하려고 14:59 KST에
+    `sudo env SIMA_PWA_HOST=sima.3-35-112-100.sslip.io bash deploy/install_pwa.sh`를 실행했다.
+    - 이 스크립트는 매매 크론·장부·주문을 건드리지 않고 장중 차단도 없다. sima-balance·sima-pwa·sima-push만 재시작한다.
+    - `current`가 `/opt/sima-pwa/releases/232a372…`로 바뀌었다.
+    - 확인: 서비스 4개(caddy 포함) active. `/healthz`는 공개 주소와 Host 헤더를 붙인 로컬 호출 모두 200이다
+      (Host 없는 127.0.0.1 호출은 신뢰 호스트 검사로 400). 비인증 `/api/push` 401, 오류 로그 없음.
+      14:59 가상 매도 확인 정상(missing=0).
+    - 되돌리기: `current`를 `/opt/sima-pwa/releases/0a8a9b8ddde283e42b69cd06cf27160931391cf8`로 돌리고 세 서비스를 재시작한다.
 
 ## 2026-11-23 (앱 알림 재동기화 장중 앱 단독 배포 — git 밖 운영 변경)
 
